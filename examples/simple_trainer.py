@@ -169,6 +169,23 @@ def _weights_only_safe(value):
     return value
 
 
+def _scale_restored_learning_rates(optimizers, schedulers, scale: float) -> None:
+    if scale <= 0:
+        raise ValueError("resume_lr_scale must be positive")
+    if scale == 1.0:
+        return
+    for optimizer in optimizers.values():
+        for group in optimizer.param_groups:
+            group["lr"] *= scale
+            if "initial_lr" in group:
+                group["initial_lr"] *= scale
+    for scheduler in schedulers:
+        if hasattr(scheduler, "base_lrs"):
+            scheduler.base_lrs = [value * scale for value in scheduler.base_lrs]
+        if hasattr(scheduler, "_last_lr"):
+            scheduler._last_lr = [value * scale for value in scheduler._last_lr]
+
+
 def _validation_better(
     candidate: Dict[str, float], current: Optional[Dict[str, float]], minimum_alpha_iou: float
 ) -> bool:
@@ -222,6 +239,8 @@ class Config:
     resume: Optional[str] = None
     # Restore optimizer, scheduler, and strategy state for interrupted runs.
     resume_optimizer: bool = True
+    # Scale restored optimizer/scheduler learning rates (native refinement: 0.25).
+    resume_lr_scale: float = 1.0
     # Save the best validation checkpoint using the object-aware ranking policy.
     save_best: bool = False
     # Evaluate the sealed manifest test split instead of validation in eval-only mode.
@@ -1075,6 +1094,9 @@ class Runner:
                 schedulers, self.resume_payload.get("schedulers", [])
             ):
                 scheduler.load_state_dict(state)
+            _scale_restored_learning_rates(
+                self.optimizers, schedulers, cfg.resume_lr_scale
+            )
 
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
