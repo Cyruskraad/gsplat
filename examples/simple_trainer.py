@@ -122,6 +122,16 @@ def _binary_boundary_fscore(alpha: Tensor, target: Tensor) -> Tensor:
     return 2.0 * precision * recall / torch.clamp(precision + recall, min=1e-8)
 
 
+def _composite_on_background(
+    colors: Tensor, alphas: Tensor, background: Tensor
+) -> Tuple[Tensor, Tensor]:
+    """Return a numerically valid image/alpha pair after raster compositing."""
+
+    safe_alphas = torch.clamp(alphas, 0.0, 1.0)
+    composite = colors + background * (1.0 - safe_alphas)
+    return torch.clamp(composite, 0.0, 1.0), safe_alphas
+
+
 def _validation_better(
     candidate: Dict[str, float], current: Optional[Dict[str, float]], minimum_alpha_iou: float
 ) -> bool:
@@ -1112,7 +1122,7 @@ class Runner:
 
             if cfg.random_bkgd or object_masks is not None:
                 bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
+                colors, alphas = _composite_on_background(colors, alphas, bkgd)
                 if object_masks is not None:
                     pixels = (
                         pixels * object_masks[..., None]
@@ -1474,7 +1484,7 @@ class Runner:
             colors = torch.clamp(colors, 0.0, 1.0)
             if object_masks is not None:
                 neutral = torch.full((1, 3), 0.5, device=device)
-                rendered = colors + neutral * (1.0 - alphas)
+                rendered, alphas = _composite_on_background(colors, alphas, neutral)
                 target = (
                     pixels * object_masks[..., None]
                     + neutral * (~object_masks)[..., None]
