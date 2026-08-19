@@ -71,6 +71,98 @@ def _resize_image_folder(image_dir: str, resized_dir: str, factor: int) -> str:
     return resized_dir
 
 
+def _relative_stem(path: str) -> str:
+    return str(Path(path).with_suffix("")).casefold()
+
+
+def _object_mask_paths(mask_dir: str, image_names: List[str]) -> List[str]:
+    mask_files = _get_rel_paths(mask_dir)
+    by_stem = {_relative_stem(path): path for path in mask_files}
+    if len(by_stem) != len(mask_files):
+        raise ValueError("Object mask relative stems must be unique")
+    missing = [name for name in image_names if _relative_stem(name) not in by_stem]
+    image_stems = {_relative_stem(name) for name in image_names}
+    extra = [path for path in mask_files if _relative_stem(path) not in image_stems]
+    if missing or extra:
+        raise ValueError(f"Object mask mismatch: missing={missing} extra={extra}")
+    return [os.path.join(mask_dir, by_stem[_relative_stem(name)]) for name in image_names]
+
+
+def _split_indices(split_manifest: str, image_names: List[str]) -> Dict[str, np.ndarray]:
+    with open(split_manifest, encoding="utf-8") as handle:
+        payload = json.load(handle)
+    splits = payload.get("splits", {})
+    expected = {"train", "validation", "test"}
+    if set(splits) != expected:
+        raise ValueError(f"Split manifest must contain exactly {sorted(expected)}")
+    index_by_name = {name: index for index, name in enumerate(image_names)}
+    flattened = [name for key in expected for name in splits[key]]
+    if len(flattened) != len(set(flattened)):
+        raise ValueError("Split manifest image names must be unique")
+    missing = sorted(set(image_names) - set(flattened))
+    extra = sorted(set(flattened) - set(image_names))
+    if missing or extra:
+        raise ValueError(f"Split manifest mismatch: missing={missing} extra={extra}")
+    return {
+        key: np.asarray([index_by_name[name] for name in splits[key]], dtype=np.int64)
+        for key in expected
+    }
+
+
+def _point_ids_inside_object_masks(
+    imdata: Dict[int, Any],
+    image_names: List[str],
+    object_mask_paths: List[Optional[str]],
+    point3D_ids: List[int],
+) -> List[int]:
+    """Keep sparse points whose registered observations are mostly foreground."""
+    mask_by_name = dict(zip(image_names, object_mask_paths))
+    point_index = {point3D_id: index for index, point3D_id in enumerate(point3D_ids)}
+    inside_counts = np.zeros(len(point3D_ids), dtype=np.int32)
+    observation_counts = np.zeros(len(point3D_ids), dtype=np.int32)
+    for image in imdata.values():
+        mask_path = mask_by_name.get(image.name)
+        if mask_path is None:
+            continue
+        mask = imageio.imread(mask_path)
+        if mask.ndim == 3:
+            mask = mask[..., 0]
+        mask = mask > 127
+        for point2D in image.points2D:
+            if not point2D.has_point3D():
+                continue
+            index = point_index.get(int(point2D.point3D_id))
+            if index is None:
+                continue
+            observation_counts[index] += 1
+            x, y = np.rint(np.asarray(point2D.xy)).astype(np.int64)
+            if 0 <= x < mask.shape[1] and 0 <= y < mask.shape[0] and mask[y, x]:
+                inside_counts[index] += 1
+    keep = (inside_counts > 0) & (
+        inside_counts >= np.ceil(0.5 * observation_counts).astype(np.int32)
+    )
+    return [point3D_id for point3D_id, selected in zip(point3D_ids, keep) if selected]
+
+
+def _padded_bbox(mask: np.ndarray, padding_fraction: float = 0.1) -> np.ndarray:
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        raise ValueError("Object mask is empty")
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    pad_x = int(np.ceil((x1 - x0) * padding_fraction))
+    pad_y = int(np.ceil((y1 - y0) * padding_fraction))
+    return np.asarray(
+        [
+            max(0, x0 - pad_x),
+            max(0, y0 - pad_y),
+            min(mask.shape[1], x1 + pad_x),
+            min(mask.shape[0], y1 + pad_y),
+        ],
+        dtype=np.int64,
+    )
+
+
 def _as_dict(map_like: Any) -> Dict[int, Any]:
     """Convert a pycolmap map view into a regular Python dictionary."""
     return {int(k): v for k, v in map_like.items()}
@@ -127,12 +219,16 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         load_exposure: bool = False,
+        object_mask_dir: Optional[str] = None,
+        split_manifest: Optional[str] = None,
     ):
         self.data_dir = data_dir
         self.factor = factor
         self.normalize = normalize
         self.test_every = test_every
         self.load_exposure = load_exposure
+        self.object_mask_dir = object_mask_dir
+        self.split_manifest = split_manifest
 
         colmap_dir = os.path.join(data_dir, "sparse/0/")
         if not os.path.exists(colmap_dir):
@@ -223,9 +319,15 @@ class Parser:
             image_dir_suffix = ""
         colmap_image_dir = os.path.join(data_dir, "images")
         image_dir = os.path.join(data_dir, "images" + image_dir_suffix)
-        for d in [image_dir, colmap_image_dir]:
-            if not os.path.exists(d):
-                raise ValueError(f"Image folder {d} does not exist.")
+        if not os.path.exists(colmap_image_dir):
+            raise ValueError(f"Image folder {colmap_image_dir} does not exist.")
+        if not os.path.exists(image_dir):
+            if factor > 1:
+                image_dir = _resize_image_folder(
+                    colmap_image_dir, image_dir + "_png", factor=factor
+                )
+            else:
+                raise ValueError(f"Image folder {image_dir} does not exist.")
 
         # Downsampled images may have different names vs images used for COLMAP,
         # so we need to map between the two sorted lists of files.
@@ -238,10 +340,35 @@ class Parser:
             image_files = sorted(_get_rel_paths(image_dir))
         colmap_to_image = dict(zip(colmap_files, image_files))
         image_paths = [os.path.join(image_dir, colmap_to_image[f]) for f in image_names]
+        if object_mask_dir is not None:
+            if not os.path.isdir(object_mask_dir):
+                raise ValueError(f"Object mask folder {object_mask_dir} does not exist")
+            object_mask_paths: List[Optional[str]] = _object_mask_paths(
+                object_mask_dir, image_names
+            )
+        else:
+            object_mask_paths = [None] * len(image_names)
+        if split_manifest is not None:
+            if not os.path.isfile(split_manifest):
+                raise ValueError(f"Split manifest {split_manifest} does not exist")
+            split_indices = _split_indices(split_manifest, image_names)
+        else:
+            split_indices = None
 
         # 3D points and {image_name -> [point_idx]}
         points3D = _as_dict(reconstruction.points3D)
         point3D_ids = sorted(points3D)
+        unfiltered_point_count = len(point3D_ids)
+        if object_mask_dir is not None:
+            point3D_ids = _point_ids_inside_object_masks(
+                imdata, image_names, object_mask_paths, point3D_ids
+            )
+            if not point3D_ids:
+                raise ValueError("Object masks rejected every COLMAP sparse point")
+            print(
+                f"[Parser] Object-mask sparse filtering kept {len(point3D_ids)}/"
+                f"{unfiltered_point_count} points."
+            )
         points = np.array(
             [points3D[point3D_id].xyz for point3D_id in point3D_ids],
             dtype=np.float32,
@@ -305,6 +432,8 @@ class Parser:
 
         self.image_names = image_names  # List[str], (num_images,)
         self.image_paths = image_paths  # List[str], (num_images,)
+        self.object_mask_paths = object_mask_paths
+        self.split_indices = split_indices
         self.camtoworlds = camtoworlds  # np.ndarray, (num_images, 4, 4)
         self.camera_ids = camera_ids  # List[int], (num_images,)
         self.Ks_dict = Ks_dict  # Dict of camera_id -> K
@@ -455,7 +584,12 @@ class Dataset:
         self.patch_size = patch_size
         self.load_depths = load_depths
         indices = np.arange(len(self.parser.image_names))
-        if split == "train":
+        if self.parser.split_indices is not None:
+            manifest_split = "validation" if split == "val" else split
+            if manifest_split not in self.parser.split_indices:
+                raise ValueError(f"Unknown dataset split: {split}")
+            self.indices = self.parser.split_indices[manifest_split]
+        elif split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
         else:
             self.indices = indices[indices % self.parser.test_every == 0]
@@ -471,6 +605,17 @@ class Dataset:
         params = self.parser.params_dict[camera_id]
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
+        object_mask_path = self.parser.object_mask_paths[index]
+        object_mask = None
+        if object_mask_path is not None:
+            object_mask = imageio.imread(object_mask_path)
+            if object_mask.ndim == 3:
+                object_mask = object_mask[..., 0]
+            object_mask = cv2.resize(
+                object_mask,
+                (image.shape[1], image.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            ) > 127
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -479,8 +624,17 @@ class Dataset:
                 self.parser.mapy_dict[camera_id],
             )
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+            if object_mask is not None:
+                object_mask = cv2.remap(
+                    object_mask.astype(np.uint8),
+                    mapx,
+                    mapy,
+                    cv2.INTER_NEAREST,
+                ).astype(bool)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+            if object_mask is not None:
+                object_mask = object_mask[y : y + h, x : x + w]
 
         if self.patch_size is not None:
             # Random crop.
@@ -488,6 +642,8 @@ class Dataset:
             x = np.random.randint(0, max(w - self.patch_size, 1))
             y = np.random.randint(0, max(h - self.patch_size, 1))
             image = image[y : y + self.patch_size, x : x + self.patch_size]
+            if object_mask is not None:
+                object_mask = object_mask[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
 
@@ -495,6 +651,7 @@ class Dataset:
             "K": torch.from_numpy(K).float(),
             "camtoworld": torch.from_numpy(camtoworlds).float(),
             "image": torch.from_numpy(image).float(),
+            "image_name": self.parser.image_names[index],
             "image_id": item,  # the index of the image in the dataset
             "camera_idx": self.parser.camera_indices[
                 index
@@ -502,6 +659,9 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+        if object_mask is not None:
+            data["object_mask"] = torch.from_numpy(object_mask).bool()
+            data["object_bbox"] = torch.from_numpy(_padded_bbox(object_mask))
 
         # Add exposure if available for this image
         exposure = self.parser.exposure_values[index]
