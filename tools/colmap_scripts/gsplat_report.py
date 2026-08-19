@@ -1,4 +1,4 @@
-"""Convert gsplat validation JSON artifacts into stable CSV tables."""
+"""Convert gsplat evaluation JSON artifacts into stable CSV tables."""
 
 from __future__ import annotations
 
@@ -9,8 +9,11 @@ import re
 from typing import Any, Iterable
 
 
-_SUMMARY_PATTERN = re.compile(r"val_step(?P<step>\d+)\.json$")
-_PER_VIEW_PATTERN = re.compile(r"val_step(?P<step>\d+)_per_view\.json$")
+_SUMMARY_PATTERN = re.compile(r"(?P<stage>val|test)_step(?P<step>\d+)\.json$")
+_PER_VIEW_PATTERN = re.compile(
+    r"(?P<stage>val|test)_step(?P<step>\d+)_per_view\.json$"
+)
+_STAGE_LABEL = {"val": "validation", "test": "test"}
 
 
 def _read_json(path: Path) -> Any:
@@ -31,13 +34,16 @@ def _write_csv(path: Path, rows: list[dict[str, object]], preferred: tuple[str, 
 
 
 def export_metrics_csv(stats_dir: Path, output_dir: Path) -> dict[str, Path]:
-    """Export validation summaries and per-view records found in ``stats_dir``."""
+    """Export validation/test summaries and per-view records in ``stats_dir``."""
 
-    checkpoints: list[dict[str, object]] = []
-    per_view: list[dict[str, object]] = []
-    for path in sorted(stats_dir.glob("val_step*.json")):
+    checkpoints: dict[str, list[dict[str, object]]] = {
+        stage: [] for stage in _STAGE_LABEL
+    }
+    per_view: dict[str, list[dict[str, object]]] = {stage: [] for stage in _STAGE_LABEL}
+    for path in sorted(stats_dir.glob("*_step*.json")):
         per_view_match = _PER_VIEW_PATTERN.fullmatch(path.name)
         if per_view_match:
+            stage = per_view_match.group("stage")
             step = int(per_view_match.group("step"))
             payload = _read_json(path)
             if not isinstance(payload, list):
@@ -46,24 +52,33 @@ def export_metrics_csv(stats_dir: Path, output_dir: Path) -> dict[str, Path]:
                 if not isinstance(raw, dict):
                     raise ValueError(f"Per-view metric rows must be JSON objects: {path}")
                 row = {"step": step, **raw}
-                per_view.append(row)
+                per_view[stage].append(row)
             continue
         summary_match = _SUMMARY_PATTERN.fullmatch(path.name)
         if summary_match:
+            stage = summary_match.group("stage")
             payload = _read_json(path)
             if not isinstance(payload, dict):
-                raise ValueError(f"Validation metrics must be a JSON object: {path}")
-            checkpoints.append({"step": int(summary_match.group("step")), **payload})
+                raise ValueError(f"Evaluation metrics must be a JSON object: {path}")
+            checkpoints[stage].append(
+                {"step": int(summary_match.group("step")), **payload}
+            )
 
     outputs: dict[str, Path] = {}
-    if checkpoints:
-        checkpoints.sort(key=lambda row: int(row["step"]))
-        output = output_dir / "validation_checkpoints.csv"
-        _write_csv(output, checkpoints, ("step",))
-        outputs["checkpoints"] = output
-    if per_view:
-        per_view.sort(key=lambda row: (int(row["step"]), str(row.get("image_name", ""))))
-        output = output_dir / "validation_per_view.csv"
-        _write_csv(output, per_view, ("step", "image_name"))
-        outputs["per_view"] = output
+    for stage, label in _STAGE_LABEL.items():
+        checkpoint_rows = checkpoints[stage]
+        per_view_rows = per_view[stage]
+        key_prefix = "" if stage == "val" else "test_"
+        if checkpoint_rows:
+            checkpoint_rows.sort(key=lambda row: int(row["step"]))
+            output = output_dir / f"{label}_checkpoints.csv"
+            _write_csv(output, checkpoint_rows, ("step",))
+            outputs[f"{key_prefix}checkpoints"] = output
+        if per_view_rows:
+            per_view_rows.sort(
+                key=lambda row: (int(row["step"]), str(row.get("image_name", "")))
+            )
+            output = output_dir / f"{label}_per_view.csv"
+            _write_csv(output, per_view_rows, ("step", "image_name"))
+            outputs[f"{key_prefix}per_view"] = output
     return outputs
