@@ -132,6 +132,29 @@ def _composite_on_background(
     return torch.clamp(composite, 0.0, 1.0), safe_alphas
 
 
+def _erode_binary_mask(mask: Tensor, pixels: int) -> Tensor:
+    if pixels <= 0:
+        return mask
+    values = mask.float().unsqueeze(1)
+    kernel = 2 * pixels + 1
+    eroded = 1.0 - F.max_pool2d(
+        1.0 - values, kernel_size=kernel, stride=1, padding=pixels
+    )
+    return eroded[:, 0] >= 0.5
+
+
+def _binary_boundary_band(mask: Tensor, pixels: int) -> Tensor:
+    if pixels <= 0:
+        return torch.zeros_like(mask)
+    values = mask.float().unsqueeze(1)
+    kernel = 2 * pixels + 1
+    dilated = F.max_pool2d(values, kernel_size=kernel, stride=1, padding=pixels)
+    eroded = 1.0 - F.max_pool2d(
+        1.0 - values, kernel_size=kernel, stride=1, padding=pixels
+    )
+    return (dilated[:, 0] - eroded[:, 0]) > 0.0
+
+
 def _validation_better(
     candidate: Dict[str, float], current: Optional[Dict[str, float]], minimum_alpha_iou: float
 ) -> bool:
@@ -282,6 +305,10 @@ class Config:
     ssim_lambda: float = 0.2
     # Weight for full-frame alpha supervision when object masks are present.
     alpha_loss_weight: float = 0.1
+    # Erode the RGB foreground target to avoid ambiguous edge-color supervision.
+    rgb_mask_erosion_pixels: int = 0
+    # Give alpha BCE twice the relative weight inside this silhouette band.
+    alpha_boundary_band_pixels: int = 0
     # Validation evaluations allowed without LPIPS or PSNR progress.
     early_stop_patience: int = 0
     early_stop_lpips_min_delta: float = 0.005
@@ -1124,9 +1151,12 @@ class Runner:
                 bkgd = torch.rand(1, 3, device=device)
                 colors, alphas = _composite_on_background(colors, alphas, bkgd)
                 if object_masks is not None:
+                    rgb_object_masks = _erode_binary_mask(
+                        object_masks, cfg.rgb_mask_erosion_pixels
+                    )
                     pixels = (
-                        pixels * object_masks[..., None]
-                        + bkgd * (~object_masks)[..., None]
+                        pixels * rgb_object_masks[..., None]
+                        + bkgd * (~rgb_object_masks)[..., None]
                     )
 
             # While Gaussians are frozen for PPISP controller distillation the render
@@ -1165,6 +1195,11 @@ class Runner:
                     object_masks.float(),
                     reduction="none",
                 )
+                if cfg.alpha_boundary_band_pixels > 0:
+                    boundary_band = _binary_boundary_band(
+                        object_masks, cfg.alpha_boundary_band_pixels
+                    )
+                    alpha_errors = alpha_errors * (1.0 + boundary_band.float())
                 if masks is not None:
                     valid_weights = masks.to(alpha_errors.dtype)
                     alpha_loss = torch.sum(alpha_errors * valid_weights) / torch.clamp(
