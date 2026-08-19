@@ -584,7 +584,9 @@ class Dataset:
         self.patch_size = patch_size
         self.load_depths = load_depths
         indices = np.arange(len(self.parser.image_names))
-        if self.parser.split_indices is not None:
+        if split == "all":
+            self.indices = indices
+        elif self.parser.split_indices is not None:
             manifest_split = "validation" if split == "val" else split
             if manifest_split not in self.parser.split_indices:
                 raise ValueError(f"Unknown dataset split: {split}")

@@ -264,6 +264,8 @@ class Config:
     object_mask_dir: Optional[str] = None
     # Optional explicit JSON train/validation/test split manifest.
     split_manifest: Optional[str] = None
+    # Train on every registered view while retaining manifest val/test loaders.
+    train_all_views: bool = False
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -634,7 +636,7 @@ class Runner:
             )
             self.trainset = Dataset(
                 self.parser,
-                split="train",
+                split="all" if cfg.train_all_views else "train",
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
             )
