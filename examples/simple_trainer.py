@@ -845,7 +845,7 @@ class Runner:
                 key: optimizer.state_dict() for key, optimizer in self.optimizers.items()
             },
             "schedulers": [scheduler.state_dict() for scheduler in schedulers],
-            "strategy_state": _weights_only_safe(self.strategy_state),
+            "strategy_state": self.strategy_state,
         }
         if self.cfg.pose_opt:
             data["pose_adjust"] = (
@@ -861,7 +861,7 @@ class Runner:
             )
         if self.post_processing_module is not None:
             data["post_processing"] = self.post_processing_module.state_dict()
-        return data
+        return _weights_only_safe(data)
 
     def _save_checkpoint(self, step: int, path: str, schedulers=()) -> None:
         torch.save(self._checkpoint_payload(step, schedulers), path)
