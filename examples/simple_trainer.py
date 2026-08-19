@@ -200,13 +200,14 @@ class _EarlyStopper:
     def observe(self, stats: Dict[str, float]) -> bool:
         lpips = stats["masked_lpips"]
         psnr = stats["masked_psnr"]
-        progress = (
-            not math.isfinite(self.best_lpips)
-            or lpips <= self.best_lpips - self.lpips_delta
-            or psnr >= self.best_psnr + self.psnr_delta
-        )
-        self.best_lpips = min(self.best_lpips, lpips)
-        self.best_psnr = max(self.best_psnr, psnr)
+        first = not math.isfinite(self.best_lpips)
+        lpips_progress = lpips <= self.best_lpips - self.lpips_delta
+        psnr_progress = psnr >= self.best_psnr + self.psnr_delta
+        progress = first or lpips_progress or psnr_progress
+        if first or lpips_progress:
+            self.best_lpips = lpips
+        if first or psnr_progress:
+            self.best_psnr = psnr
         self.stale = 0 if progress else self.stale + 1
         return self.patience > 0 and self.stale >= self.patience
 
