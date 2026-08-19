@@ -155,6 +155,20 @@ def _binary_boundary_band(mask: Tensor, pixels: int) -> Tensor:
     return (dilated[:, 0] - eroded[:, 0]) > 0.0
 
 
+def _weights_only_safe(value):
+    """Copy checkpoint state while converting NumPy scalars to safe primitives."""
+
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: _weights_only_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_weights_only_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_weights_only_safe(item) for item in value)
+    return value
+
+
 def _validation_better(
     candidate: Dict[str, float], current: Optional[Dict[str, float]], minimum_alpha_iou: float
 ) -> bool:
@@ -831,7 +845,7 @@ class Runner:
                 key: optimizer.state_dict() for key, optimizer in self.optimizers.items()
             },
             "schedulers": [scheduler.state_dict() for scheduler in schedulers],
-            "strategy_state": self.strategy_state,
+            "strategy_state": _weights_only_safe(self.strategy_state),
         }
         if self.cfg.pose_opt:
             data["pose_adjust"] = (
