@@ -3,21 +3,21 @@
 from pathlib import Path
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
-ARAGO_RUNS_ROOT = Path("/home/dhlab/Documents/arago-3d-reconstruction/runs/colmap-scripts")
-RELIGHT_RUNS_ROOT = Path("/home/dhlab/Documents/arago-3d-reconstruction/runs/uv-mgs")
+COLMAP_RESULTS_ROOT = Path("/home/dhlab/results")
+UV_MGS_RESULTS_ROOT = Path("/home/dhlab/results")
 
 REQUIRED_IMAGE_COUNT = 32
 RUN_ID_FORMAT = "%Y%m%d-%H%M%S"
 GIT_REMOTE_REPO = "https://github.com/raphaelsulzer/colmap-scripts.git"
 DEFAULT_CONFIG_FILENAME = "colmap-scripts.toml"
 
-ARAGO_PREFIX = "RIG_"
-ARAGO_START_INDEX = 15177
+CAPTURE_PREFIX = "RIG_"
+CAPTURE_START_INDEX = 15177
 
 DEFAULT_RECONSTRUCTION_CONFIG = {
     "expected_images": REQUIRED_IMAGE_COUNT,
-    "arago_names": True,
-    "arago_start_index": ARAGO_START_INDEX,
+    "capture_names": True,
+    "capture_start_index": CAPTURE_START_INDEX,
     "gpu_index": 0,
     "colmap": {
         "feature_extractor": {

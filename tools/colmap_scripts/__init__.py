@@ -1,4 +1,4 @@
-"""Production-oriented COLMAP reconstruction helpers for ARAGO datasets."""
+"""Production-oriented COLMAP reconstruction helpers for rig datasets."""
 
 from . import constants
 
