@@ -165,6 +165,14 @@ def get_extras_require() -> dict:
             "tyro",
             "imageio>=2.37.2",
         ],
+        # gsplat.photogrammetry.mesh_extraction dependencies (TSDF fusion,
+        # Poisson reconstruction, texture baking). Not needed to use the rest
+        # of gsplat.photogrammetry (bundle_adjustment, dense_mvs) or the core
+        # library — install with `pip install gsplat[mesh]`.
+        "mesh": [
+            "open3d>=0.18.0",
+            "imageio>=2.37.2",
+        ],
         # dev dependencies. Install them by `pip install gsplat[dev]`
         "dev": [
             "black[jupyter]==22.3.0",
@@ -189,6 +197,8 @@ def get_extras_require() -> dict:
             "PLAS @ git+https://github.com/fraunhoferhhi/PLAS.git",
             "imageio>=2.37.2",
             "torchpq>=0.3.0.6",
+            # tests/test_mesh_extraction.py needs open3d to be collectible.
+            "open3d>=0.18.0",
         ],
     }
 

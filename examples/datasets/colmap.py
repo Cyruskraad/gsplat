@@ -107,6 +107,28 @@ def _camera_distortion(camera: Any) -> tuple[np.ndarray, str]:
     )
 
 
+def _load_dense_pointcloud(path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Load a dense point cloud (e.g. COLMAP's fused ``dense.ply``) via Open3D.
+
+    Returns (xyz [P, 3] float32, rgb [P, 3] uint8).
+    """
+    try:
+        import open3d as o3d
+    except ImportError as e:
+        raise ImportError(
+            "Loading a dense point cloud (`dense_points_path`) requires "
+            "open3d. Install it with `pip install gsplat[mesh]` (or "
+            "`pip install open3d`)."
+        ) from e
+    pcd = o3d.io.read_point_cloud(path)
+    xyz = np.asarray(pcd.points, dtype=np.float32)
+    if pcd.has_colors():
+        rgb = (np.asarray(pcd.colors) * 255.0).clip(0, 255).astype(np.uint8)
+    else:
+        rgb = np.full((xyz.shape[0], 3), 128, dtype=np.uint8)
+    return xyz, rgb
+
+
 def _image_w2c(image: Any) -> np.ndarray:
     cam_from_world = image.cam_from_world
     if callable(cam_from_world):
@@ -127,6 +149,9 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         load_exposure: bool = False,
+        colmap_dir: Optional[str] = None,
+        dense_points_path: Optional[str] = None,
+        dense_mode: str = "augment",
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -134,9 +159,10 @@ class Parser:
         self.test_every = test_every
         self.load_exposure = load_exposure
 
-        colmap_dir = os.path.join(data_dir, "sparse/0/")
-        if not os.path.exists(colmap_dir):
-            colmap_dir = os.path.join(data_dir, "sparse")
+        if colmap_dir is None:
+            colmap_dir = os.path.join(data_dir, "sparse/0/")
+            if not os.path.exists(colmap_dir):
+                colmap_dir = os.path.join(data_dir, "sparse")
         assert os.path.exists(
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
@@ -316,6 +342,36 @@ class Parser:
         self.points_rgb = points_rgb  # np.ndarray, (num_points, 3)
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
+
+        # Optionally densify the sparse SfM point cloud with a dense MVS point
+        # cloud (see `gsplat.photogrammetry.dense_mvs.run_dense_mvs`), applying
+        # the same normalization transform as the sparse points so both stay
+        # aligned with `self.camtoworlds`.
+        if dense_points_path is not None:
+            dense_xyz, dense_rgb = _load_dense_pointcloud(dense_points_path)
+            dense_xyz = transform_points(transform, dense_xyz).astype(np.float32)
+            dense_err = np.full(
+                (dense_xyz.shape[0],),
+                float(np.median(self.points_err)) if len(self.points_err) else 0.0,
+                dtype=np.float32,
+            )
+            if dense_mode == "replace":
+                self.points = dense_xyz
+                self.points_rgb = dense_rgb
+                self.points_err = dense_err
+            elif dense_mode == "augment":
+                self.points = np.concatenate([self.points, dense_xyz], axis=0)
+                self.points_rgb = np.concatenate([self.points_rgb, dense_rgb], axis=0)
+                self.points_err = np.concatenate([self.points_err, dense_err], axis=0)
+            else:
+                raise ValueError(
+                    f"Unknown dense_mode: {dense_mode!r}. Use 'augment' or 'replace'."
+                )
+            print(
+                f"[Parser] Densified with {dense_xyz.shape[0]} points from "
+                f"{dense_points_path} (dense_mode={dense_mode}); "
+                f"total {self.points.shape[0]} points."
+            )
 
         # Create 0-based contiguous camera indices from COLMAP camera_ids.
         # This is useful for camera-based embeddings/modules.
