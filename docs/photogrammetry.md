@@ -88,6 +88,109 @@ Poisson reconstruction and the dense-MVS point cloud path still need the
 standalone `examples/extract_mesh.py` script, since the trainer has no dense
 point cloud of its own to reconstruct from.
 
+### Monocular depth-prior supervision (AI-assisted)
+
+gsplat does not run any depth-estimation model itself -- consistent with how
+`dense_mvs.py` shells out to `colmap` rather than reimplementing MVS, this is
+"bring your own precomputed depth maps." Run a monocular depth model
+externally over your training images, save one `<image_stem>.npy` (float32,
+any resolution -- it's resized to match automatically) per image into a
+directory, then pass `--mono_depth_loss --mono_depth_dir <that directory>` to
+`simple_trainer_2dgs.py`. This supervises the *full* rendered depth map
+against the prior via `gsplat.losses.pearson_depth_loss` -- scale/shift
+invariant, since monocular predictions are only *relative*-depth accurate --
+additive to (not a replacement for) `--depth_loss`'s existing sparse
+COLMAP-point supervision.
+
+Example using Depth Anything V2 via HuggingFace `transformers` (a separate
+install -- `pip install transformers`; not a gsplat dependency) to produce
+compatible `.npy` files:
+
+```python
+import os
+import numpy as np
+from PIL import Image
+from transformers import pipeline
+
+pipe = pipeline(task="depth-estimation", model="depth-anything/Depth-Anything-V2-Small-hf")
+image_dir, out_dir = "data/360_v2/garden/images", "data/360_v2/garden/mono_depth"
+os.makedirs(out_dir, exist_ok=True)
+for fname in os.listdir(image_dir):
+    depth = pipe(Image.open(os.path.join(image_dir, fname)))["predicted_depth"]
+    stem = os.path.splitext(fname)[0]
+    np.save(os.path.join(out_dir, f"{stem}.npy"), depth.numpy().astype(np.float32))
+```
+
+```bash
+python examples/simple_trainer_2dgs.py \
+    --data_dir data/360_v2/garden --data_factor 4 \
+    --result_dir results/garden_2dgs \
+    --mono_depth_loss --mono_depth_dir data/360_v2/garden/mono_depth
+```
+
+### Starting from a neural SfM tool instead of COLMAP (AI-assisted)
+
+Feed-forward neural SfM tools (DUSt3R/MASt3R/VGGT-style) predict per-image
+camera poses and a dense 3D point *per pixel* directly, without COLMAP's
+incremental matching/triangulation. gsplat doesn't run any such tool itself
+(same convention as above) -- `gsplat.photogrammetry.neural_sfm` is a
+tool-agnostic adapter that takes plain arrays and produces a normal COLMAP
+model, so the rest of the pipeline (most usefully, bundle adjustment --
+neural-SfM poses are typically less precise than classical SfM and benefit
+from it) works unchanged:
+
+```python
+from gsplat.photogrammetry.neural_sfm import (
+    merge_point_maps_to_tracks,
+    write_colmap_reconstruction,
+)
+from gsplat.photogrammetry.bundle_adjustment import refine_reconstruction
+
+# 1. Run your neural SfM tool externally, and extract, per image:
+#    - a (N_i, 3) array of 3D points (already in one shared world frame,
+#      as these tools' own global alignment produces)
+#    - a matching (N_i, 2) array of the pixel each point came from
+#    - (recommended) a (N_i,) confidence array
+# points_per_image, pixel_xy_per_image, confidence_per_image = ...  # your adapter code
+
+# 2. Merge each image's independent per-pixel points into cross-view tracks.
+#    min_track_length=2 is important -- a point only one image "saw" gives
+#    bundle adjustment no cross-view constraint.
+merged = merge_point_maps_to_tracks(
+    points_per_image, pixel_xy_per_image,
+    confidence_per_image=confidence_per_image, confidence_threshold=0.5,
+    merge_radius=0.01, min_track_length=2, max_points_per_image=2000,
+)
+
+# 3. Write it as a COLMAP model.
+write_colmap_reconstruction(
+    image_names=image_names,        # must match files under <data_dir>/images/
+    camtoworlds=camtoworlds,        # (N, 4, 4), from the neural SfM tool
+    Ks=Ks,                          # (N, 3, 3) or (3, 3)
+    image_sizes=(width, height),
+    points_xyz=merged["points_xyz"],
+    tracks=merged["tracks"],
+    output_dir="data/my_scene/sparse/0",
+)
+
+# 4. Refine the (typically approximate) neural-SfM poses -- exactly the same
+#    bundle adjustment step used after COLMAP.
+refine_reconstruction(
+    colmap_dir="data/my_scene/sparse/0",
+    output_dir="data/my_scene/sparse/refined",
+)
+```
+
+From there, `examples/dense_mvs.py`, `examples/simple_trainer_2dgs.py`
+(`--colmap_dir data/my_scene/sparse/refined` via
+`examples.datasets.colmap.Parser`'s `colmap_dir` argument), and
+`examples/extract_mesh.py` all work exactly as they would starting from
+COLMAP. gsplat provides the merge + COLMAP-writing primitives above; a
+tool-specific script converting DUSt3R/MASt3R/VGGT's own output format into
+the plain `points_per_image`/`pixel_xy_per_image`/`camtoworlds` arrays is
+something you write yourself (or find in that tool's own repo) -- not
+something gsplat ships.
+
 ### For users using gsplat's API:
 
 - `gsplat.photogrammetry.bundle_adjustment.refine_reconstruction(colmap_dir,

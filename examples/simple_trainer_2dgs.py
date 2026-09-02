@@ -32,7 +32,7 @@ import tyro
 import viser
 from datasets.colmap import Dataset, Parser
 from datasets.traj import generate_interpolated_path
-from gsplat.losses import depth_l1_loss, l1_loss, ssim_loss
+from gsplat.losses import depth_l1_loss, l1_loss, pearson_depth_loss, ssim_loss
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -179,6 +179,18 @@ class Config:
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
+    # Enable dense monocular depth-prior supervision, via a directory of
+    # precomputed per-image relative depth maps (e.g. from Depth Anything
+    # V2, run externally -- gsplat does not run any depth model itself, see
+    # docs/photogrammetry.md). Additive to depth_loss, not a replacement.
+    mono_depth_loss: bool = False
+    # Weight for the monocular depth-prior loss
+    mono_depth_lambda: float = 0.1
+    # Directory of precomputed monocular depth maps, one `<image_stem>.npy`
+    # (float32, any resolution) per training image. Required if
+    # mono_depth_loss is enabled.
+    mono_depth_dir: Optional[str] = None
+
     # Enable normal consistency loss. (Currently for 2DGS only)
     normal_loss: bool = False
     # Weight for normal loss
@@ -314,6 +326,13 @@ class Runner:
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
+        if cfg.mono_depth_loss:
+            assert cfg.mono_depth_dir is not None, (
+                "cfg.mono_depth_dir must be set when cfg.mono_depth_loss is "
+                "enabled (a directory of precomputed <image_stem>.npy depth "
+                "maps -- see docs/photogrammetry.md)."
+            )
+
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.data_dir,
@@ -326,6 +345,7 @@ class Runner:
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            mono_depth_dir=cfg.mono_depth_dir if cfg.mono_depth_loss else None,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -647,6 +667,17 @@ class Runner:
             l1loss = l1_loss(colors, pixels).mean()
             ssimloss = ssim_loss(colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2))
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+            if cfg.mono_depth_loss:
+                # Dense, scale/shift-invariant supervision against a
+                # precomputed monocular depth prior -- must run before the
+                # cfg.depth_loss block below, which overwrites `depths` with
+                # a sparse point-sampled version.
+                mono_depth_gt = data["mono_depth"].to(device)  # [1, H, W]
+                valid_mask = alphas.squeeze(-1) > 0.5  # [1, H, W]
+                mono_depth_loss_val = pearson_depth_loss(
+                    depths.squeeze(-1), mono_depth_gt, mask=valid_mask
+                )
+                loss += mono_depth_loss_val * cfg.mono_depth_lambda
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(

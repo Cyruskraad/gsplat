@@ -26,16 +26,22 @@ This package closes the SfM -> dense MVS -> Gaussian Splatting -> mesh loop:
   triangle mesh from a trained 2DGS/3DGS scene (TSDF fusion of rendered
   depth/normal maps, or Poisson reconstruction from a dense point cloud), with
   vertex-color texture baking from the training images.
+- :mod:`gsplat.photogrammetry.neural_sfm` - imports feed-forward neural-SfM
+  output (DUSt3R/MASt3R/VGGT-style, run externally) as a COLMAP model, so it
+  becomes a drop-in alternative to COLMAP for the rest of the pipeline.
 
 ``mesh_extraction`` requires the optional ``open3d`` dependency
-(``pip install gsplat[mesh]``); ``bundle_adjustment`` requires ``pycolmap``
-(already required by the example COLMAP data loader); ``dense_mvs`` requires
-the ``colmap`` command-line tool (built with CUDA support) on ``PATH``.
+(``pip install gsplat[mesh]``); ``bundle_adjustment``/``neural_sfm`` require
+``pycolmap`` (already required by the example COLMAP data loader);
+``neural_sfm``'s point-merging step also requires ``scipy``/``scikit-learn``;
+``dense_mvs`` requires the ``colmap`` command-line tool (built with CUDA
+support) on ``PATH``.
 """
 
 from .bundle_adjustment import refine_reconstruction
 from .dense_mvs import run_dense_mvs
 from .mesh_extraction import bake_texture, extract_mesh_poisson, extract_mesh_tsdf
+from .neural_sfm import merge_point_maps_to_tracks, write_colmap_reconstruction
 
 __all__ = [
     "refine_reconstruction",
@@ -43,4 +49,6 @@ __all__ = [
     "extract_mesh_tsdf",
     "extract_mesh_poisson",
     "bake_texture",
+    "merge_point_maps_to_tracks",
+    "write_colmap_reconstruction",
 ]

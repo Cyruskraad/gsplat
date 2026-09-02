@@ -285,9 +285,16 @@ def refine_reconstruction(
     for iid, idx in image_id_to_idx.items():
         R_refined = w2c_refined[idx, :3, :3]
         t_refined = w2c_refined[idx, :3, 3]
-        reconstruction.images[iid].cam_from_world = pycolmap.Rigid3d(
-            pycolmap.Rotation3d(R_refined), t_refined
-        )
+        pose = pycolmap.Rigid3d(pycolmap.Rotation3d(R_refined), t_refined)
+        image = reconstruction.images[iid]
+        # Newer pycolmap (rig/frame model): Image.cam_from_world is
+        # read-only, poses live on the image's Frame. Older pycolmap:
+        # Image.cam_from_world is a plain settable attribute.
+        frame_id = getattr(image, "frame_id", None)
+        if frame_id is not None:
+            reconstruction.frame(frame_id).set_cam_from_world(image.camera_id, pose)
+        else:
+            image.cam_from_world = pose
     if refine_points:
         for pid in point3D_ids:
             reconstruction.points3D[pid].xyz = points_refined[point3D_id_to_idx[pid]]

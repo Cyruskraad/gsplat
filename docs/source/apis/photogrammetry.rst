@@ -30,3 +30,9 @@ Mesh Extraction
 
 .. automodule:: gsplat.photogrammetry.mesh_extraction
    :members: extract_mesh_tsdf, extract_mesh_poisson, bake_texture
+
+Neural SfM Import
+------------------
+
+.. automodule:: gsplat.photogrammetry.neural_sfm
+   :members: merge_point_maps_to_tracks, write_colmap_reconstruction

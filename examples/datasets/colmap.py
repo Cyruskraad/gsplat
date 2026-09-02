@@ -505,11 +505,13 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        mono_depth_dir: Optional[str] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.mono_depth_dir = mono_depth_dir
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -538,6 +540,19 @@ class Dataset:
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
 
+        mono_depth = None
+        if self.mono_depth_dir is not None:
+            image_name = self.parser.image_names[index]
+            stem = os.path.splitext(os.path.basename(image_name))[0]
+            mono_depth = np.load(os.path.join(self.mono_depth_dir, f"{stem}.npy"))
+            mono_depth = mono_depth.astype(np.float32)
+            if mono_depth.shape[:2] != image.shape[:2]:
+                mono_depth = cv2.resize(
+                    mono_depth,
+                    (image.shape[1], image.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
         if self.patch_size is not None:
             # Random crop.
             h, w = image.shape[:2]
@@ -546,6 +561,10 @@ class Dataset:
             image = image[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
+            if mono_depth is not None:
+                mono_depth = mono_depth[
+                    y : y + self.patch_size, x : x + self.patch_size
+                ]
 
         data = {
             "K": torch.from_numpy(K).float(),
@@ -558,6 +577,8 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+        if mono_depth is not None:
+            data["mono_depth"] = torch.from_numpy(mono_depth)
 
         # Add exposure if available for this image
         exposure = self.parser.exposure_values[index]
