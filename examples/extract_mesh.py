@@ -27,6 +27,7 @@ writes `results/garden_2dgs/mesh.ply`. Pass `--method poisson
 reconstruction over a dense MVS point cloud (see `examples/dense_mvs.py`).
 """
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Literal, Optional
@@ -42,6 +43,7 @@ from gsplat.photogrammetry.mesh_extraction import (
     extract_mesh_poisson,
     extract_mesh_tsdf,
 )
+from gsplat.photogrammetry.metrics import mesh_quality_stats, point_to_mesh_distance
 
 
 @dataclass
@@ -99,12 +101,16 @@ def main(cfg: Config) -> None:
             sdf_trunc=cfg.sdf_trunc,
             device=cfg.device,
         )
+        # No dense MVS cloud on this path -- fall back to the sparse SfM
+        # cloud as the cloud-to-mesh fit reference.
+        reference_points = parser.points
     elif cfg.method == "poisson":
         assert cfg.dense_points, "--dense_points is required for --method poisson."
         pcd = o3d.io.read_point_cloud(cfg.dense_points)
         points_xyz = np.asarray(pcd.points)
         points_rgb = np.asarray(pcd.colors) if pcd.has_colors() else None
         mesh = extract_mesh_poisson(points_xyz, points_rgb, depth=cfg.poisson_depth)
+        reference_points = points_xyz
     else:
         raise ValueError(f"Unknown method: {cfg.method!r}")
 
@@ -121,6 +127,18 @@ def main(cfg: Config) -> None:
     out_path = os.path.join(cfg.result_dir, "mesh.ply")
     o3d.io.write_triangle_mesh(out_path, mesh)
     print(f"[extract_mesh] wrote {out_path}")
+
+    stats = mesh_quality_stats(mesh)
+    stats["point_to_mesh"] = point_to_mesh_distance(reference_points, mesh)
+    print(
+        f"[extract_mesh] watertight={stats['is_watertight']} "
+        f"components={stats['num_connected_components']} "
+        f"cloud-to-mesh mean={stats['point_to_mesh']['mean']:.4f}"
+    )
+    stats_path = os.path.join(cfg.result_dir, "mesh_metrics.json")
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"[extract_mesh] wrote stats to {stats_path}")
 
 
 if __name__ == "__main__":

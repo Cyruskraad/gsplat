@@ -30,6 +30,11 @@ extraction to go from SfM data all the way to a textured mesh:
         --ckpt results/garden_2dgs/ckpts/ckpt_29999_rank0.pt \
         --data_dir data/360_v2/garden --result_dir results/garden_2dgs
 
+Each stage above writes automatic quality metrics (:mod:`gsplat.photogrammetry.metrics`)
+to a ``stats/*.json`` file next to its output -- run
+``python examples/summarize_photogrammetry_stats.py --result_dir results/garden_2dgs
+--data_dir data/360_v2/garden`` to aggregate them into one report.
+
 See ``docs/photogrammetry.md`` (repo root) for the full guide, including how
 to wire the refined poses / dense point cloud into the trainer's
 ``Parser(..., colmap_dir=..., dense_points_path=...)`` arguments, and

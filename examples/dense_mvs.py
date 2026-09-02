@@ -29,13 +29,17 @@ argument to densify Gaussian initialization, or to
 `gsplat.photogrammetry.mesh_extraction.extract_mesh_poisson`.
 """
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Optional
 
+import numpy as np
+import open3d as o3d
 import tyro
 
 from gsplat.photogrammetry.dense_mvs import run_dense_mvs
+from gsplat.photogrammetry.metrics import point_cloud_stats
 
 
 @dataclass
@@ -69,6 +73,17 @@ def main(cfg: Config) -> None:
         max_image_size=cfg.max_image_size,
     )
     print(f"[dense_mvs] wrote fused dense point cloud to {dense_ply}")
+
+    pcd = o3d.io.read_point_cloud(dense_ply)
+    stats = point_cloud_stats(np.asarray(pcd.points))
+    print(
+        f"[dense_mvs] {stats['num_points']} points, "
+        f"mean k-NN spacing {stats['mean_knn_distance']:.4f}"
+    )
+    stats_path = os.path.join(output_dir, "dense_stats.json")
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"[dense_mvs] wrote stats to {stats_path}")
 
 
 if __name__ == "__main__":

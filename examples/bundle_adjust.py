@@ -23,6 +23,7 @@ can then be used in place of ``sparse/0`` by pointing
 ``examples.datasets.colmap.Parser`` at it via its ``colmap_dir`` argument.
 """
 
+import json
 import os
 from dataclasses import dataclass
 
@@ -86,6 +87,11 @@ def main(cfg: Config) -> None:
         f"{stats['mean_reprojection_error_after']:.4f}px"
     )
     print(f"[bundle_adjust] wrote refined reconstruction to {output_dir}")
+
+    stats_path = os.path.join(output_dir, "bundle_adjust_stats.json")
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"[bundle_adjust] wrote stats to {stats_path}")
 
 
 if __name__ == "__main__":

@@ -36,3 +36,9 @@ Neural SfM Import
 
 .. automodule:: gsplat.photogrammetry.neural_sfm
    :members: merge_point_maps_to_tracks, write_colmap_reconstruction
+
+Automatic Metrics
+------------------
+
+.. automodule:: gsplat.photogrammetry.metrics
+   :members: point_to_mesh_distance, mesh_quality_stats, point_cloud_stats

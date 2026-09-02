@@ -1042,6 +1042,10 @@ class Runner:
             bake_texture,
             extract_mesh_tsdf,
         )
+        from gsplat.photogrammetry.metrics import (
+            mesh_quality_stats,
+            point_to_mesh_distance,
+        )
 
         print("Running mesh extraction...")
         cfg = self.cfg
@@ -1067,6 +1071,19 @@ class Runner:
         mesh_path = f"{cfg.result_dir}/mesh_{step}.ply"
         o3d.io.write_triangle_mesh(mesh_path, mesh)
         print(f"Mesh saved to {mesh_path}")
+
+        # Mesh quality + cloud-to-mesh fit against the sparse SfM cloud,
+        # written next to this run's stats/val_step*.json render-quality
+        # reports (see Runner.eval()).
+        mesh_stats = mesh_quality_stats(mesh)
+        mesh_stats["point_to_mesh"] = point_to_mesh_distance(self.parser.points, mesh)
+        print(
+            f"[extract_mesh] watertight={mesh_stats['is_watertight']} "
+            f"components={mesh_stats['num_connected_components']} "
+            f"cloud-to-mesh mean={mesh_stats['point_to_mesh']['mean']:.4f}"
+        )
+        with open(f"{self.stats_dir}/mesh_step{step:04d}.json", "w") as f:
+            json.dump(mesh_stats, f)
 
     @torch.no_grad()
     def _viewer_render_fn(

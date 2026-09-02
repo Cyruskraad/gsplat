@@ -16,11 +16,16 @@ changes required:
   cleaned, colored triangle mesh from a trained 2DGS/3DGS scene, via TSDF
   fusion of rendered depth/normal maps or Poisson reconstruction from a dense
   point cloud, with vertex-color texture baking from the training images.
+- **Automatic metrics** (`gsplat.photogrammetry.metrics`) reports
+  quantitative quality stats -- mesh watertightness/connected-components,
+  cloud-to-mesh fit, point-cloud density -- for the stages above, written to
+  `stats/*.json` files next to the trainer's existing PSNR/SSIM/LPIPS
+  render-quality reports.
 
-`mesh_extraction` requires the optional `open3d` dependency: `pip install
-gsplat[mesh]`. `dense_mvs` requires a CUDA-enabled `colmap` command-line
-install (see https://colmap.github.io/install.html) -- `pycolmap` alone does
-not expose patch-match stereo.
+`mesh_extraction`/`metrics` require the optional `open3d` dependency: `pip
+install gsplat[mesh]`. `dense_mvs` requires a CUDA-enabled `colmap`
+command-line install (see https://colmap.github.io/install.html) --
+`pycolmap` alone does not expose patch-match stereo.
 
 ## How to Use
 
@@ -54,7 +59,12 @@ python examples/extract_mesh.py \
 
 This writes `data/360_v2/garden/sparse/refined/` (refined COLMAP model),
 `data/360_v2/garden/dense/dense.ply` (dense point cloud), and
-`results/garden_2dgs/mesh.ply` (textured mesh).
+`results/garden_2dgs/mesh.ply` (textured mesh) -- and, alongside each,
+automatic quality stats: `.../sparse/refined/bundle_adjust_stats.json`
+(reprojection error before/after), `.../dense/dense_stats.json` (point
+count, k-NN density), and `results/garden_2dgs/mesh_metrics.json`
+(watertightness, connected components, cloud-to-mesh fit against the sparse
+or dense cloud).
 
 To reconstruct a mesh via Poisson reconstruction over the dense MVS cloud
 instead of TSDF fusion:
@@ -86,7 +96,30 @@ This shortcut only covers the TSDF path (`--mesh_bake_texture`,
 `--mesh_voxel_size`, `--mesh_sdf_trunc` mirror `extract_mesh.py`'s options) --
 Poisson reconstruction and the dense-MVS point cloud path still need the
 standalone `examples/extract_mesh.py` script, since the trainer has no dense
-point cloud of its own to reconstruct from.
+point cloud of its own to reconstruct from. It writes mesh quality stats to
+`results/garden_2dgs/stats/mesh_step<step>.json`, next to `eval()`'s own
+`stats/val_step<step>.json` render-quality reports.
+
+### Automatic metrics & the consolidated report
+
+Every stage above that produces a geometric artifact (bundle adjustment,
+dense MVS, mesh extraction) now writes a `stats/*.json` file of automatic
+quality metrics (`gsplat.photogrammetry.metrics`) next to its output, using
+the same convention the trainer's `eval()` already uses for render quality
+(PSNR/SSIM/LPIPS). To pull everything for one run together into a single
+report:
+
+```bash
+python examples/summarize_photogrammetry_stats.py \
+    --result_dir results/garden_2dgs --data_dir data/360_v2/garden
+```
+
+This finds and aggregates whichever of `bundle_adjust_stats.json`,
+`dense_stats.json`, `mesh_metrics.json`/`mesh_step*.json`, and
+`val_step*.json` are present under `--result_dir`/`--data_dir`, prints a
+summary table, and writes `results/garden_2dgs/pipeline_report.json` --
+mirroring `examples/benchmarks/compression/summarize_stats.py`'s
+read-then-write pattern.
 
 ### Monocular depth-prior supervision (AI-assisted)
 
@@ -209,3 +242,7 @@ something gsplat ships.
   `bake_texture(mesh, dataset, ...)` operate on a loaded checkpoint's
   `"splats"` state dict and an `examples.datasets.colmap.Dataset`, returning
   `open3d.geometry.TriangleMesh` objects.
+- `gsplat.photogrammetry.metrics.point_to_mesh_distance(points, mesh, ...)` /
+  `mesh_quality_stats(mesh)` / `point_cloud_stats(points, ...)` return plain
+  dicts of quality stats for a mesh or point cloud, independent of how it was
+  produced -- the functions the CLIs above write to `stats/*.json` with.
