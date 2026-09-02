@@ -249,7 +249,12 @@ def _tsdf_fuse(
         )
         K = view["K"]
         intrinsic = o3d.camera.PinholeCameraIntrinsic(
-            width, height, float(K[0, 0]), float(K[1, 1]), float(K[0, 2]), float(K[1, 2])
+            width,
+            height,
+            float(K[0, 0]),
+            float(K[1, 1]),
+            float(K[0, 2]),
+            float(K[1, 2]),
         )
         volume.integrate(rgbd, intrinsic, view["extrinsic"])
 
@@ -368,10 +373,7 @@ def bake_texture(mesh, dataset, max_views: Optional[int] = None):
         uvw = (K @ Xc.T).T
         uv = uvw[:, :2] / np.clip(uvw[:, 2:3], 1e-8, None)
         in_bounds = (
-            (uv[:, 0] >= 0)
-            & (uv[:, 0] < width)
-            & (uv[:, 1] >= 0)
-            & (uv[:, 1] < height)
+            (uv[:, 0] >= 0) & (uv[:, 0] < width) & (uv[:, 1] >= 0) & (uv[:, 1] < height)
         )
         candidates = np.nonzero(in_front & in_bounds)[0]
         if candidates.size == 0:
@@ -410,8 +412,6 @@ def bake_texture(mesh, dataset, max_views: Optional[int] = None):
         if mesh.has_vertex_colors()
         else np.zeros((num_vertices, 3))
     )
-    vertex_colors[has_color] = (
-        color_accum[has_color] / weight_accum[has_color, None]
-    )
+    vertex_colors[has_color] = color_accum[has_color] / weight_accum[has_color, None]
     mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(vertex_colors, 0.0, 1.0))
     return mesh

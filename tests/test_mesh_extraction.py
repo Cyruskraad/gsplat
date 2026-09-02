@@ -22,7 +22,9 @@ cloud respectively.
 import numpy as np
 import pytest
 
-pytest.importorskip("open3d", reason="open3d is not installed (pip install gsplat[mesh])")
+pytest.importorskip(
+    "open3d", reason="open3d is not installed (pip install gsplat[mesh])"
+)
 
 from gsplat.photogrammetry.mesh_extraction import _tsdf_fuse, extract_mesh_poisson
 
@@ -93,7 +95,9 @@ def test_tsdf_fuse_reconstructs_sphere():
     verts = np.asarray(mesh.vertices)
     radii = np.linalg.norm(verts, axis=1)
     mean_radius_err = np.mean(np.abs(radii - 1.0))
-    assert mean_radius_err < 0.1, f"mesh doesn't look like a unit sphere: {mean_radius_err}"
+    assert (
+        mean_radius_err < 0.1
+    ), f"mesh doesn't look like a unit sphere: {mean_radius_err}"
 
 
 def test_extract_mesh_poisson_reconstructs_sphere():
@@ -109,4 +113,6 @@ def test_extract_mesh_poisson_reconstructs_sphere():
     verts = np.asarray(mesh.vertices)
     radii = np.linalg.norm(verts, axis=1)
     mean_radius_err = np.mean(np.abs(radii - 1.0))
-    assert mean_radius_err < 0.15, f"mesh doesn't look like a unit sphere: {mean_radius_err}"
+    assert (
+        mean_radius_err < 0.15
+    ), f"mesh doesn't look like a unit sphere: {mean_radius_err}"

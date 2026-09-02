@@ -144,9 +144,9 @@ def _optimize(
             + ((rot_delta * mask) ** 2).sum(-1).mean()
         )
         if refine_points:
-            reg_loss = reg_loss + anchor_reg * (
-                (points - points_init) ** 2
-            ).sum(-1).mean()
+            reg_loss = (
+                reg_loss + anchor_reg * ((points - points_init) ** 2).sum(-1).mean()
+            )
 
         loss = reproj_loss + reg_loss
         loss.backward()

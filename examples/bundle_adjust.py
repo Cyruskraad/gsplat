@@ -76,8 +76,10 @@ def main(cfg: Config) -> None:
         refine_points=cfg.refine_points,
         device=cfg.device,
     )
-    print(f"[bundle_adjust] {stats['num_images']} images, {stats['num_points']} points, "
-          f"{stats['num_observations']} observations")
+    print(
+        f"[bundle_adjust] {stats['num_images']} images, {stats['num_points']} points, "
+        f"{stats['num_observations']} observations"
+    )
     print(
         "[bundle_adjust] mean reprojection error: "
         f"{stats['mean_reprojection_error_before']:.4f}px -> "

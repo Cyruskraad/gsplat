@@ -115,9 +115,7 @@ def test_optimize_recovers_perturbed_poses_and_points():
         R_noise = _so3_exp(torch.from_numpy(noise_r)).numpy()
         w2c_noisy[i, :3, :3] = R_noise @ w2c[i, :3, :3]
         w2c_noisy[i, :3, 3] = w2c[i, :3, 3] + noise_t
-    points_noisy = points + rng.normal(scale=0.02, size=points.shape).astype(
-        np.float32
-    )
+    points_noisy = points + rng.normal(scale=0.02, size=points.shape).astype(np.float32)
 
     result = _optimize(
         w2c_init=torch.from_numpy(w2c_noisy).to(device),
