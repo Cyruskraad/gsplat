@@ -530,18 +530,13 @@ class Dataset:
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
 
-        if len(params) > 0:
-            # Images are distorted. Undistort them.
-            mapx, mapy = (
-                self.parser.mapx_dict[camera_id],
-                self.parser.mapy_dict[camera_id],
-            )
-            image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
-            x, y, w, h = self.parser.roi_undist_dict[camera_id]
-            image = image[y : y + h, x : x + w]
-
         mono_depth = None
         if self.mono_depth_dir is not None:
+            # Load and resize to the *original* (pre-undistortion) image
+            # resolution now, so it goes through the same undistortion remap
+            # + ROI crop as `image` below and stays pixel-aligned with it --
+            # a plain post-undistortion resize would leave it misaligned
+            # under any non-trivial lens distortion.
             image_name = self.parser.image_names[index]
             stem = os.path.splitext(os.path.basename(image_name))[0]
             mono_depth = np.load(os.path.join(self.mono_depth_dir, f"{stem}.npy"))
@@ -552,6 +547,19 @@ class Dataset:
                     (image.shape[1], image.shape[0]),
                     interpolation=cv2.INTER_LINEAR,
                 )
+
+        if len(params) > 0:
+            # Images are distorted. Undistort them.
+            mapx, mapy = (
+                self.parser.mapx_dict[camera_id],
+                self.parser.mapy_dict[camera_id],
+            )
+            image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
+            x, y, w, h = self.parser.roi_undist_dict[camera_id]
+            image = image[y : y + h, x : x + w]
+            if mono_depth is not None:
+                mono_depth = cv2.remap(mono_depth, mapx, mapy, cv2.INTER_LINEAR)
+                mono_depth = mono_depth[y : y + h, x : x + w]
 
         if self.patch_size is not None:
             # Random crop.

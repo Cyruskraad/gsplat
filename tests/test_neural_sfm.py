@@ -15,7 +15,7 @@
 
 """Tests for gsplat.photogrammetry.neural_sfm, on synthetic multi-view point
 maps (no real DUSt3R/MASt3R/VGGT tool needed -- this module is a tool-agnostic
-adapter, see its docstring). `merge_point_maps_to_tracks` is pure numpy/scipy/
+adapter, see its docstring). `merge_point_maps_to_tracks` is pure numpy/
 scikit-learn and tested directly; `write_colmap_reconstruction` needs
 pycolmap, and is tested end-to-end including feeding its output into
 `bundle_adjustment.refine_reconstruction`, proving the two compose as
@@ -25,7 +25,6 @@ intended.
 import numpy as np
 import pytest
 
-pytest.importorskip("scipy", reason="scipy not installed")
 pytest.importorskip("sklearn", reason="scikit-learn not installed")
 
 from gsplat.photogrammetry.neural_sfm import (
@@ -100,6 +99,43 @@ def test_merge_point_maps_to_tracks_merges_shared_points():
     )
     assert len(result_filtered["tracks"]) == 20
     assert all(len(t) == num_cameras for t in result_filtered["tracks"])
+
+
+def test_merge_point_maps_to_tracks_does_not_chain():
+    """Single-linkage clustering (connected-components on a radius graph) can
+    chain points transitively into one giant cluster even when its endpoints
+    are much farther apart than merge_radius -- e.g. a dense line of points
+    each merge_radius/2 apart. merge_point_maps_to_tracks must not do this:
+    every merged track's points should be mutually within merge_radius.
+    """
+    merge_radius = 0.1
+    # A chain of 20 points spaced merge_radius/2 apart along the x-axis:
+    # adjacent points are well within merge_radius of each other, but the
+    # first and last points are ~1.9 apart -- 19x merge_radius.
+    chain = np.stack(
+        [np.arange(20) * (merge_radius / 2), np.zeros(20), np.zeros(20)], axis=1
+    )
+    points_per_image = [chain[i : i + 1] for i in range(20)]
+    pixel_xy_per_image = [np.array([[float(i), 0.0]]) for i in range(20)]
+
+    result = merge_point_maps_to_tracks(
+        points_per_image, pixel_xy_per_image, merge_radius=merge_radius
+    )
+
+    # Reconstruct which original chain points landed in each track (via the
+    # image index each observation came from -- image i only ever contained
+    # chain point i) and assert every track's span stays within merge_radius.
+    for track in result["tracks"]:
+        member_positions = chain[[obs[0] for obs in track]]
+        pairwise_span = np.linalg.norm(
+            member_positions[:, None, :] - member_positions[None, :, :], axis=-1
+        )
+        assert pairwise_span.max() <= merge_radius + 1e-9, (
+            f"track spans {pairwise_span.max():.3f}, exceeding merge_radius "
+            f"{merge_radius} -- points were chained rather than merged"
+        )
+    # And no information was lost: every chain point appears in exactly one track.
+    assert sum(len(t) for t in result["tracks"]) == 20
 
 
 def test_write_colmap_reconstruction_round_trip(tmp_path):

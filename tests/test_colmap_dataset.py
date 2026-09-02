@@ -244,3 +244,60 @@ def test_dataset_mono_depth_dir_with_patch_crop(synthetic_dataset, tmp_path):
     item = dataset[0]
     assert item["image"].shape[:2] == (16, 16)
     assert item["mono_depth"].shape == (16, 16)
+
+
+def test_dataset_mono_depth_dir_stays_aligned_under_distortion(tmp_path):
+    """A distorted camera's mono_depth must go through the same undistortion
+    remap + ROI crop as the image, not just a plain resize -- otherwise the
+    two become spatially misaligned. Build `mono_depth` as an exact copy of
+    the image's own red channel; since both then go through the identical
+    cv2.remap/crop, they should end up numerically matching.
+    """
+    data_dir = str(tmp_path)
+    sparse_dir = os.path.join(data_dir, "sparse", "0")
+    images_dir = os.path.join(data_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+
+    width, height = 80, 60
+    recon = pycolmap.Reconstruction()
+    # SIMPLE_RADIAL params: [f, cx, cy, k] -- a non-trivial k so undistortion
+    # actually warps content, not just crops it.
+    camera = pycolmap.Camera.create_from_model_id(
+        1, pycolmap.CameraModelId.SIMPLE_RADIAL, 60.0, width, height
+    )
+    camera.params = np.array([60.0, width / 2, height / 2, -0.25], dtype=np.float64)
+    recon.add_camera_with_trivial_rig(camera)
+
+    img = pycolmap.Image()
+    img.image_id = 1
+    img.camera_id = 1
+    img.name = "img000.png"
+    img.points2D = []
+    cam_from_world = pycolmap.Rigid3d(pycolmap.Rotation3d(np.eye(3)), np.zeros(3))
+    recon.add_image_with_trivial_frame(img, cam_from_world)
+
+    os.makedirs(sparse_dir, exist_ok=True)
+    recon.write(sparse_dir)
+
+    rng = np.random.default_rng(5)
+    image = rng.uniform(0, 255, size=(height, width, 3)).astype(np.uint8)
+    imageio.imwrite(os.path.join(images_dir, "img000.png"), image)
+
+    mono_depth_dir = str(tmp_path / "mono_depth")
+    os.makedirs(mono_depth_dir, exist_ok=True)
+    # Exact copy of the red channel -- same content, so the two should
+    # receive numerically matching geometric warps.
+    np.save(
+        os.path.join(mono_depth_dir, "img000.npy"), image[..., 0].astype(np.float32)
+    )
+
+    parser = Parser(data_dir=data_dir, factor=1, normalize=False, test_every=100)
+    assert len(parser.params_dict[1]) > 0, "camera should have distortion params"
+
+    dataset = Dataset(parser, split="val", mono_depth_dir=mono_depth_dir)
+    item = dataset[0]
+
+    image_red = item["image"][..., 0].numpy()
+    mono = item["mono_depth"].numpy()
+    assert image_red.shape == mono.shape
+    np.testing.assert_allclose(mono, image_red, atol=2.0)

@@ -33,7 +33,7 @@ This package closes the SfM -> dense MVS -> Gaussian Splatting -> mesh loop:
 ``mesh_extraction`` requires the optional ``open3d`` dependency
 (``pip install gsplat[mesh]``); ``bundle_adjustment``/``neural_sfm`` require
 ``pycolmap`` (already required by the example COLMAP data loader);
-``neural_sfm``'s point-merging step also requires ``scipy``/``scikit-learn``;
+``neural_sfm``'s point-merging step also requires ``scikit-learn``;
 ``dense_mvs`` requires the ``colmap`` command-line tool (built with CUDA
 support) on ``PATH``.
 """

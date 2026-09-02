@@ -33,8 +33,10 @@ Two functions, used in sequence:
   one dense 3D point *per pixel per image*, with no COLMAP-style track
   structure linking the same 3D point as seen by multiple images. A track of
   length 1 gives bundle adjustment no cross-view constraint at all, so this
-  merges near-duplicate points across images (radius-based nearest-neighbor
-  clustering) into shared tracks.
+  merges near-duplicate points across images (complete-linkage clustering,
+  bounding every merged track's spatial extent to ``merge_radius`` -- unlike
+  single-linkage/connected-components, which can chain far-apart points
+  together through a dense intermediate run) into shared tracks.
 - :func:`write_colmap_reconstruction` -- builds a ``pycolmap.Reconstruction``
   from scratch (poses + merged tracks) and writes it to disk as a normal
   COLMAP sparse model.
@@ -88,12 +90,11 @@ def merge_point_maps_to_tracks(
         observations for that merged point.
     """
     try:
-        from scipy.sparse.csgraph import connected_components
-        from sklearn.neighbors import radius_neighbors_graph
+        from sklearn.cluster import AgglomerativeClustering
     except ImportError as e:
         raise ImportError(
-            "merge_point_maps_to_tracks requires scipy and scikit-learn. "
-            "Install them with `pip install scipy scikit-learn`."
+            "merge_point_maps_to_tracks requires scikit-learn. Install it "
+            "with `pip install scikit-learn`."
         ) from e
 
     num_images = len(points_per_image)
@@ -134,10 +135,19 @@ def merge_point_maps_to_tracks(
         np.concatenate(all_colors, axis=0) if colors_per_image is not None else None
     )
 
-    graph = radius_neighbors_graph(
-        points, radius=merge_radius, mode="connectivity", include_self=False
-    )
-    num_components, labels = connected_components(graph, directed=False)
+    if points.shape[0] == 1:
+        labels = np.zeros(1, dtype=np.int64)
+        num_components = 1
+    else:
+        # complete linkage: two clusters only merge while every cross-pair of
+        # points between them is within merge_radius, so (unlike single
+        # linkage / connected-components on a radius graph) a cluster can
+        # never grow into a long chain whose endpoints are far apart.
+        clustering = AgglomerativeClustering(
+            n_clusters=None, distance_threshold=merge_radius, linkage="complete"
+        )
+        labels = clustering.fit_predict(points)
+        num_components = int(labels.max()) + 1
 
     tracks: List[List[Tuple[int, Tuple[float, float]]]] = [
         [] for _ in range(num_components)

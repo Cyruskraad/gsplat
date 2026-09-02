@@ -639,7 +639,9 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
+                render_mode=(
+                    "RGB+ED" if (cfg.depth_loss or cfg.mono_depth_loss) else "RGB+D"
+                ),
                 distloss=self.cfg.dist_loss,
             )
             if renders.shape[-1] == 4:
