@@ -201,6 +201,17 @@ class Config:
     # Save training images to tensorboard
     tb_save_image: bool = False
 
+    # Extract a textured mesh (TSDF fusion of rendered depth maps) at the end
+    # of training / eval. Requires the optional `open3d` dependency
+    # (`pip install gsplat[mesh]`). See gsplat.photogrammetry.mesh_extraction.
+    extract_mesh: bool = False
+    # Bake per-vertex texture onto the extracted mesh from the training images
+    mesh_bake_texture: bool = True
+    # TSDF voxel size, in scene units
+    mesh_voxel_size: float = 0.01
+    # TSDF truncation distance, in scene units
+    mesh_sdf_trunc: float = 0.04
+
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
         self.save_steps = [int(i * factor) for i in self.save_steps]
@@ -778,6 +789,8 @@ class Runner:
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
                 self.eval(step)
                 self.render_traj(step)
+                if cfg.extract_mesh:
+                    self.extract_mesh(step)
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -981,6 +994,48 @@ class Runner:
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
+    def extract_mesh(self, step: int):
+        """Extract a textured mesh via TSDF fusion of rendered depth maps.
+
+        Single-command shortcut for what `examples/extract_mesh.py --method
+        tsdf` does standalone. Poisson reconstruction and the dense-MVS point
+        cloud path aren't available here (this trainer has no dense point
+        cloud to reconstruct from) -- use the standalone script for those.
+        """
+        # open3d (required by extract_mesh_tsdf/bake_texture) is only
+        # imported lazily inside gsplat.photogrammetry.mesh_extraction, which
+        # raises its own actionable ImportError if it's missing.
+        from gsplat.photogrammetry.mesh_extraction import (
+            bake_texture,
+            extract_mesh_tsdf,
+        )
+
+        print("Running mesh extraction...")
+        cfg = self.cfg
+        mesh = extract_mesh_tsdf(
+            self.splats,
+            self.trainset,
+            renderer="2dgs",
+            sh_degree=cfg.sh_degree,
+            voxel_size=cfg.mesh_voxel_size,
+            sdf_trunc=cfg.mesh_sdf_trunc,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+            device=self.device,
+        )
+        print(
+            f"[extract_mesh] {len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles"
+        )
+        if cfg.mesh_bake_texture:
+            mesh = bake_texture(mesh, self.trainset)
+
+        import open3d as o3d
+
+        mesh_path = f"{cfg.result_dir}/mesh_{step}.ply"
+        o3d.io.write_triangle_mesh(mesh_path, mesh)
+        print(f"Mesh saved to {mesh_path}")
+
+    @torch.no_grad()
     def _viewer_render_fn(
         self, camera_state: CameraState, render_tab_state: RenderTabState
     ):
@@ -1064,6 +1119,8 @@ def main(cfg: Config):
             runner.splats[k].data = ckpt["splats"][k]
         runner.eval(step=ckpt["step"])
         runner.render_traj(step=ckpt["step"])
+        if cfg.extract_mesh:
+            runner.extract_mesh(step=ckpt["step"])
     else:
         runner.train()
 

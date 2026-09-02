@@ -71,6 +71,23 @@ i.e. trained without `--app_opt`) -- appearance-embedding checkpoints are out
 of scope, since per-image appearance variation doesn't map onto a single
 canonical mesh texture.
 
+Steps 3-4 can also be collapsed into one command: pass `--extract_mesh` to
+`simple_trainer_2dgs.py` to run TSDF extraction + texture baking
+automatically at the end of training (writing `mesh_<step>.ply` alongside the
+checkpoint), instead of a separate `extract_mesh.py` call:
+
+```bash
+python examples/simple_trainer_2dgs.py \
+    --data_dir data/360_v2/garden --data_factor 4 \
+    --result_dir results/garden_2dgs --extract_mesh
+```
+
+This shortcut only covers the TSDF path (`--mesh_bake_texture`,
+`--mesh_voxel_size`, `--mesh_sdf_trunc` mirror `extract_mesh.py`'s options) --
+Poisson reconstruction and the dense-MVS point cloud path still need the
+standalone `examples/extract_mesh.py` script, since the trainer has no dense
+point cloud of its own to reconstruct from.
+
 ### For users using gsplat's API:
 
 - `gsplat.photogrammetry.bundle_adjustment.refine_reconstruction(colmap_dir,
