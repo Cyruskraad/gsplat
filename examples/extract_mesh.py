@@ -162,12 +162,22 @@ def main(cfg: Config) -> None:
     print(f"[extract_mesh] wrote {out_path}")
 
     stats = mesh_quality_stats(mesh)
-    stats["point_to_mesh"] = point_to_mesh_distance(reference_points, mesh)
-    print(
-        f"[extract_mesh] watertight={stats['is_watertight']} "
-        f"components={stats['num_connected_components']} "
-        f"cloud-to-mesh mean={stats['point_to_mesh']['mean']:.4f}"
-    )
+    if len(mesh.triangles) == 0:
+        # Extraction produced nothing usable. Say so plainly instead of
+        # letting the cloud-to-mesh measurement fail against an empty surface.
+        stats["point_to_mesh"] = None
+        print(
+            "[extract_mesh] WARNING: the extracted mesh has no triangles, so "
+            "there is no cloud-to-mesh fit to measure. Check --voxel_size / "
+            "--sdf_trunc (TSDF) or --poisson_depth for this scene."
+        )
+    else:
+        stats["point_to_mesh"] = point_to_mesh_distance(reference_points, mesh)
+        print(
+            f"[extract_mesh] watertight={stats['is_watertight']} "
+            f"components={stats['num_connected_components']} "
+            f"cloud-to-mesh mean={stats['point_to_mesh']['mean']:.4f}"
+        )
     stats_path = os.path.join(cfg.result_dir, "mesh_metrics.json")
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2)

@@ -21,7 +21,7 @@
        tests/test_neural_sfm.py tests/test_colmap_dataset.py \
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -q
    ```
-   Expect **69 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **72 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Then start from §5.1.** As of the latest session all three §5.1 items
    are still blocked (re-verified, see §4) — Actions is still off, the PR is
@@ -235,9 +235,9 @@ just re-asserting the buggy behavior):
 | `tests/test_mesh_extraction.py` | 10 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
 | `tests/test_colmap_dataset.py` | 14 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
-| `tests/test_photogrammetry_metrics.py` | 6 | Geometry metrics against known analytic ground truth |
+| `tests/test_photogrammetry_metrics.py` | 9 | Geometry metrics against known analytic ground truth |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
-| **Total** | **69** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| **Total** | **72** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -342,6 +342,25 @@ everything before them: by hand, since CI still cannot run.
   that recipe's exact output format (PIL, single-channel uint8 from a bool
   array -- a different writer from the `imageio` masks the other tests use).
 
+**Bugs found by probing degenerate inputs** (§2.7's eighth and ninth): an
+adversarial pass over the metrics surface -- feeding each function empty,
+single-element and non-finite input -- found two plausible inputs that failed
+opaquely rather than reporting anything useful.
+`point_to_mesh_distance(points, empty_mesh)` died with open3d's
+`IndexError: _Map_base::at`, and `extract_mesh.py` calls it unconditionally
+after writing the mesh, so a TSDF run that produced nothing usable (bad
+`--voxel_size`/`--sdf_trunc`) crashed opaquely at the very end of a long GPU
+run. It now raises a `ValueError` naming the likely cause, and
+`extract_mesh.py` checks first and prints what to adjust instead of failing.
+`point_cloud_stats(empty_cloud)` raised numpy's bare "zero-size array to
+reduction operation minimum"; an empty cloud is a real outcome (dense MVS
+fusing nothing) and the rest of the module reports empty input as zeros, so it
+now does too. Relatedly, `point_to_mesh_distance` with no points returns
+`None` distances rather than `0.0` -- "nothing was measured" and "the fit is
+perfect" must not look alike, least of all to
+`mesh_fit_over_point_spacing`, which divides by them (confirmed: a null
+`point_to_mesh` omits that metric rather than fabricating one).
+
 **Bug found while verifying the depth recipe** (§2.7's seventh): a `(1, H, W)`
 depth map -- the shape a transformers depth-estimation pipeline's
 `predicted_depth` commonly has, and what the documented recipe produced --
@@ -366,7 +385,7 @@ write. This affected every stage, not just the new gate.
 **What was actually executed for these** (same sandbox: no GPU, no CUDA
 extension, no capture data):
 
-- Full suite 69 passed. Every new guard was mutation-checked rather than just
+- Full suite 72 passed. Every new guard was mutation-checked rather than just
   asserted: removing the depth-map squeeze/ndim guard fails its test;
   vertically flipping the baked atlas fails the UV-convention test;
   removing the seam-fill edge-blanking fails the wrap test; calling

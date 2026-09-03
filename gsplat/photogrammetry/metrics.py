@@ -93,13 +93,40 @@ def point_to_mesh_distance(
     Returns:
         A dict with ``num_points``, ``mean``, ``rms``, ``max``, and one
         ``p{percentile}`` entry per value in ``percentiles``, all in the
-        same scene units as ``points``/``mesh``.
+        same scene units as ``points``/``mesh``. With no points to measure,
+        the distance entries are ``None`` rather than ``0.0`` -- "nothing was
+        measured" and "the fit is perfect" must not look alike, here or in the
+        derived cross-stage metrics that divide by them.
+
+    Raises:
+        ValueError: If ``mesh`` has no triangles. There is no surface to
+            measure against, and open3d's raycaster fails on an empty scene
+            with an opaque ``IndexError: _Map_base::at`` -- which extraction
+            producing a degenerate mesh would otherwise surface at the very
+            end of a long run.
     """
     o3d = _require_open3d()
 
     points = np.asarray(points, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"points must have shape (P, 3), got {points.shape}")
+    if len(mesh.triangles) == 0:
+        raise ValueError(
+            "Cannot measure cloud-to-mesh distance against a mesh with no "
+            "triangles. Mesh extraction produced nothing usable -- check the "
+            "TSDF voxel_size/sdf_trunc or the Poisson depth for this scene."
+        )
+
+    empty_stats: Dict[str, float] = {
+        "num_points": 0,
+        "mean": None,
+        "rms": None,
+        "max": None,
+    }
+    if points.shape[0] == 0:
+        for p in percentiles:
+            empty_stats[f"p{p:g}"] = None
+        return empty_stats
 
     t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
     scene = o3d.t.geometry.RaycastingScene()
@@ -197,6 +224,20 @@ def point_cloud_stats(points: np.ndarray, k: int = 4) -> Dict[str, object]:
     if points.ndim != 2 or points.shape[1] != 3:
         raise ValueError(f"points must have shape (P, 3), got {points.shape}")
     num_points = points.shape[0]
+
+    if num_points == 0:
+        # An empty cloud is a real outcome (dense MVS fusing nothing), and the
+        # rest of this module reports empty input as zeros rather than
+        # raising; numpy's bare "zero-size array to reduction operation
+        # minimum" would say nothing about which stage produced nothing.
+        return {
+            "num_points": 0,
+            "bbox_min": [0.0, 0.0, 0.0],
+            "bbox_max": [0.0, 0.0, 0.0],
+            "bbox_extent": [0.0, 0.0, 0.0],
+            "mean_knn_distance": 0.0,
+            "median_knn_distance": 0.0,
+        }
 
     bbox_min = points.min(axis=0)
     bbox_max = points.max(axis=0)

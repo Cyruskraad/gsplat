@@ -113,3 +113,45 @@ def test_point_cloud_stats_single_point():
     assert stats["num_points"] == 1
     assert stats["mean_knn_distance"] == 0.0
     assert stats["median_knn_distance"] == 0.0
+
+
+def test_point_cloud_stats_empty_cloud():
+    """An empty cloud is a real outcome (dense MVS fusing nothing), and the
+    rest of this module reports empty input as zeros rather than raising.
+
+    Without this, numpy raised a bare "zero-size array to reduction operation
+    minimum", which says nothing about which stage produced nothing.
+    """
+    stats = point_cloud_stats(np.zeros((0, 3)))
+    assert stats["num_points"] == 0
+    assert stats["bbox_extent"] == [0.0, 0.0, 0.0]
+    assert stats["mean_knn_distance"] == 0.0
+    assert stats["median_knn_distance"] == 0.0
+    # Same keys as a populated cloud, so downstream readers don't special-case.
+    assert set(stats) == set(point_cloud_stats(np.zeros((5, 3))))
+
+
+def test_point_to_mesh_distance_rejects_an_empty_mesh():
+    """A degenerate extraction must report why, not fail opaquely.
+
+    open3d's raycaster fails on an empty scene with `IndexError:
+    _Map_base::at`, which mesh extraction producing nothing would otherwise
+    surface at the very end of a long run.
+    """
+    with pytest.raises(ValueError, match="no triangles"):
+        point_to_mesh_distance(np.zeros((5, 3)), o3d.geometry.TriangleMesh())
+
+
+def test_point_to_mesh_distance_with_no_points_reports_nothing_measured():
+    """No points measured must not read as a perfect fit.
+
+    `0.0` here would mean "every point lies exactly on the mesh" -- and would
+    feed a fake `mesh_fit_over_point_spacing` into the cross-stage metrics.
+    """
+    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=1.0, resolution=6)
+    stats = point_to_mesh_distance(np.zeros((0, 3)), sphere)
+    assert stats["num_points"] == 0
+    assert stats["mean"] is None and stats["rms"] is None and stats["max"] is None
+    # Percentile keys are present too, so the schema doesn't change shape.
+    populated = point_to_mesh_distance(np.zeros((5, 3)), sphere)
+    assert set(stats) == set(populated)
