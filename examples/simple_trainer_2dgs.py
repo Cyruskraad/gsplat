@@ -247,8 +247,15 @@ class Config:
     # of training / eval. Requires the optional `open3d` dependency
     # (`pip install gsplat[mesh]`). See gsplat.photogrammetry.mesh_extraction.
     extract_mesh: bool = False
-    # Bake per-vertex texture onto the extracted mesh from the training images
+    # Bake texture onto the extracted mesh from the training images
     mesh_bake_texture: bool = True
+    # How to represent the baked texture. "vertex" writes per-vertex colors
+    # into a .ply; "atlas" UV-unwraps the mesh and bakes a texture image,
+    # writing a .obj + .mtl + .png that standard DCC tools and game engines
+    # load with the texture attached (see gsplat.photogrammetry.mesh_extraction)
+    mesh_texture_mode: Literal["vertex", "atlas"] = "vertex"
+    # Atlas width/height in texels (--mesh_texture_mode atlas only)
+    mesh_texture_size: int = 2048
     # TSDF voxel size, in scene units
     mesh_voxel_size: float = 0.01
     # TSDF truncation distance, in scene units
@@ -1086,7 +1093,7 @@ class Runner:
         # imported lazily inside gsplat.photogrammetry.mesh_extraction, which
         # raises its own actionable ImportError if it's missing.
         from gsplat.photogrammetry.mesh_extraction import (
-            bake_texture,
+            bake_mesh_texture,
             extract_mesh_tsdf,
         )
         from gsplat.photogrammetry.metrics import (
@@ -1110,12 +1117,26 @@ class Runner:
         print(
             f"[extract_mesh] {len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles"
         )
+        texture = None
         if cfg.mesh_bake_texture:
-            mesh = bake_texture(mesh, self.trainset)
+            mesh, texture = bake_mesh_texture(
+                mesh,
+                self.trainset,
+                mode=cfg.mesh_texture_mode,
+                texture_size=cfg.mesh_texture_size,
+            )
+            if texture is not None:
+                print(
+                    f"[extract_mesh] baked a {texture.shape[1]}x{texture.shape[0]} "
+                    "UV texture atlas from training images"
+                )
 
         import open3d as o3d
 
-        mesh_path = f"{cfg.result_dir}/mesh_{step}.ply"
+        # A UV atlas needs a format that can carry UVs and a texture image;
+        # .ply cannot, so an atlas mesh is written as .obj (+ .mtl + .png).
+        mesh_ext = "obj" if texture is not None else "ply"
+        mesh_path = f"{cfg.result_dir}/mesh_{step}.{mesh_ext}"
         o3d.io.write_triangle_mesh(mesh_path, mesh)
         print(f"Mesh saved to {mesh_path}")
 

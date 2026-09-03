@@ -25,7 +25,8 @@ This package closes the SfM -> dense MVS -> Gaussian Splatting -> mesh loop:
 - :mod:`gsplat.photogrammetry.mesh_extraction` - extracts a cleaned, colored
   triangle mesh from a trained 2DGS/3DGS scene (TSDF fusion of rendered
   depth/normal maps, or Poisson reconstruction from a dense point cloud), with
-  vertex-color texture baking from the training images.
+  texture baking from the training images -- either per-vertex colors or a
+  UV-unwrapped texture atlas.
 - :mod:`gsplat.photogrammetry.neural_sfm` - imports feed-forward neural-SfM
   output (DUSt3R/MASt3R/VGGT-style, run externally) as a COLMAP model, so it
   becomes a drop-in alternative to COLMAP for the rest of the pipeline.
@@ -49,7 +50,13 @@ requires the ``colmap`` command-line tool (built with CUDA support) on
 
 from .bundle_adjustment import refine_reconstruction
 from .dense_mvs import run_dense_mvs
-from .mesh_extraction import bake_texture, extract_mesh_poisson, extract_mesh_tsdf
+from .mesh_extraction import (
+    bake_mesh_texture,
+    bake_texture,
+    bake_texture_atlas,
+    extract_mesh_poisson,
+    extract_mesh_tsdf,
+)
 from .metrics import (
     depth_prior_stats,
     mask_coverage_stats,
@@ -74,6 +81,8 @@ __all__ = [
     "extract_mesh_tsdf",
     "extract_mesh_poisson",
     "bake_texture",
+    "bake_texture_atlas",
+    "bake_mesh_texture",
     "merge_point_maps_to_tracks",
     "write_colmap_reconstruction",
     "point_to_mesh_distance",

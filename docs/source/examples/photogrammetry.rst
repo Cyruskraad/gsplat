@@ -58,5 +58,12 @@ externally-segmented transient content (people, vehicles, ...) from training
 and mesh fusion -- see "Monocular depth-prior supervision" and
 "Transient/dynamic-object masking" in ``docs/photogrammetry.md``.
 
+Step 4 bakes per-vertex colors by default, whose resolution is limited by the
+mesh's vertex density. Pass ``--texture_mode atlas`` (``--texture_size`` sets
+the resolution) to UV-unwrap the mesh and bake a real texture atlas instead,
+writing ``mesh.obj`` + ``mesh.mtl`` + ``mesh_0.png`` -- a mesh that loads with
+its texture attached in standard DCC tools and game engines. See "Texture:
+per-vertex colors or a UV atlas" in ``docs/photogrammetry.md``.
+
 See ``docs/photogrammetry.md`` (repo root) for the full guide and
 :doc:`../apis/photogrammetry` for the Python API.

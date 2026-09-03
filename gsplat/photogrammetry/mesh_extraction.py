@@ -28,7 +28,11 @@ surface mesh -- this module closes that gap with two complementary paths:
   fallback).
 
 :func:`bake_texture` then colors a mesh's vertices from the training images,
-with occlusion-aware, view-angle-weighted blending across views.
+with occlusion-aware, view-angle-weighted blending across views;
+:func:`bake_texture_atlas` bakes the same multi-view color signal into a
+UV-unwrapped texture atlas instead, so the result carries detail beyond the
+mesh's vertex density and loads with its texture in standard DCC tools and
+game engines.
 
 Requires the optional ``open3d`` dependency: ``pip install gsplat[mesh]``.
 Only SH-color checkpoints (containing ``"sh0"``/``"shN"``) are supported --
@@ -37,6 +41,7 @@ scope, since per-image appearance variation doesn't map onto a single
 canonical mesh texture.
 """
 
+import warnings
 from typing import Dict, Optional
 
 import numpy as np
@@ -325,19 +330,121 @@ def extract_mesh_poisson(
     return _clean_mesh(mesh)
 
 
+def _bake_points_from_views(
+    mesh,
+    dataset,
+    points: np.ndarray,
+    normals: np.ndarray,
+    max_views: Optional[int] = None,
+    chunk_size: int = 1 << 20,
+):
+    """Accumulate occlusion-aware, view-weighted colors for surface points.
+
+    Shared by :func:`bake_texture` (which bakes at mesh vertices) and
+    :func:`bake_texture_atlas` (which bakes at texel positions), so both
+    produce the same color signal and only differ in where they sample it.
+
+    For each point, projects into every (or up to ``max_views``) training
+    camera, discards out-of-frame projections and -- via ray casting against
+    ``mesh`` itself -- occluded ones, and accumulates the remaining observed
+    pixel colors weighted by view-direction/surface-normal alignment and
+    inverse distance.
+
+    Args:
+        mesh: The ``open3d.geometry.TriangleMesh`` to ray-cast against for
+            occlusion. ``points`` are expected to lie on its surface.
+        dataset: An ``examples.datasets.colmap.Dataset``-like object yielding
+            dicts with ``"camtoworld"`` (4, 4), ``"K"`` (3, 3), and ``"image"``
+            ((H, W, 3), values in [0, 255]).
+        points: (P, 3) surface points to bake.
+        normals: (P, 3) unit-length outward normals, one per point.
+        max_views: If given, only the first ``max_views`` dataset images are
+            used (for speed on large datasets).
+        chunk_size: Max points ray-cast at once, bounding peak memory when
+            baking the millions of texels a large atlas can contain.
+
+    Returns:
+        ``(color_accum, weight_accum)``: a (P, 3) sum of weighted colors and
+        the (P,) sum of weights. Points with ``weight_accum == 0`` were never
+        observed.
+    """
+    o3d = _require_open3d()
+
+    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(t_mesh)
+
+    num_points = points.shape[0]
+    color_accum = np.zeros((num_points, 3), dtype=np.float64)
+    weight_accum = np.zeros((num_points,), dtype=np.float64)
+    if num_points == 0:
+        return color_accum, weight_accum
+
+    num_views = len(dataset) if max_views is None else min(max_views, len(dataset))
+    for i in range(num_views):
+        data = dataset[i]
+        camtoworld = data["camtoworld"].numpy()
+        K = data["K"].numpy()
+        image = data["image"].numpy() / 255.0  # (H, W, 3) in [0, 1]
+        height, width = image.shape[:2]
+        cam_pos = camtoworld[:3, 3]
+        viewmat = np.linalg.inv(camtoworld)
+
+        Xc = (viewmat[:3, :3] @ points.T + viewmat[:3, 3:4]).T  # (P, 3)
+        in_front = Xc[:, 2] > 1e-4
+        uvw = (K @ Xc.T).T
+        uv = uvw[:, :2] / np.clip(uvw[:, 2:3], 1e-8, None)
+        in_bounds = (
+            (uv[:, 0] >= 0) & (uv[:, 0] < width) & (uv[:, 1] >= 0) & (uv[:, 1] < height)
+        )
+        candidates = np.nonzero(in_front & in_bounds)[0]
+        if candidates.size == 0:
+            continue
+
+        for start in range(0, candidates.size, chunk_size):
+            chunk = candidates[start : start + chunk_size]
+            dirs = points[chunk] - cam_pos[None, :]
+            dists = np.linalg.norm(dirs, axis=1)
+            dirs_n = dirs / np.clip(dists, 1e-8, None)[:, None]
+            rays = np.concatenate(
+                [np.repeat(cam_pos[None, :], len(chunk), axis=0), dirs_n], axis=1
+            ).astype(np.float32)
+            hit_t = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
+            # Keep only points whose nearest ray hit is (approximately)
+            # themselves, i.e. not occluded by other geometry in this view.
+            visible = np.abs(hit_t - dists) < (1e-2 * dists + 1e-3)
+            chunk = chunk[visible]
+            if chunk.size == 0:
+                continue
+            dirs_n = dirs_n[visible]
+            dists = dists[visible]
+
+            px = np.clip(uv[chunk, 0].astype(np.int64), 0, width - 1)
+            py = np.clip(uv[chunk, 1].astype(np.int64), 0, height - 1)
+            sampled = image[py, px]  # (K, 3)
+
+            cos_weight = np.clip((normals[chunk] * -dirs_n).sum(-1), 0.0, 1.0)
+            dist_weight = 1.0 / np.clip(dists, 1e-3, None)
+            weight = cos_weight * dist_weight + 1e-6
+
+            # `chunk` indexes each point at most once per view, so a plain
+            # in-place add is correct (and much faster than np.add.at).
+            color_accum[chunk] += sampled * weight[:, None]
+            weight_accum[chunk] += weight
+
+    return color_accum, weight_accum
+
+
 def bake_texture(mesh, dataset, max_views: Optional[int] = None):
     """Bake per-vertex colors onto ``mesh`` from ``dataset``'s training images.
 
-    For each mesh vertex, projects into every (or up to ``max_views``)
-    training camera, discards occluded/out-of-frame projections via
-    ray-casting against ``mesh`` itself, and blends the remaining observed
-    pixel colors weighted by view-direction/vertex-normal alignment and
-    inverse distance.
+    Colors each mesh vertex by the occlusion-aware, view-weighted blend
+    described in :func:`_bake_points_from_views`.
 
-    This produces per-vertex colors, not a UV-unwrapped texture atlas (which
-    would need a UV unwrapper such as ``xatlas``) -- a deliberate scope
-    boundary: vertex colors are correct and sufficient for inspection/most
-    downstream uses, and adding UV-atlas baking is left as future work.
+    This produces per-vertex colors, whose effective resolution is the mesh's
+    own vertex density. For image-resolution detail independent of tessellation
+    -- and for a mesh that loads with its texture in standard DCC tools and
+    game engines -- use :func:`bake_texture_atlas` instead.
 
     Args:
         mesh: An ``open3d.geometry.TriangleMesh`` (e.g. from
@@ -357,70 +464,278 @@ def bake_texture(mesh, dataset, max_views: Optional[int] = None):
     if not mesh.has_vertex_normals():
         mesh.compute_vertex_normals()
 
-    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(t_mesh)
-
     vertices = np.asarray(mesh.vertices)
     vertex_normals = np.asarray(mesh.vertex_normals)
-    num_vertices = vertices.shape[0]
-    color_accum = np.zeros((num_vertices, 3), dtype=np.float64)
-    weight_accum = np.zeros((num_vertices,), dtype=np.float64)
-
-    num_views = len(dataset) if max_views is None else min(max_views, len(dataset))
-    for i in range(num_views):
-        data = dataset[i]
-        camtoworld = data["camtoworld"].numpy()
-        K = data["K"].numpy()
-        image = data["image"].numpy() / 255.0  # (H, W, 3) in [0, 1]
-        height, width = image.shape[:2]
-        cam_pos = camtoworld[:3, 3]
-        viewmat = np.linalg.inv(camtoworld)
-
-        Xc = (viewmat[:3, :3] @ vertices.T + viewmat[:3, 3:4]).T  # (V, 3)
-        in_front = Xc[:, 2] > 1e-4
-        uvw = (K @ Xc.T).T
-        uv = uvw[:, :2] / np.clip(uvw[:, 2:3], 1e-8, None)
-        in_bounds = (
-            (uv[:, 0] >= 0) & (uv[:, 0] < width) & (uv[:, 1] >= 0) & (uv[:, 1] < height)
-        )
-        candidates = np.nonzero(in_front & in_bounds)[0]
-        if candidates.size == 0:
-            continue
-
-        dirs = vertices[candidates] - cam_pos[None, :]
-        dists = np.linalg.norm(dirs, axis=1)
-        dirs_n = dirs / np.clip(dists, 1e-8, None)[:, None]
-        rays = np.concatenate(
-            [np.repeat(cam_pos[None, :], len(candidates), axis=0), dirs_n], axis=1
-        ).astype(np.float32)
-        hit_t = scene.cast_rays(o3d.core.Tensor(rays))["t_hit"].numpy()
-        # Keep only vertices whose nearest ray hit is (approximately)
-        # themselves, i.e. not occluded by other geometry in this view.
-        visible = np.abs(hit_t - dists) < (1e-2 * dists + 1e-3)
-        candidates = candidates[visible]
-        if candidates.size == 0:
-            continue
-        dirs_n = dirs_n[visible]
-        dists = dists[visible]
-
-        px = np.clip(uv[candidates, 0].astype(np.int64), 0, width - 1)
-        py = np.clip(uv[candidates, 1].astype(np.int64), 0, height - 1)
-        sampled = image[py, px]  # (K, 3)
-
-        cos_weight = np.clip((vertex_normals[candidates] * -dirs_n).sum(-1), 0.0, 1.0)
-        dist_weight = 1.0 / np.clip(dists, 1e-3, None)
-        weight = cos_weight * dist_weight + 1e-6
-
-        color_accum[candidates] += sampled * weight[:, None]
-        weight_accum[candidates] += weight
+    color_accum, weight_accum = _bake_points_from_views(
+        mesh, dataset, vertices, vertex_normals, max_views=max_views
+    )
 
     has_color = weight_accum > 0
     vertex_colors = (
         np.asarray(mesh.vertex_colors)
         if mesh.has_vertex_colors()
-        else np.zeros((num_vertices, 3))
+        else np.zeros((vertices.shape[0], 3))
     )
     vertex_colors[has_color] = color_accum[has_color] / weight_accum[has_color, None]
     mesh.vertex_colors = o3d.utility.Vector3dVector(np.clip(vertex_colors, 0.0, 1.0))
     return mesh
+
+
+def _fill_texture_holes(texture: np.ndarray, filled: np.ndarray, iterations: int):
+    """Pad baked texels outward into unfilled ones by nearest-neighbor growth.
+
+    Two kinds of texel end up unfilled: those outside every UV island, and
+    those inside an island that no camera ever observed. Renderers sample an
+    atlas bilinearly (and build mipmaps from it), so both kinds bleed the fill
+    color across every UV seam and into every unobserved patch. Growing the
+    baked colors a few texels outward removes that artifact.
+
+    Args:
+        texture: (S, S, 3) float texture, unfilled texels at 0.
+        filled: (S, S) bool mask of texels that carry a baked color.
+        iterations: How many texels to grow outward.
+
+    Returns:
+        A new (S, S, 3) float texture with the padding applied.
+    """
+    texture = texture.copy()
+    filled = filled.copy()
+    for _ in range(max(iterations, 0)):
+        if filled.all():
+            break
+        neighbor_sum = np.zeros_like(texture)
+        neighbor_count = np.zeros(filled.shape, dtype=np.float64)
+        for axis, shift in ((0, 1), (0, -1), (1, 1), (1, -1)):
+            shifted_tex = np.roll(texture, shift, axis=axis)
+            shifted_filled = np.roll(filled, shift, axis=axis)
+            # np.roll wraps around; blank the wrapped-in edge so colors can't
+            # leak from one side of the atlas to the other.
+            edge = 0 if shift > 0 else -1
+            if axis == 0:
+                shifted_tex[edge, :] = 0.0
+                shifted_filled[edge, :] = False
+            else:
+                shifted_tex[:, edge] = 0.0
+                shifted_filled[:, edge] = False
+            neighbor_sum += shifted_tex * shifted_filled[..., None]
+            neighbor_count += shifted_filled
+        grow = (~filled) & (neighbor_count > 0)
+        if not grow.any():
+            break
+        texture[grow] = neighbor_sum[grow] / neighbor_count[grow][:, None]
+        filled |= grow
+    return texture
+
+
+def bake_texture_atlas(
+    mesh,
+    dataset,
+    texture_size: int = 2048,
+    max_views: Optional[int] = None,
+    unwrap_size: Optional[int] = None,
+    gutter: float = 1.0,
+    margin: float = 2.0,
+    max_stretch: float = 1.0 / 6.0,
+    dilation: int = 4,
+):
+    """Bake a UV-unwrapped texture atlas onto ``mesh`` from the training images.
+
+    Unlike :func:`bake_texture`, whose per-vertex colors can only carry as
+    much detail as the mesh is tessellated for, this UV-unwraps ``mesh`` and
+    bakes one color per *texel*, so texture detail is independent of vertex
+    density -- and the result is what standard DCC tools and game engines
+    expect a textured mesh to look like.
+
+    The pipeline is: UV-unwrap via open3d's ``compute_uvatlas``; rasterize the
+    mesh's per-vertex positions and normals into the atlas via
+    ``bake_vertex_attr_textures`` to recover each texel's 3D surface point;
+    color those points with the same occlusion-aware, view-weighted blend
+    :func:`bake_texture` uses (see :func:`_bake_points_from_views`); then pad
+    the result outward across UV seams (see :func:`_fill_texture_holes`).
+
+    The returned mesh carries ``triangle_uvs`` and ``textures``, so writing it
+    with ``open3d.io.write_triangle_mesh("mesh.obj", mesh)`` emits the ``.obj``,
+    its ``.mtl``, and the texture ``.png`` together. Note that ``.ply`` cannot
+    carry a UV atlas -- write ``.obj`` on this path.
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``. Must be manifold (see
+            below).
+        dataset: An ``examples.datasets.colmap.Dataset``-like object yielding
+            dicts with ``"camtoworld"`` (4, 4), ``"K"`` (3, 3), and ``"image"``
+            ((H, W, 3), values in [0, 255]).
+        texture_size: Width/height of the (square) texture, in texels.
+        max_views: If given, only the first ``max_views`` dataset images are
+            used (for speed on large datasets).
+        unwrap_size: Texture size assumed while unwrapping, which sets the
+            scale ``gutter`` is measured against. Defaults to ``texture_size``.
+        gutter: Space around each UV island, in texels, passed to
+            ``compute_uvatlas``.
+        margin: Extra texels rasterized around each UV island by
+            ``bake_vertex_attr_textures``.
+        max_stretch: Per-chart stretch tolerance for ``compute_uvatlas``.
+            Lower values cut the mesh into more, less distorted charts.
+        dilation: How many texels to grow baked colors outward across seams
+            and unobserved patches.
+
+    Returns:
+        ``(mesh, texture)``: ``mesh`` with ``triangle_uvs``/``textures`` set in
+        place, and the (``texture_size``, ``texture_size``, 3) ``uint8`` texture
+        as a numpy array.
+
+    Raises:
+        ValueError: If ``mesh`` has no triangles, ``texture_size`` is not
+            positive, or ``mesh`` is non-manifold. open3d's ``compute_uvatlas``
+            requires a manifold mesh and *segfaults* rather than raising on
+            non-manifold input, so this is checked up front -- a crash in the
+            middle of a long pipeline run would otherwise take the whole run
+            down. :func:`extract_mesh_tsdf`/:func:`extract_mesh_poisson` output
+            has already been through ``remove_non_manifold_edges``; fall back
+            to :func:`bake_texture` for a mesh that still fails the check.
+    """
+    o3d = _require_open3d()
+
+    if texture_size <= 0:
+        raise ValueError(f"texture_size must be positive, got {texture_size}.")
+    if len(mesh.triangles) == 0:
+        raise ValueError("Cannot UV-unwrap a mesh with no triangles.")
+    # Boundary edges are fine (and normal for TSDF output) -- only edges shared
+    # by more than two triangles, or vertices joining disconnected fans, break
+    # the unwrapper.
+    if not mesh.is_edge_manifold(allow_boundary_edges=True):
+        raise ValueError(
+            "Cannot UV-unwrap a mesh with non-manifold edges (open3d's "
+            "compute_uvatlas requires a manifold mesh and crashes on this "
+            "input). Run `mesh.remove_non_manifold_edges()` first, or use "
+            "bake_texture() for per-vertex colors instead."
+        )
+    if not mesh.is_vertex_manifold():
+        raise ValueError(
+            "Cannot UV-unwrap a mesh with non-manifold vertices (open3d's "
+            "compute_uvatlas requires a manifold mesh and crashes on this "
+            "input). Use bake_texture() for per-vertex colors instead."
+        )
+
+    if not mesh.has_vertex_normals():
+        mesh.compute_vertex_normals()
+
+    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    t_mesh.compute_uvatlas(
+        size=texture_size if unwrap_size is None else unwrap_size,
+        gutter=gutter,
+        max_stretch=max_stretch,
+    )
+
+    # UV coordinates are per triangle corner, so unwrapping leaves the mesh's
+    # vertices and triangles untouched -- the atlas can be attached straight
+    # back onto the input mesh below.
+    vertices = np.asarray(mesh.vertices)
+    vertex_normals = np.asarray(mesh.vertex_normals)
+    t_mesh.vertex["_bake_xyz"] = o3d.core.Tensor(vertices.astype(np.float32))
+    t_mesh.vertex["_bake_normal"] = o3d.core.Tensor(vertex_normals.astype(np.float32))
+    # A constant-1 attribute bakes to exactly the texels the rasterizer covered,
+    # which is what marks a texel as being on the surface. Testing the baked
+    # position against 0 instead would misclassify a surface passing through
+    # the world origin.
+    t_mesh.vertex["_bake_coverage"] = o3d.core.Tensor(
+        np.ones((vertices.shape[0], 1), dtype=np.float32)
+    )
+
+    baked = t_mesh.bake_vertex_attr_textures(
+        texture_size,
+        {"_bake_xyz", "_bake_normal", "_bake_coverage"},
+        margin=margin,
+        fill=0.0,
+        update_material=False,
+    )
+    covered = baked["_bake_coverage"].numpy()[..., 0] > 0.5
+    rows, cols = np.nonzero(covered)
+
+    texture = np.zeros((texture_size, texture_size, 3), dtype=np.float64)
+    filled = np.zeros((texture_size, texture_size), dtype=bool)
+    if rows.size > 0:
+        texel_points = baked["_bake_xyz"].numpy()[rows, cols].astype(np.float64)
+        texel_normals = baked["_bake_normal"].numpy()[rows, cols].astype(np.float64)
+        # Barycentric interpolation of unit vertex normals doesn't preserve
+        # length; renormalize so the view-alignment weight stays comparable
+        # across texels.
+        texel_normals /= np.clip(
+            np.linalg.norm(texel_normals, axis=1, keepdims=True), 1e-8, None
+        )
+        color_accum, weight_accum = _bake_points_from_views(
+            mesh, dataset, texel_points, texel_normals, max_views=max_views
+        )
+        observed = weight_accum > 0
+        texture[rows[observed], cols[observed]] = (
+            color_accum[observed] / weight_accum[observed, None]
+        )
+        filled[rows[observed], cols[observed]] = True
+
+    texture = _fill_texture_holes(texture, filled, dilation)
+    texture = (np.clip(texture, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+    triangle_uvs = t_mesh.triangle["texture_uvs"].numpy().reshape(-1, 2)
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs.astype(np.float64))
+    mesh.textures = [o3d.geometry.Image(texture)]
+    mesh.triangle_material_ids = o3d.utility.IntVector(
+        np.zeros(len(mesh.triangles), dtype=np.int32)
+    )
+    return mesh, texture
+
+
+def bake_mesh_texture(
+    mesh,
+    dataset,
+    mode: str = "vertex",
+    texture_size: int = 2048,
+    max_views: Optional[int] = None,
+    allow_atlas_fallback: bool = True,
+):
+    """Bake texture onto ``mesh`` in either supported form.
+
+    The one entry point the CLIs use, so the choice between per-vertex colors
+    and a UV atlas -- and what happens when a mesh can't be unwrapped -- is
+    decided in one place rather than in each script.
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``.
+        dataset: An ``examples.datasets.colmap.Dataset``-like object (see
+            :func:`bake_texture`).
+        mode: ``"vertex"`` for :func:`bake_texture`, ``"atlas"`` for
+            :func:`bake_texture_atlas`.
+        texture_size: Atlas width/height in texels (``"atlas"`` mode only).
+        max_views: If given, only the first ``max_views`` dataset images are
+            used.
+        allow_atlas_fallback: In ``"atlas"`` mode, whether a mesh that can't be
+            UV-unwrapped falls back to per-vertex colors (with a warning)
+            instead of raising. Defaults to ``True``: this runs at the end of a
+            long training run or pipeline, where losing the mesh entirely is
+            the worse outcome.
+
+    Returns:
+        ``(mesh, texture)``. ``texture`` is the ``uint8`` atlas in ``"atlas"``
+        mode, and ``None`` for per-vertex colors -- which is also what a
+        fallback returns, so callers can use it to decide whether to write
+        ``.obj`` (a UV atlas needs one) or ``.ply``.
+    """
+    if mode == "vertex":
+        return bake_texture(mesh, dataset, max_views=max_views), None
+    if mode != "atlas":
+        raise ValueError(
+            f"Unknown texture mode {mode!r}, expected 'vertex' or 'atlas'."
+        )
+
+    try:
+        return bake_texture_atlas(
+            mesh, dataset, texture_size=texture_size, max_views=max_views
+        )
+    except ValueError as e:
+        if not allow_atlas_fallback:
+            raise
+        warnings.warn(
+            f"UV-atlas texture baking failed ({e}); falling back to per-vertex "
+            "colors. The mesh is still written, but without a texture atlas.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return bake_texture(mesh, dataset, max_views=max_views), None

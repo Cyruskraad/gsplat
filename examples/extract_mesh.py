@@ -25,6 +25,10 @@ Example:
 writes `results/garden_2dgs/mesh.ply`. Pass `--method poisson
 --dense_points data/360_v2/garden/dense/dense.ply` to instead run Poisson
 reconstruction over a dense MVS point cloud (see `examples/dense_mvs.py`).
+
+Pass `--texture_mode atlas` to UV-unwrap the mesh and bake a texture atlas
+instead of per-vertex colors, writing `mesh.obj` + `mesh.mtl` + `mesh_0.png`
+(loadable with its texture in standard DCC tools and game engines).
 """
 
 import json
@@ -39,7 +43,7 @@ import tyro
 from datasets.colmap import Dataset, Parser
 
 from gsplat.photogrammetry.mesh_extraction import (
-    bake_texture,
+    bake_mesh_texture,
     extract_mesh_poisson,
     extract_mesh_tsdf,
 )
@@ -79,8 +83,16 @@ class Config:
     mask_dir: Optional[str] = None
     # Directory to write mesh.ply to.
     result_dir: str = "results/garden"
-    # Whether to bake per-vertex texture from the training images.
+    # Whether to bake texture from the training images.
     bake_texture_: bool = True
+    # How to represent the baked texture. "vertex" writes per-vertex colors
+    # into a .ply; "atlas" UV-unwraps the mesh and bakes a texture image,
+    # writing a .obj + .mtl + .png that standard DCC tools and game engines
+    # load with the texture attached. "atlas" resolves detail finer than the
+    # mesh's vertex spacing; "vertex" is cheaper and works on any mesh.
+    texture_mode: Literal["vertex", "atlas"] = "vertex"
+    # Atlas width/height in texels (--texture_mode atlas only).
+    texture_size: int = 2048
     # Torch device.
     device: str = "cuda"
 
@@ -124,12 +136,28 @@ def main(cfg: Config) -> None:
         f"{len(mesh.triangles)} triangles"
     )
 
+    texture = None
     if cfg.bake_texture_:
-        mesh = bake_texture(mesh, dataset)
-        print("[extract_mesh] baked per-vertex texture from training images")
+        mesh, texture = bake_mesh_texture(
+            mesh,
+            dataset,
+            mode=cfg.texture_mode,
+            texture_size=cfg.texture_size,
+        )
+        if texture is not None:
+            print(
+                f"[extract_mesh] baked a {texture.shape[1]}x{texture.shape[0]} "
+                "UV texture atlas from training images"
+            )
+        else:
+            print("[extract_mesh] baked per-vertex texture from training images")
 
     os.makedirs(cfg.result_dir, exist_ok=True)
-    out_path = os.path.join(cfg.result_dir, "mesh.ply")
+    # A UV atlas needs a format that can carry UVs and a texture image; .ply
+    # cannot, so an atlas mesh is written as .obj (+ .mtl + .png alongside).
+    out_path = os.path.join(
+        cfg.result_dir, "mesh.obj" if texture is not None else "mesh.ply"
+    )
     o3d.io.write_triangle_mesh(out_path, mesh)
     print(f"[extract_mesh] wrote {out_path}")
 

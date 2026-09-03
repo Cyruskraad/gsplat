@@ -92,6 +92,43 @@ i.e. trained without `--app_opt`) -- appearance-embedding checkpoints are out
 of scope, since per-image appearance variation doesn't map onto a single
 canonical mesh texture.
 
+#### Texture: per-vertex colors or a UV atlas
+
+By default the extracted mesh carries **per-vertex colors**, whose effective
+resolution is the mesh's own vertex density: detail finer than the spacing
+between vertices is averaged away, no matter how sharp the input images are.
+Pass `--texture_mode atlas` to instead UV-unwrap the mesh and bake one color
+per *texel*:
+
+```bash
+python examples/extract_mesh.py \
+    --ckpt results/garden_2dgs/ckpts/ckpt_29999_rank0.pt \
+    --data_dir data/360_v2/garden --result_dir results/garden_2dgs \
+    --texture_mode atlas --texture_size 4096
+```
+
+This writes `mesh.obj`, `mesh.mtl` and `mesh_0.png` (instead of `mesh.ply`,
+which cannot carry UVs or a texture image), so the result opens with its
+texture already attached in Blender, MeshLab, Unreal, Unity and anything else
+that reads OBJ. Texture detail is then set by `--texture_size` rather than by
+how finely the mesh happens to be tessellated, which usually means a smaller,
+cheaper mesh can carry the same visual detail.
+
+Both paths use the same occlusion-aware, view-weighted blend across training
+images (each sample weighted by view-direction/surface-normal alignment and
+inverse distance, with points occluded in a given view ray-cast away), so
+switching modes changes the *resolution* of the texture, not its colors.
+Baked colors are grown a few texels outward across UV seams and into patches
+no camera observed, so bilinear sampling and mipmapping don't bleed
+background into the surface.
+
+UV unwrapping requires a **manifold** mesh. TSDF and Poisson output has
+already been through `remove_non_manifold_edges()`, so this normally holds;
+if it doesn't, the CLIs warn and fall back to per-vertex colors rather than
+failing at the end of a long run. (The underlying
+`bake_texture_atlas` raises instead -- open3d's unwrapper *segfaults* on
+non-manifold input rather than raising, so the check happens up front.)
+
 Steps 3-4 can also be collapsed into one command: pass `--extract_mesh` to
 `simple_trainer_2dgs.py` to run TSDF extraction + texture baking
 automatically at the end of training (writing `mesh_<step>.ply` alongside the
@@ -104,7 +141,9 @@ python examples/simple_trainer_2dgs.py \
 ```
 
 This shortcut only covers the TSDF path (`--mesh_bake_texture`,
-`--mesh_voxel_size`, `--mesh_sdf_trunc` mirror `extract_mesh.py`'s options) --
+`--mesh_texture_mode`, `--mesh_texture_size`, `--mesh_voxel_size`,
+`--mesh_sdf_trunc` mirror `extract_mesh.py`'s options; `--mesh_texture_mode
+atlas` writes `mesh_<step>.obj` rather than `mesh_<step>.ply`) --
 Poisson reconstruction and the dense-MVS point cloud path still need the
 standalone `examples/extract_mesh.py` script, since the trainer has no dense
 point cloud of its own to reconstruct from. It writes mesh quality stats to
@@ -355,6 +394,13 @@ something gsplat ships.
   `bake_texture(mesh, dataset, ...)` operate on a loaded checkpoint's
   `"splats"` state dict and an `examples.datasets.colmap.Dataset`, returning
   `open3d.geometry.TriangleMesh` objects.
+  `bake_texture_atlas(mesh, dataset, texture_size=...)` returns
+  `(mesh, texture)` -- the mesh with `triangle_uvs`/`textures` set (write it
+  with `open3d.io.write_triangle_mesh("mesh.obj", mesh)` to emit the `.obj`,
+  `.mtl` and `.png` together) and the `uint8` atlas as a numpy array.
+  `bake_mesh_texture(mesh, dataset, mode="vertex"|"atlas", ...)` is the
+  dispatching entry point the CLIs use, returning `(mesh, texture_or_None)`
+  and falling back to per-vertex colors if the mesh can't be unwrapped.
 - `gsplat.photogrammetry.metrics.point_to_mesh_distance(points, mesh, ...)` /
   `mesh_quality_stats(mesh)` / `point_cloud_stats(points, ...)` return plain
   dicts of quality stats for a mesh or point cloud, independent of how it was
