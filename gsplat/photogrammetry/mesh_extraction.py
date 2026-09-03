@@ -42,6 +42,7 @@ canonical mesh texture.
 """
 
 import warnings
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 import numpy as np
@@ -527,6 +528,191 @@ def _fill_texture_holes(texture: np.ndarray, filled: np.ndarray, iterations: int
     return texture
 
 
+@dataclass
+class _AtlasTexels:
+    """The per-texel surface frame of a UV-unwrapped mesh.
+
+    ``rows``/``cols`` index the texels the rasterizer covered; ``positions``,
+    ``normals`` and (optionally) ``tangents`` are the interpolated surface
+    frame at each of those texels, in the same order.
+    """
+
+    triangle_uvs: np.ndarray
+    rows: np.ndarray
+    cols: np.ndarray
+    positions: np.ndarray
+    normals: np.ndarray
+    tangents: Optional[np.ndarray] = None
+
+
+def _vertex_tangents(vertices, vertex_normals, triangles, corner_uvs):
+    """Per-vertex tangents from the UV parameterization (Lengyel's method).
+
+    Accumulates each triangle's UV-aligned tangent onto its vertices, then
+    orthogonalizes against the vertex normal. Vertices on a UV seam belong to
+    charts with different orientations, so they get a blended tangent -- the
+    standard artifact of not splitting vertices per chart, confined to the
+    seam texels the dilation pass already covers.
+    """
+    tangents = np.zeros_like(vertices)
+    edge1 = vertices[triangles[:, 1]] - vertices[triangles[:, 0]]
+    edge2 = vertices[triangles[:, 2]] - vertices[triangles[:, 0]]
+    duv1 = corner_uvs[:, 1] - corner_uvs[:, 0]
+    duv2 = corner_uvs[:, 2] - corner_uvs[:, 0]
+    det = duv1[:, 0] * duv2[:, 1] - duv2[:, 0] * duv1[:, 1]
+    # A degenerate UV triangle carries no direction; skip it rather than
+    # dividing by ~0 and poisoning its vertices' accumulated tangent.
+    usable = np.abs(det) > 1e-12
+    per_face = np.zeros_like(edge1)
+    per_face[usable] = (
+        edge1[usable] * duv2[usable, 1:2] - edge2[usable] * duv1[usable, 1:2]
+    ) / det[usable, None]
+    for corner in range(3):
+        np.add.at(tangents, triangles[:, corner], per_face)
+
+    tangents -= vertex_normals * (vertex_normals * tangents).sum(-1, keepdims=True)
+    lengths = np.linalg.norm(tangents, axis=1, keepdims=True)
+    # A vertex whose tangents cancelled out gets an arbitrary perpendicular
+    # rather than a zero vector, so the tangent frame stays well-defined.
+    degenerate = lengths[:, 0] < 1e-12
+    if degenerate.any():
+        fallback = np.tile(np.array([1.0, 0.0, 0.0]), (int(degenerate.sum()), 1))
+        parallel = np.abs(vertex_normals[degenerate][:, 0]) > 0.9
+        fallback[parallel] = np.array([0.0, 1.0, 0.0])
+        normals_d = vertex_normals[degenerate]
+        fallback -= normals_d * (normals_d * fallback).sum(-1, keepdims=True)
+        tangents[degenerate] = fallback
+        lengths = np.linalg.norm(tangents, axis=1, keepdims=True)
+    return tangents / np.clip(lengths, 1e-12, None)
+
+
+def _unwrap_and_rasterize(
+    mesh,
+    texture_size: int,
+    unwrap_size: Optional[int] = None,
+    gutter: float = 1.0,
+    margin: float = 2.0,
+    max_stretch: float = 1.0 / 6.0,
+    with_tangents: bool = False,
+    reuse_uvs: bool = True,
+) -> "_AtlasTexels":
+    """UV-unwrap ``mesh`` and recover each texel's surface frame.
+
+    Shared by :func:`bake_texture_atlas` and :func:`bake_normal_map`, which
+    differ only in what they bake into the atlas, never in how the atlas is
+    built or which texels it covers.
+
+    **open3d's ``compute_uvatlas`` is not deterministic** -- unwrapping the
+    same mesh twice yields different UV layouts. So when ``mesh`` already
+    carries ``triangle_uvs``, they are reused rather than recomputed
+    (``reuse_uvs=False`` forces a fresh unwrap). Without that, baking an
+    albedo atlas and then a normal map for one mesh would produce two maps
+    with *different* UV layouts, and the second would be applied through the
+    first's coordinates -- a silently broken asset.
+
+    It also requires a manifold mesh and **segfaults** rather than raising on
+    non-manifold input, so that is checked up front: a crash in the middle of
+    a long pipeline run would otherwise take the whole run down.
+
+    Raises:
+        ValueError: If ``mesh`` has no triangles, ``texture_size`` is not
+            positive, or ``mesh`` is non-manifold.
+    """
+    o3d = _require_open3d()
+
+    if texture_size <= 0:
+        raise ValueError(f"texture_size must be positive, got {texture_size}.")
+    if len(mesh.triangles) == 0:
+        raise ValueError("Cannot UV-unwrap a mesh with no triangles.")
+    # Boundary edges are fine (and normal for TSDF output) -- only edges shared
+    # by more than two triangles, or vertices joining disconnected fans, break
+    # the unwrapper.
+    if not mesh.is_edge_manifold(allow_boundary_edges=True):
+        raise ValueError(
+            "Cannot UV-unwrap a mesh with non-manifold edges (open3d's "
+            "compute_uvatlas requires a manifold mesh and crashes on this "
+            "input). Run `mesh.remove_non_manifold_edges()` first, or use "
+            "bake_texture() for per-vertex colors instead."
+        )
+    if not mesh.is_vertex_manifold():
+        raise ValueError(
+            "Cannot UV-unwrap a mesh with non-manifold vertices (open3d's "
+            "compute_uvatlas requires a manifold mesh and crashes on this "
+            "input). Use bake_texture() for per-vertex colors instead."
+        )
+
+    if not mesh.has_vertex_normals():
+        mesh.compute_vertex_normals()
+
+    num_triangles = len(mesh.triangles)
+    existing_uvs = np.asarray(mesh.triangle_uvs)
+    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    if reuse_uvs and existing_uvs.shape[0] == 3 * num_triangles:
+        t_mesh.triangle["texture_uvs"] = o3d.core.Tensor(
+            existing_uvs.reshape(num_triangles, 3, 2).astype(np.float32)
+        )
+    else:
+        t_mesh.compute_uvatlas(
+            size=texture_size if unwrap_size is None else unwrap_size,
+            gutter=gutter,
+            max_stretch=max_stretch,
+        )
+
+    # UV coordinates are per triangle corner, so unwrapping leaves the mesh's
+    # vertices and triangles untouched -- the atlas can be attached straight
+    # back onto the input mesh by the caller.
+    vertices = np.asarray(mesh.vertices)
+    vertex_normals = np.asarray(mesh.vertex_normals)
+    corner_uvs = t_mesh.triangle["texture_uvs"].numpy()  # (F, 3, 2)
+
+    attrs = {"_bake_xyz", "_bake_normal", "_bake_coverage"}
+    t_mesh.vertex["_bake_xyz"] = o3d.core.Tensor(vertices.astype(np.float32))
+    t_mesh.vertex["_bake_normal"] = o3d.core.Tensor(vertex_normals.astype(np.float32))
+    # A constant-1 attribute bakes to exactly the texels the rasterizer covered,
+    # which is what marks a texel as being on the surface. Testing the baked
+    # position against 0 instead would misclassify a surface passing through
+    # the world origin.
+    t_mesh.vertex["_bake_coverage"] = o3d.core.Tensor(
+        np.ones((vertices.shape[0], 1), dtype=np.float32)
+    )
+    if with_tangents:
+        tangents = _vertex_tangents(
+            vertices, vertex_normals, np.asarray(mesh.triangles), corner_uvs
+        )
+        t_mesh.vertex["_bake_tangent"] = o3d.core.Tensor(tangents.astype(np.float32))
+        attrs.add("_bake_tangent")
+
+    baked = t_mesh.bake_vertex_attr_textures(
+        texture_size, attrs, margin=margin, fill=0.0, update_material=False
+    )
+    covered = baked["_bake_coverage"].numpy()[..., 0] > 0.5
+    rows, cols = np.nonzero(covered)
+
+    positions = baked["_bake_xyz"].numpy()[rows, cols].astype(np.float64)
+    normals = baked["_bake_normal"].numpy()[rows, cols].astype(np.float64)
+    # Barycentric interpolation of unit vertex normals doesn't preserve length;
+    # renormalize so downstream dot products stay comparable across texels.
+    normals /= np.clip(np.linalg.norm(normals, axis=1, keepdims=True), 1e-8, None)
+
+    texel_tangents = None
+    if with_tangents:
+        texel_tangents = baked["_bake_tangent"].numpy()[rows, cols].astype(np.float64)
+        # Re-orthogonalize after interpolation, for the same reason.
+        texel_tangents -= normals * (normals * texel_tangents).sum(-1, keepdims=True)
+        texel_tangents /= np.clip(
+            np.linalg.norm(texel_tangents, axis=1, keepdims=True), 1e-8, None
+        )
+
+    return _AtlasTexels(
+        triangle_uvs=corner_uvs.reshape(-1, 2).astype(np.float64),
+        rows=rows,
+        cols=cols,
+        positions=positions,
+        normals=normals,
+        tangents=texel_tangents,
+    )
+
+
 def bake_texture_atlas(
     mesh,
     dataset,
@@ -595,75 +781,21 @@ def bake_texture_atlas(
     """
     o3d = _require_open3d()
 
-    if texture_size <= 0:
-        raise ValueError(f"texture_size must be positive, got {texture_size}.")
-    if len(mesh.triangles) == 0:
-        raise ValueError("Cannot UV-unwrap a mesh with no triangles.")
-    # Boundary edges are fine (and normal for TSDF output) -- only edges shared
-    # by more than two triangles, or vertices joining disconnected fans, break
-    # the unwrapper.
-    if not mesh.is_edge_manifold(allow_boundary_edges=True):
-        raise ValueError(
-            "Cannot UV-unwrap a mesh with non-manifold edges (open3d's "
-            "compute_uvatlas requires a manifold mesh and crashes on this "
-            "input). Run `mesh.remove_non_manifold_edges()` first, or use "
-            "bake_texture() for per-vertex colors instead."
-        )
-    if not mesh.is_vertex_manifold():
-        raise ValueError(
-            "Cannot UV-unwrap a mesh with non-manifold vertices (open3d's "
-            "compute_uvatlas requires a manifold mesh and crashes on this "
-            "input). Use bake_texture() for per-vertex colors instead."
-        )
-
-    if not mesh.has_vertex_normals():
-        mesh.compute_vertex_normals()
-
-    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
-    t_mesh.compute_uvatlas(
-        size=texture_size if unwrap_size is None else unwrap_size,
+    atlas = _unwrap_and_rasterize(
+        mesh,
+        texture_size,
+        unwrap_size=unwrap_size,
         gutter=gutter,
+        margin=margin,
         max_stretch=max_stretch,
     )
-
-    # UV coordinates are per triangle corner, so unwrapping leaves the mesh's
-    # vertices and triangles untouched -- the atlas can be attached straight
-    # back onto the input mesh below.
-    vertices = np.asarray(mesh.vertices)
-    vertex_normals = np.asarray(mesh.vertex_normals)
-    t_mesh.vertex["_bake_xyz"] = o3d.core.Tensor(vertices.astype(np.float32))
-    t_mesh.vertex["_bake_normal"] = o3d.core.Tensor(vertex_normals.astype(np.float32))
-    # A constant-1 attribute bakes to exactly the texels the rasterizer covered,
-    # which is what marks a texel as being on the surface. Testing the baked
-    # position against 0 instead would misclassify a surface passing through
-    # the world origin.
-    t_mesh.vertex["_bake_coverage"] = o3d.core.Tensor(
-        np.ones((vertices.shape[0], 1), dtype=np.float32)
-    )
-
-    baked = t_mesh.bake_vertex_attr_textures(
-        texture_size,
-        {"_bake_xyz", "_bake_normal", "_bake_coverage"},
-        margin=margin,
-        fill=0.0,
-        update_material=False,
-    )
-    covered = baked["_bake_coverage"].numpy()[..., 0] > 0.5
-    rows, cols = np.nonzero(covered)
+    rows, cols = atlas.rows, atlas.cols
 
     texture = np.zeros((texture_size, texture_size, 3), dtype=np.float64)
     filled = np.zeros((texture_size, texture_size), dtype=bool)
     if rows.size > 0:
-        texel_points = baked["_bake_xyz"].numpy()[rows, cols].astype(np.float64)
-        texel_normals = baked["_bake_normal"].numpy()[rows, cols].astype(np.float64)
-        # Barycentric interpolation of unit vertex normals doesn't preserve
-        # length; renormalize so the view-alignment weight stays comparable
-        # across texels.
-        texel_normals /= np.clip(
-            np.linalg.norm(texel_normals, axis=1, keepdims=True), 1e-8, None
-        )
         color_accum, weight_accum = _bake_points_from_views(
-            mesh, dataset, texel_points, texel_normals, max_views=max_views
+            mesh, dataset, atlas.positions, atlas.normals, max_views=max_views
         )
         observed = weight_accum > 0
         texture[rows[observed], cols[observed]] = (
@@ -674,8 +806,7 @@ def bake_texture_atlas(
     texture = _fill_texture_holes(texture, filled, dilation)
     texture = (np.clip(texture, 0.0, 1.0) * 255.0).round().astype(np.uint8)
 
-    triangle_uvs = t_mesh.triangle["texture_uvs"].numpy().reshape(-1, 2)
-    mesh.triangle_uvs = o3d.utility.Vector2dVector(triangle_uvs.astype(np.float64))
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(atlas.triangle_uvs)
     mesh.textures = [o3d.geometry.Image(texture)]
     mesh.triangle_material_ids = o3d.utility.IntVector(
         np.zeros(len(mesh.triangles), dtype=np.int32)
@@ -739,3 +870,244 @@ def bake_mesh_texture(
             stacklevel=2,
         )
         return bake_texture(mesh, dataset, max_views=max_views), None
+
+
+def simplify_mesh(
+    mesh,
+    target_triangles: int,
+    maximum_error: float = float("inf"),
+    boundary_weight: float = 1.0,
+):
+    """Decimate ``mesh`` to roughly ``target_triangles`` via quadric error metrics.
+
+    TSDF and Poisson extraction produce meshes tessellated to the voxel grid,
+    not to the scene's actual geometric complexity -- routinely millions of
+    triangles for a scene a few hundred thousand would describe. Garland &
+    Heckbert quadric-error decimation collapses edges cheapest-first, so flat
+    regions lose triangles and detailed ones keep them.
+
+    The detail this removes is not lost if you follow it with
+    :func:`bake_normal_map`, which records the *original* mesh's normals onto
+    the decimated one's UV atlas -- the standard photogrammetry delivery path
+    (dense scan -> low-poly mesh + normal map).
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``.
+        target_triangles: Triangle budget. Decimation stops here, or earlier if
+            ``maximum_error`` is reached first, so the result can have more
+            triangles than requested only when the input already had fewer.
+        maximum_error: Stop collapsing once the cheapest remaining edge exceeds
+            this quadric error, whatever the triangle count.
+        boundary_weight: How strongly to penalize collapsing boundary edges.
+            Higher keeps open borders (a scanned scene's outer edge) sharper.
+
+    Returns:
+        A new decimated mesh, cleaned of degenerate/duplicate geometry and
+        small floating components. The input is not modified.
+
+    Raises:
+        ValueError: If ``target_triangles`` is not positive.
+    """
+    _require_open3d()
+
+    if target_triangles <= 0:
+        raise ValueError(f"target_triangles must be positive, got {target_triangles}.")
+
+    simplified = mesh.simplify_quadric_decimation(
+        target_number_of_triangles=int(target_triangles),
+        maximum_error=maximum_error,
+        boundary_weight=boundary_weight,
+    )
+    simplified = _clean_mesh(simplified)
+    simplified.compute_vertex_normals()
+    return simplified
+
+
+def bake_normal_map(
+    high_mesh,
+    low_mesh,
+    texture_size: int = 2048,
+    space: str = "tangent",
+    cage: Optional[float] = None,
+    max_distance: Optional[float] = None,
+    unwrap_size: Optional[int] = None,
+    gutter: float = 1.0,
+    margin: float = 2.0,
+    max_stretch: float = 1.0 / 6.0,
+    dilation: int = 4,
+):
+    """Bake ``high_mesh``'s surface normals onto ``low_mesh``'s UV atlas.
+
+    The other half of the standard photogrammetry delivery path: after
+    :func:`simplify_mesh` cuts a dense extraction down to a workable triangle
+    budget, this records the detail that was removed as a normal map, so the
+    low-poly mesh *shades* like the dense one. It is what makes decimation
+    nearly free visually, and it is why production scans ship as a light mesh
+    plus texture maps rather than as raw multi-million-triangle geometry.
+
+    For each texel of ``low_mesh``'s atlas, a ray is cast from just outside the
+    low surface, inward along its own normal, onto ``high_mesh``; the high
+    mesh's normal at the hit point (barycentrically interpolated) is what gets
+    stored. Texels whose ray misses -- and texels in the atlas margin, which
+    lie off the surface by construction -- fall back to the low mesh's own
+    normal, i.e. "no change from the base geometry".
+
+    Args:
+        high_mesh: The dense mesh to take detail from.
+        low_mesh: The decimated mesh to bake onto. Must be manifold; it gains
+            ``triangle_uvs`` in place, matching the returned map.
+        texture_size: Width/height of the (square) normal map, in texels.
+        space: ``"tangent"`` stores normals relative to each texel's surface
+            frame -- the portable choice, and what engines expect, since it
+            stays valid if the mesh is transformed. ``"object"`` stores them
+            in mesh space: simpler and immune to UV-seam tangent artifacts,
+            and a common choice for static scanned assets.
+        cage: How far outside the low surface each ray starts, in scene units.
+            It must clear the gap between the two meshes; defaults to 2% of
+            ``low_mesh``'s bounding-box diagonal.
+        max_distance: Reject hits farther than this from the ray origin.
+            Defaults to twice ``cage``, so a ray that punches through a gap
+            and hits unrelated geometry behind it is discarded.
+        unwrap_size, gutter, margin, max_stretch, dilation: As in
+            :func:`bake_texture_atlas`.
+
+    Returns:
+        ``(low_mesh, normal_map, stats)``:
+
+        - ``low_mesh`` with ``triangle_uvs`` set, matching the returned map.
+        - ``normal_map``, a (``texture_size``, ``texture_size``, 3) ``uint8``
+          array encoded the usual way (``0.5 + 0.5 * n``, so a flat texel is
+          ~(128, 128, 255) in tangent space).
+        - ``stats``: ``num_texels``, ``num_hits``, ``hit_fraction`` and the
+          ``cage``/``max_distance`` actually used. A low ``hit_fraction`` means
+          most texels fell back to the base normal and the map is doing
+          nothing -- almost always a ``cage`` too small to span the gap
+          between the two meshes. Worth checking before shipping the asset,
+          which is why it is returned rather than left to be eyeballed.
+
+    Raises:
+        ValueError: If ``space`` is not ``"tangent"``/``"object"``, or
+            ``low_mesh`` cannot be unwrapped (see
+            :func:`bake_texture_atlas`), or ``high_mesh`` has no triangles.
+    """
+    o3d = _require_open3d()
+
+    if space not in ("tangent", "object"):
+        raise ValueError(
+            f"Unknown normal-map space {space!r}, expected 'tangent' or 'object'."
+        )
+    if len(high_mesh.triangles) == 0:
+        raise ValueError("Cannot bake normals from a high mesh with no triangles.")
+
+    if not high_mesh.has_vertex_normals():
+        high_mesh.compute_vertex_normals()
+
+    atlas = _unwrap_and_rasterize(
+        low_mesh,
+        texture_size,
+        unwrap_size=unwrap_size,
+        gutter=gutter,
+        margin=margin,
+        max_stretch=max_stretch,
+        with_tangents=(space == "tangent"),
+    )
+
+    if cage is None:
+        extent = np.asarray(low_mesh.get_max_bound()) - np.asarray(
+            low_mesh.get_min_bound()
+        )
+        cage = 0.02 * float(np.linalg.norm(extent))
+        cage = max(cage, 1e-6)
+    if max_distance is None:
+        max_distance = 2.0 * cage
+
+    positions, normals = atlas.positions, atlas.normals
+    # Default to the low mesh's own normal: for a texel with no hit that is
+    # exactly right -- "this surface is already as detailed as the base mesh".
+    detailed = normals.copy()
+    num_hits = 0
+
+    if positions.shape[0] > 0:
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(high_mesh))
+        origins = positions + normals * cage
+        rays = np.concatenate([origins, -normals], axis=1).astype(np.float32)
+        result = scene.cast_rays(o3d.core.Tensor(rays))
+        hit_t = result["t_hit"].numpy()
+        primitives = result["primitive_ids"].numpy()
+        bary = result["primitive_uvs"].numpy()
+        hit = np.isfinite(hit_t) & (hit_t <= max_distance)
+
+        num_hits = int(hit.sum())
+        if hit.any():
+            high_triangles = np.asarray(high_mesh.triangles)[primitives[hit]]
+            corner_normals = np.asarray(high_mesh.vertex_normals)[high_triangles]
+            u, v = bary[hit, 0], bary[hit, 1]
+            # open3d's primitive_uvs weight the corners (1-u-v, u, v) --
+            # verified by reconstructing hit positions from them.
+            weights = np.stack([1.0 - u - v, u, v], axis=-1)[..., None]
+            detailed[hit] = (corner_normals * weights).sum(axis=1)
+            detailed /= np.clip(
+                np.linalg.norm(detailed, axis=1, keepdims=True), 1e-12, None
+            )
+
+    if space == "tangent":
+        tangent = atlas.tangents
+        bitangent = np.cross(normals, tangent)
+        encoded = np.stack(
+            [
+                (detailed * tangent).sum(-1),
+                (detailed * bitangent).sum(-1),
+                (detailed * normals).sum(-1),
+            ],
+            axis=-1,
+        )
+    else:
+        encoded = detailed
+
+    normal_map = np.zeros((texture_size, texture_size, 3), dtype=np.float64)
+    filled = np.zeros((texture_size, texture_size), dtype=bool)
+    if atlas.rows.size > 0:
+        normal_map[atlas.rows, atlas.cols] = 0.5 + 0.5 * encoded
+        filled[atlas.rows, atlas.cols] = True
+    # Unfilled texels would otherwise decode to a zero-length normal; the
+    # dilation pass spreads real values across seams the same way the color
+    # atlas does.
+    normal_map = _fill_texture_holes(normal_map, filled, dilation)
+    if not filled.all():
+        # Anything still untouched gets "flat": +Z in tangent space, and the
+        # neutral 0.5 grey in object space.
+        neutral = np.array([0.5, 0.5, 1.0]) if space == "tangent" else np.full(3, 0.5)
+        normal_map[~_grown_mask(filled, dilation)] = neutral
+    normal_map = (np.clip(normal_map, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+    low_mesh.triangle_uvs = o3d.utility.Vector2dVector(atlas.triangle_uvs)
+    num_texels = int(positions.shape[0])
+    stats = {
+        "num_texels": num_texels,
+        "num_hits": num_hits,
+        "hit_fraction": float(num_hits / num_texels) if num_texels else 0.0,
+        "cage": float(cage),
+        "max_distance": float(max_distance),
+        "space": space,
+    }
+    return low_mesh, normal_map, stats
+
+
+def _grown_mask(filled: np.ndarray, iterations: int) -> np.ndarray:
+    """Which texels :func:`_fill_texture_holes` reaches in ``iterations`` steps."""
+    grown = filled.copy()
+    for _ in range(max(iterations, 0)):
+        if grown.all():
+            break
+        neighbors = np.zeros_like(grown)
+        for axis, shift in ((0, 1), (0, -1), (1, 1), (1, -1)):
+            shifted = np.roll(grown, shift, axis=axis)
+            edge = 0 if shift > 0 else -1
+            if axis == 0:
+                shifted[edge, :] = False
+            else:
+                shifted[:, edge] = False
+            neighbors |= shifted
+        grown |= neighbors
+    return grown

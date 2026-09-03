@@ -131,6 +131,52 @@ Baked colors are grown a few texels outward across UV seams and into patches
 no camera observed, so bilinear sampling and mipmapping don't bleed
 background into the surface.
 
+#### Decimation + normal maps (the delivery path)
+
+TSDF and Poisson extraction tessellate to the voxel grid, not to the scene's
+actual complexity -- routinely millions of triangles for a scene a few hundred
+thousand would describe. The standard photogrammetry answer is not to extract
+a coarser mesh (that loses the detail) but to **decimate and bake the removed
+detail into a normal map**, so the light mesh still *shades* like the dense
+one:
+
+```bash
+python examples/extract_mesh.py \
+    --ckpt results/garden_2dgs/ckpts/ckpt_29999_rank0.pt \
+    --data_dir data/360_v2/garden --result_dir results/garden_2dgs \
+    --texture_mode atlas --texture_size 4096 \
+    --target_triangles 200000 --normal_map
+```
+
+`--target_triangles` decimates via Garland & Heckbert quadric error metrics
+(collapsing the cheapest edges first, so flat regions lose triangles and
+detailed ones keep them), and `--normal_map` bakes the *pre-decimation* mesh's
+normals onto the decimated mesh's UV atlas. The result is
+`mesh.obj` + `mesh.mtl` + `mesh_0.png` (albedo) + `mesh_normal.png`, with the
+`.mtl` referencing both.
+
+`--normal_map_space` selects `tangent` (the default -- what engines expect,
+and valid under transforms) or `object` (simpler, immune to UV-seam tangent
+artifacts, and a fine choice for a static scanned asset). Both are reported
+with a `hit_fraction`: the share of texels whose ray actually reached the
+dense mesh. A low value means the map is mostly flat and is doing nothing,
+almost always because the ray cage is too small to span the gap between the
+two meshes; the CLI warns when it drops below 50%.
+
+Two ordering details matter, and the CLI handles both: decimation happens
+*before* texturing, so the atlas is built on the mesh that ships; and the
+normal map is baked *after* the albedo atlas so it reuses those UVs.
+open3d's unwrapper is **not deterministic** -- unwrapping the same mesh twice
+gives different layouts -- so a second unwrap would leave the normal map
+addressed by different coordinates than the albedo, silently breaking the
+asset. Baking onto a mesh that already has `triangle_uvs` always reuses them.
+
+Note the resolution floor of an 8-bit normal map: encoded as `0.5 + 0.5 * n`,
+the smallest representable deviation is about `0.004`. On a surface whose
+low-poly normals are already that accurate there is nothing to recover, and
+the map only adds quantization noise -- decimate far enough that the detail
+you are baking actually exceeds that floor.
+
 UV unwrapping requires a **manifold** mesh. TSDF and Poisson output has
 already been through `remove_non_manifold_edges()`, so this normally holds;
 if it doesn't, the CLIs warn and fall back to per-vertex colors rather than
@@ -493,6 +539,11 @@ something gsplat ships.
   `bake_mesh_texture(mesh, dataset, mode="vertex"|"atlas", ...)` is the
   dispatching entry point the CLIs use, returning `(mesh, texture_or_None)`
   and falling back to per-vertex colors if the mesh can't be unwrapped.
+- `gsplat.photogrammetry.simplify_mesh(mesh, target_triangles=...)` returns a
+  quadric-decimated copy; `bake_normal_map(high_mesh, low_mesh,
+  texture_size=..., space="tangent"|"object")` returns
+  `(low_mesh, normal_map, stats)`, baking the dense mesh's normals onto the
+  decimated one's atlas (reusing its existing UVs when it has them).
 - `gsplat.photogrammetry.metrics.point_to_mesh_distance(points, mesh, ...)` /
   `mesh_quality_stats(mesh)` / `point_cloud_stats(points, ...)` return plain
   dicts of quality stats for a mesh or point cloud, independent of how it was

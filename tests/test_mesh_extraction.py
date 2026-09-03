@@ -481,3 +481,206 @@ def test_bake_mesh_texture_dispatches_and_falls_back():
             texture_size=32,
             allow_atlas_fallback=False,
         )
+
+
+def test_simplify_mesh_hits_the_triangle_budget_and_keeps_the_shape():
+    """Decimation should cut triangles hard while staying on the surface."""
+    from gsplat.photogrammetry.mesh_extraction import simplify_mesh
+    from gsplat.photogrammetry.metrics import point_to_mesh_distance
+
+    dense = _unit_sphere_mesh(resolution=20)
+    assert len(dense.triangles) > 1000
+
+    low = simplify_mesh(dense, target_triangles=200)
+    assert len(low.triangles) <= 260, len(low.triangles)
+    assert len(low.triangles) >= 100
+    # The input is left alone.
+    assert len(dense.triangles) > 1000
+
+    # Points sampled from the dense mesh still lie close to the decimated one:
+    # decimation removed triangles, not geometry.
+    sampled = np.asarray(dense.sample_points_uniformly(2000).points)
+    fit = point_to_mesh_distance(sampled, low)
+    assert fit["mean"] < 0.02, fit["mean"]
+
+    with pytest.raises(ValueError, match="target_triangles"):
+        simplify_mesh(dense, target_triangles=0)
+
+
+def _bumpy_sphere(resolution=48, amplitude=0.06):
+    """A unit sphere displaced radially by a smooth high-frequency bump.
+
+    A plain sphere is useless for testing normal-map baking: its interpolated
+    vertex normals are already essentially the exact analytic normals, so a
+    decimated sphere has no detail for the map to recover and an 8-bit map can
+    only add quantization noise. This surface carries detail a smooth low-poly
+    genuinely cannot represent, which is the case the feature exists for.
+    """
+    o3d = pytest.importorskip("open3d")
+    mesh = o3d.geometry.TriangleMesh.create_sphere(radius=1.0, resolution=resolution)
+    unit = np.asarray(mesh.vertices)
+    unit = unit / np.linalg.norm(unit, axis=1, keepdims=True)
+    radius = 1.0 + amplitude * np.sin(6 * np.arctan2(unit[:, 1], unit[:, 0])) * np.sin(
+        5 * np.arccos(np.clip(unit[:, 2], -1.0, 1.0))
+    )
+    mesh.vertices = o3d.utility.Vector3dVector(unit * radius[:, None])
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def _closest_point_normals(dense, points):
+    """Dense-mesh normals at the points nearest `points`.
+
+    Deliberately a *closest-point* query -- a different code path from the
+    along-the-normal ray cast `bake_normal_map` uses -- so the test checks the
+    bake against an independent answer rather than against itself.
+    """
+    o3d = pytest.importorskip("open3d")
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(dense))
+    found = scene.compute_closest_points(o3d.core.Tensor(points.astype(np.float32)))
+    corner_normals = np.asarray(dense.vertex_normals)[
+        np.asarray(dense.triangles)[found["primitive_ids"].numpy()]
+    ]
+    bary = found["primitive_uvs"].numpy()
+    weights = np.stack(
+        [1.0 - bary[:, 0] - bary[:, 1], bary[:, 0], bary[:, 1]], axis=-1
+    )[..., None]
+    normals = (corner_normals * weights).sum(axis=1)
+    return normals / np.clip(
+        np.linalg.norm(normals, axis=1, keepdims=True), 1e-12, None
+    )
+
+
+@pytest.mark.parametrize("space", ["tangent", "object"])
+def test_bake_normal_map_recovers_detail_the_low_poly_lacks(space):
+    """The baked map must reconstruct the dense surface's normals on a
+    low-poly that cannot represent them -- the whole point of the feature.
+
+    Ground truth comes from an independent closest-point query against the
+    dense mesh, not from the bake's own ray cast.
+    """
+    from gsplat.photogrammetry.mesh_extraction import (
+        _unwrap_and_rasterize,
+        bake_normal_map,
+        simplify_mesh,
+    )
+
+    dense = _bumpy_sphere()
+    low = simplify_mesh(_unit_sphere_mesh(resolution=8), target_triangles=200)
+    texture_size = 256
+
+    low, normal_map, stats = bake_normal_map(
+        dense, low, texture_size=texture_size, space=space
+    )
+
+    assert normal_map.shape == (texture_size, texture_size, 3)
+    assert normal_map.dtype == np.uint8
+    assert stats["hit_fraction"] > 0.8, stats
+    assert stats["space"] == space
+    assert stats["num_hits"] <= stats["num_texels"]
+
+    # Recover the same texel frame the bake used, then decode the map there.
+    atlas = _unwrap_and_rasterize(low, texture_size, with_tangents=(space == "tangent"))
+    decoded = normal_map[atlas.rows, atlas.cols] / 255.0 * 2.0 - 1.0
+    if space == "tangent":
+        bitangent = np.cross(atlas.normals, atlas.tangents)
+        world = (
+            decoded[:, 0:1] * atlas.tangents
+            + decoded[:, 1:2] * bitangent
+            + decoded[:, 2:3] * atlas.normals
+        )
+    else:
+        world = decoded
+    world /= np.clip(np.linalg.norm(world, axis=1, keepdims=True), 1e-12, None)
+
+    truth = _closest_point_normals(dense, atlas.positions)
+    baked_err = np.abs(world - truth).mean()
+    base_err = np.abs(atlas.normals - truth).mean()
+
+    # The low-poly is genuinely wrong about this surface; the map should fix
+    # most of that, not merely tie.
+    assert base_err > 0.08, f"test surface has too little detail to recover: {base_err}"
+    assert baked_err < base_err / 3.0, (
+        f"normal map ({baked_err}) should be far closer to the dense surface "
+        f"than the low-poly's own normals ({base_err})"
+    )
+
+
+def test_bake_normal_map_tangent_space_is_mostly_flat_and_valid():
+    """A tangent-space map of a smooth surface should sit near +Z.
+
+    A map whose blue channel is not dominant means the tangent frame is wrong
+    -- the classic symptom of a flipped bitangent or an un-orthogonalized
+    tangent, which looks like inverted lighting in a renderer.
+    """
+    from gsplat.photogrammetry.mesh_extraction import bake_normal_map, simplify_mesh
+
+    dense = _unit_sphere_mesh(resolution=24)
+    low = simplify_mesh(_unit_sphere_mesh(resolution=6), target_triangles=120)
+    _, normal_map, stats = bake_normal_map(dense, low, texture_size=128)
+
+    decoded = normal_map.reshape(-1, 3) / 255.0 * 2.0 - 1.0
+    assert (decoded[:, 2] > 0).mean() > 0.98, "tangent-space normals must face +Z"
+    # Unit length, so the map is physically decodable rather than washed out.
+    lengths = np.linalg.norm(decoded, axis=1)
+    assert np.abs(lengths - 1.0).mean() < 0.05
+
+
+def test_bake_normal_map_validates_its_inputs():
+    o3d = pytest.importorskip("open3d")
+    from gsplat.photogrammetry.mesh_extraction import bake_normal_map
+
+    dense = _unit_sphere_mesh(resolution=8)
+    low = _unit_sphere_mesh(resolution=6)
+
+    with pytest.raises(ValueError, match="Unknown normal-map space"):
+        bake_normal_map(dense, low, texture_size=32, space="world")
+
+    with pytest.raises(ValueError, match="high mesh with no triangles"):
+        bake_normal_map(o3d.geometry.TriangleMesh(), low, texture_size=32)
+
+    # The low mesh goes through the same manifold guard as the color atlas.
+    vertices = np.array(
+        [[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [0, -1, 0]], dtype=np.float64
+    )
+    triangles = np.array([[0, 1, 2], [0, 1, 3], [0, 1, 4]], dtype=np.int32)
+    non_manifold = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices), o3d.utility.Vector3iVector(triangles)
+    )
+    non_manifold.compute_vertex_normals()
+    with pytest.raises(ValueError, match="non-manifold"):
+        bake_normal_map(dense, non_manifold, texture_size=32)
+
+
+def test_albedo_and_normal_maps_share_one_uv_layout():
+    """An asset's albedo and normal map must be addressed by the same UVs.
+
+    open3d's `compute_uvatlas` is *not* deterministic -- unwrapping the same
+    mesh twice gives different layouts. So baking a color atlas and then a
+    normal map must reuse the first bake's UVs; otherwise the normal map is
+    sampled through the albedo's coordinates and the asset is silently wrong.
+    """
+    from gsplat.photogrammetry.mesh_extraction import (
+        _unwrap_and_rasterize,
+        bake_normal_map,
+        bake_texture_atlas,
+        simplify_mesh,
+    )
+
+    dense = _bumpy_sphere()
+    low = simplify_mesh(_unit_sphere_mesh(resolution=8), target_triangles=200)
+
+    low, _ = bake_texture_atlas(low, _SphereDataset(num_views=8), texture_size=64)
+    albedo_uvs = np.asarray(low.triangle_uvs).copy()
+
+    low, normal_map, _ = bake_normal_map(dense, low, texture_size=64)
+    np.testing.assert_allclose(np.asarray(low.triangle_uvs), albedo_uvs)
+
+    # And the guard is real: two independent unwraps of the same mesh disagree.
+    fresh_a = _unwrap_and_rasterize(low, 64, reuse_uvs=False).triangle_uvs
+    fresh_b = _unwrap_and_rasterize(low, 64, reuse_uvs=False).triangle_uvs
+    assert not np.allclose(fresh_a, fresh_b), (
+        "compute_uvatlas became deterministic -- the reuse path is no longer "
+        "load-bearing and this test's premise needs revisiting"
+    )

@@ -36,6 +36,7 @@ import os
 from dataclasses import dataclass
 from typing import Literal, Optional
 
+import imageio.v2 as imageio
 import numpy as np
 import open3d as o3d
 import torch
@@ -44,8 +45,10 @@ from datasets.colmap import Dataset, Parser
 
 from gsplat.photogrammetry.mesh_extraction import (
     bake_mesh_texture,
+    bake_normal_map,
     extract_mesh_poisson,
     extract_mesh_tsdf,
+    simplify_mesh,
 )
 from gsplat.photogrammetry.metrics import mesh_quality_stats, point_to_mesh_distance
 
@@ -93,6 +96,18 @@ class Config:
     texture_mode: Literal["vertex", "atlas"] = "vertex"
     # Atlas width/height in texels (--texture_mode atlas only).
     texture_size: int = 2048
+    # Decimate the extracted mesh to roughly this many triangles before
+    # texturing (quadric error metrics). TSDF/Poisson output is tessellated to
+    # the voxel grid rather than to the scene's complexity, so this is usually
+    # a large reduction. Combine with --normal_map to keep the detail.
+    target_triangles: Optional[int] = None
+    # Bake the pre-decimation mesh's normals into a normal map on the textured
+    # mesh's UV atlas, so the decimated mesh still shades like the dense one.
+    # Requires --texture_mode atlas. Writes mesh_normal.png next to mesh.obj.
+    normal_map: bool = False
+    # Normal-map space. "tangent" is what engines expect; "object" is simpler
+    # and immune to UV-seam tangent artifacts, fine for a static scanned asset.
+    normal_map_space: Literal["tangent", "object"] = "tangent"
     # Torch device.
     device: str = "cuda"
 
@@ -136,6 +151,31 @@ def main(cfg: Config) -> None:
         f"{len(mesh.triangles)} triangles"
     )
 
+    if cfg.normal_map and cfg.texture_mode != "atlas":
+        raise ValueError(
+            "--normal_map needs UV coordinates to bake into, so it requires "
+            "--texture_mode atlas (which also switches the output to .obj)."
+        )
+
+    # Decimate before texturing, so the atlas is built on the mesh that ships.
+    # Keep the dense mesh: it is what --normal_map bakes detail from.
+    dense_mesh = mesh
+    decimation_stats = None
+    if cfg.target_triangles is not None:
+        before = len(mesh.triangles)
+        mesh = simplify_mesh(mesh, target_triangles=cfg.target_triangles)
+        after = len(mesh.triangles)
+        decimation_stats = {
+            "triangles_before": before,
+            "triangles_after": after,
+            "reduction": 1.0 - (after / before) if before else 0.0,
+            "target_triangles": cfg.target_triangles,
+        }
+        print(
+            f"[extract_mesh] decimated {before} -> {after} triangles "
+            f"({decimation_stats['reduction']:.1%} fewer)"
+        )
+
     texture = None
     if cfg.bake_texture_:
         mesh, texture = bake_mesh_texture(
@@ -152,6 +192,30 @@ def main(cfg: Config) -> None:
         else:
             print("[extract_mesh] baked per-vertex texture from training images")
 
+    normal_map_stats = None
+    if cfg.normal_map:
+        # Runs after the color atlas so it reuses those UVs -- open3d's
+        # unwrapper is non-deterministic, so a second unwrap would give the
+        # normal map a different layout from the albedo.
+        mesh, normal_map, normal_map_stats = bake_normal_map(
+            dense_mesh,
+            mesh,
+            texture_size=cfg.texture_size,
+            space=cfg.normal_map_space,
+        )
+        print(
+            f"[extract_mesh] baked a {cfg.normal_map_space}-space normal map "
+            f"({normal_map_stats['hit_fraction']:.1%} of texels hit the dense "
+            "mesh)"
+        )
+        if normal_map_stats["hit_fraction"] < 0.5:
+            print(
+                "[extract_mesh] WARNING: most texels missed the dense mesh, so "
+                "the normal map is mostly flat. The ray cage "
+                f"({normal_map_stats['cage']:.4g} scene units) is probably too "
+                "small to span the gap between the two meshes."
+            )
+
     os.makedirs(cfg.result_dir, exist_ok=True)
     # A UV atlas needs a format that can carry UVs and a texture image; .ply
     # cannot, so an atlas mesh is written as .obj (+ .mtl + .png alongside).
@@ -161,7 +225,24 @@ def main(cfg: Config) -> None:
     o3d.io.write_triangle_mesh(out_path, mesh)
     print(f"[extract_mesh] wrote {out_path}")
 
+    if normal_map_stats is not None:
+        normal_path = os.path.join(cfg.result_dir, "mesh_normal.png")
+        imageio.imwrite(normal_path, normal_map)
+        # open3d's OBJ writer emits map_Kd but nothing for a normal map, so
+        # reference it here -- otherwise the .png ships beside an .mtl that
+        # never mentions it and every importer ignores it.
+        mtl_path = os.path.splitext(out_path)[0] + ".mtl"
+        if os.path.exists(mtl_path):
+            with open(mtl_path, "a") as f:
+                f.write(f"norm {os.path.basename(normal_path)}\n")
+                f.write(f"map_Bump {os.path.basename(normal_path)}\n")
+        print(f"[extract_mesh] wrote {normal_path} (referenced from {mtl_path})")
+
     stats = mesh_quality_stats(mesh)
+    if decimation_stats is not None:
+        stats["decimation"] = decimation_stats
+    if normal_map_stats is not None:
+        stats["normal_map"] = normal_map_stats
     if len(mesh.triangles) == 0:
         # Extraction produced nothing usable. Say so plainly instead of
         # letting the cloud-to-mesh measurement fail against an empty surface.

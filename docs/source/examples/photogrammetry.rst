@@ -72,5 +72,12 @@ are constant or mostly non-finite -- before the training stage spends hours
 on them. It warns by default and fails the run under ``--strict``. See "The
 ``priors`` quality gate" in ``docs/photogrammetry.md``.
 
+For a deliverable asset rather than a raw extraction, add
+``--target_triangles`` and ``--normal_map`` to step 4: the mesh is decimated
+to a triangle budget (quadric error metrics) and the removed detail is baked
+into a normal map on its UV atlas, so the light mesh still shades like the
+dense one. See "Decimation + normal maps (the delivery path)" in
+``docs/photogrammetry.md``.
+
 See ``docs/photogrammetry.md`` (repo root) for the full guide and
 :doc:`../apis/photogrammetry` for the Python API.

@@ -21,7 +21,7 @@
        tests/test_neural_sfm.py tests/test_colmap_dataset.py \
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -q
    ```
-   Expect **72 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **78 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Then start from §5.1.** As of the latest session all three §5.1 items
    are still blocked (re-verified, see §4) — Actions is still off, the PR is
@@ -232,12 +232,12 @@ just re-asserting the buggy behavior):
 | Test file | Count | Covers |
 |---|---|---|
 | `tests/test_bundle_adjustment.py` | 3 | Pure-torch optimization core (no pycolmap needed) |
-| `tests/test_mesh_extraction.py` | 10 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
+| `tests/test_mesh_extraction.py` | 16 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
 | `tests/test_colmap_dataset.py` | 14 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 9 | Geometry metrics against known analytic ground truth |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
-| **Total** | **72** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| **Total** | **78** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -254,6 +254,50 @@ executions, not just `--help`:
   output.
 
 ---
+
+### 2.10 Decimation + normal-map baking (the delivery path)
+
+TSDF/Poisson extraction tessellates to the voxel grid rather than to the
+scene's complexity, so a raw extraction is far heavier than the geometry
+warrants. The standard photogrammetry answer is not a coarser extraction (that
+loses detail) but decimate-and-bake, which this now implements:
+
+- `simplify_mesh(mesh, target_triangles=...)` — Garland & Heckbert quadric
+  error decimation, then the existing `_clean_mesh` pass.
+- `bake_normal_map(high_mesh, low_mesh, space="tangent"|"object")` — casts a
+  ray per texel from just outside the low surface inward along its own normal
+  onto the dense mesh, and stores the dense mesh's barycentrically
+  interpolated normal there. Returns `(mesh, normal_map, stats)`; `stats`
+  carries `hit_fraction`, the diagnostic that says whether the map is doing
+  anything (a low value means the ray cage doesn't span the gap).
+- `extract_mesh.py --target_triangles/--normal_map/--normal_map_space`, which
+  decimates before texturing, bakes the normal map after the albedo atlas,
+  writes `mesh_normal.png`, and appends `norm`/`map_Bump` to the `.mtl`
+  (open3d's OBJ writer emits `map_Kd` and nothing else, so the normal map
+  would otherwise ship unreferenced).
+- `_unwrap_and_rasterize` factors the unwrap + texel-frame rasterization out
+  of `bake_texture_atlas`, so both bakes share one atlas construction.
+
+**Correctness issue this exposed (§2.7's tenth):** open3d's `compute_uvatlas`
+is **not deterministic** — unwrapping the same mesh twice yields different UV
+layouts (confirmed: four unwraps of one sphere, four different layouts). Since
+`bake_texture_atlas` and `bake_normal_map` each unwrapped independently, an
+asset's albedo and normal map would have had *different* UV layouts, so the
+normal map would be sampled through the albedo's coordinates — a silently
+broken asset. `_unwrap_and_rasterize` now reuses a mesh's existing
+`triangle_uvs` when present (`reuse_uvs=False` forces a fresh unwrap). This
+surfaced as an intermittently failing test before it was understood.
+
+**A test-design trap worth remembering:** a plain sphere is useless for
+validating normal-map baking. Its interpolated vertex normals are already
+essentially the exact analytic normals, so a decimated sphere has no detail to
+recover and an 8-bit map (quantization floor ~0.004, since `0.5` encodes to
+byte 128) can only add noise — the first version of the test failed for
+exactly that reason, and loosening the threshold would have hidden it. The
+test now uses a radially displaced "bumpy" sphere, where the low-poly is
+genuinely wrong (base error 0.14) and the map recovers it (0.025), with ground
+truth from an *independent* closest-point query rather than the bake's own ray
+cast.
 
 ### 2.9 Follow-on work from §5.2 (later session)
 
@@ -520,10 +564,16 @@ work is.
   policy denies non-registry hosts): running either recipe against a real
   model on real images, and confirming the depth prior actually improves a
   trained result. Do this together with the §5.1 GPU run.
-- **UV-atlas polish, once a real capture has been through it.** `--texture_size`
-  defaults to 2048 and the seam dilation to 4 texels; neither has been tuned
-  against a real scene. Multi-material output (one atlas per chart group) and
-  a non-square atlas are unimplemented.
+- **UV-atlas / normal-map polish, once a real capture has been through it.**
+  `--texture_size` defaults to 2048, the seam dilation to 4 texels, and the
+  normal-map ray cage to 2% of the bounding-box diagonal; none has been tuned
+  against a real scene. Multi-material output (one atlas per chart group), a
+  non-square atlas, and 16-bit normal maps (past the 8-bit ~0.004 floor) are
+  unimplemented.
+- **Decimation driven by a quality target rather than a triangle count.**
+  `simplify_mesh` takes a triangle budget; choosing that budget from a target
+  cloud-to-mesh error (decimate until the fit degrades past a threshold) would
+  be a better interface, and all the measurement pieces already exist.
 
 ### 5.3 Explicitly out of scope (by design, not oversight)
 - gsplat will **never** bundle code that runs a neural network itself for
