@@ -3,7 +3,7 @@
 **Repo:** `Cyruskraad/gsplat` (fork of `nerfstudio-project/gsplat`)
 **Branch:** `claude/photogrammetry-techniques-plan-jb0pod`
 **PR:** [#3 — Add state-of-the-art photogrammetry pipeline](https://github.com/Cyruskraad/gsplat/pull/3) (open, draft)
-**Diff size:** 26 files changed, +5,027 / −10 lines, 8 commits since branching from `main`
+**Diff size:** 29 files changed, ~+6,000 / −60 lines, 12 commits since branching from `main`
 
 ---
 
@@ -21,11 +21,12 @@
        tests/test_neural_sfm.py tests/test_colmap_dataset.py \
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -q
    ```
-   Expect **42 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **58 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
-4. **Then start from §5.1** — the highest-value remaining steps are getting
-   CI enabled, getting PR #3 reviewed/merged, and running the pipeline once
-   on real GPU hardware against a real capture.
+4. **Then start from §5.1.** As of the latest session all three §5.1 items
+   are still blocked (re-verified, see §4) — Actions is still off, the PR is
+   still an unreviewed draft, and the sandbox still has no GPU/CUDA/`colmap`/
+   capture data. Re-check them first anyway, then continue down §5.2.
 
 **Ground rules carried over from the work so far:**
 
@@ -226,12 +227,12 @@ just re-asserting the buggy behavior):
 | Test file | Count | Covers |
 |---|---|---|
 | `tests/test_bundle_adjustment.py` | 3 | Pure-torch optimization core (no pycolmap needed) |
-| `tests/test_mesh_extraction.py` | 2 | TSDF fusion + Poisson reconstruction against an analytic sphere |
+| `tests/test_mesh_extraction.py` | 10 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
 | `tests/test_colmap_dataset.py` | 11 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 6 | Geometry metrics against known analytic ground truth |
-| `tests/test_photogrammetry_pipeline.py` | 16 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions |
-| **Total** | **42** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| `tests/test_photogrammetry_pipeline.py` | 24 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, and report-on-failure (see §2.9) |
+| **Total** | **58** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -249,6 +250,84 @@ executions, not just `--help`:
 
 ---
 
+### 2.9 Follow-on work from §5.2 (later session)
+
+Three of §5.2's items are now done. All three were validated the same way as
+everything before them: by hand, since CI still cannot run.
+
+- **UV-atlas texture baking** (`bake_texture_atlas`). Per-vertex colors can
+  only carry as much detail as the mesh is tessellated for. This UV-unwraps
+  the mesh (open3d's `compute_uvatlas`), recovers each texel's 3D surface
+  point/normal by baking vertex positions and normals into the atlas
+  (`bake_vertex_attr_textures`), colors those points, and pads the result
+  across UV seams. Returns `(mesh, texture)` with `triangle_uvs`/`textures`
+  set, so `write_triangle_mesh("mesh.obj", mesh)` emits .obj + .mtl + .png.
+  **No new dependency** — this uses open3d, already the `gsplat[mesh]` extra,
+  so the `xatlas` §5.2 originally suggested turned out not to be needed.
+  `_bake_points_from_views` factors the existing occlusion-aware,
+  view-weighted blend out of `bake_texture` so both paths share one color
+  signal; it also now chunks the ray cast, bounding memory for large atlases.
+  `bake_mesh_texture(..., mode=...)` is the dispatcher both CLIs use, exposed
+  as `extract_mesh.py --texture_mode/--texture_size` and
+  `simple_trainer_2dgs.py --mesh_texture_mode/--mesh_texture_size`.
+  **Sharp edge worth knowing:** open3d's `compute_uvatlas` requires a manifold
+  mesh and **segfaults** rather than raising on non-manifold input (confirmed:
+  exit 139). `bake_texture_atlas` therefore checks edge/vertex manifoldness up
+  front and raises `ValueError`; the dispatcher warns and falls back to
+  per-vertex colors, since losing the mesh after hours of training is worse.
+- **`priors` mask/depth quality gate.** `pipeline.check_prior_quality(...)`
+  (pure stdlib) turns the `mask_coverage_stats`/`depth_prior_stats` dicts into
+  a list of concrete problems — an empty prior directory, masks excluding
+  (almost) the whole frame or nothing at all, a mask excluding its entire
+  frame, mostly-degenerate or mostly-non-finite depth maps. `run_pipeline.py`
+  prints them, records them in the report, and fails the stage under
+  `--strict`, so the run stops *before* the training stage rather than after.
+  Thresholds are CLI-tunable (`--max_excluded_fraction`,
+  `--max_degenerate_fraction`) and pass on equality.
+- **CI would exercise the photogrammetry suite** (§5.2's last item, which
+  asked for exactly this double-check). Measured by simulating
+  `core_tests.yml`'s dependency set: `pytest tests/` would **pass but be
+  hollow** — 26 of 58 tests run, four of the six photogrammetry files skipping
+  wholesale on their `importorskip` guards. `core_tests.yml` now also installs
+  `pycolmap`, `open3d`, `scikit-learn`, `opencv-python-headless` and `piexif`,
+  which takes it to all 58. Adding `scikit-learn` also un-skips the
+  pre-existing `tests/test_init_multiframe.py` (checked: 10 passed, 1
+  skipped). `opencv` does **not** newly enable
+  `tests/sensors/models/cameras/test_fisheye.py` — that file imports
+  `gsplat.sensors` at module scope and so already fails collection on a CPU
+  runner with or without cv2 (pre-existing, unrelated to this PR, untouched).
+
+**Bug found by running the new gate** (bringing §2.7's count to six): without
+`--continue_on_error`, a failing stage re-raised out of `run_pipeline.py`'s
+`main()` *before the report was ever written* — so the `status="failed"`
+record `run_stage` had just built was lost to the traceback, and any
+`pipeline_report.json` from an earlier run stayed on disk still claiming
+success. `main()` now runs the stages in a `try`/`finally` around the report
+write. This affected every stage, not just the new gate.
+
+**What was actually executed for these** (same sandbox: no GPU, no CUDA
+extension, no capture data):
+
+- Full suite 58 passed. Every new guard was mutation-checked rather than just
+  asserted: vertically flipping the baked atlas fails the UV-convention test;
+  removing the seam-fill edge-blanking fails the wrap test; calling
+  `compute_uvatlas` on the non-manifold test mesh without the guard dies with
+  SIGSEGV; reverting the `try`/`finally` fails the report-on-failure test.
+- Real, non-dry-run runs of `run_pipeline.py --stages priors` against
+  synthetic prior directories: warns and continues by default, fails the stage
+  under `--strict` (exit 1, report written with `status="failed"`), clean on
+  healthy priors.
+- `extract_mesh.py --help` and `simple_trainer_2dgs.py --help` parse the new
+  flags; `black --check --required-version 22.3.0` and `py_compile` on every
+  changed file.
+
+Still **not** executed: the atlas path against a real trained checkpoint and
+real imagery (needs a GPU), and the `core_tests.yml` change itself (needs
+Actions). The atlas correctness tests use analytic ground truth — a unit
+sphere shaded by a known position-dependent function, viewed from 24
+ray-traced cameras — and check the atlas *as addressed by the mesh's own
+`triangle_uvs`*, which pins the OBJ v-up convention external tools rely on.
+
 ## 3. What has **not** been verified (sandbox limitations)
 
 This work was done in a sandbox with **no GPU, no compiled CUDA extension,
@@ -260,14 +339,18 @@ unverified beyond code review + the checks above:
   `--dense_points_path`) has never executed on a GPU.
 - `extract_mesh.py`'s TSDF/Poisson extraction has never run against a real
   trained checkpoint (only against synthetic depth maps / point clouds in
-  unit tests).
+  unit tests). The same goes for `--texture_mode atlas` (§2.9): its
+  correctness is pinned against analytic ground truth, but it has never baked
+  a real capture's imagery onto a real mesh.
 - `dense_mvs.py` has never run at all beyond `--help` — needs a real
   CUDA-enabled `colmap` CLI install.
 - No run has ever happened against a real dataset (e.g. Mip-NeRF 360
   "garden") — all validation used small synthetic `pycolmap` reconstructions
   and analytic shapes (spheres, grids).
 - CI (`.github/workflows/*.yml` exist in the tree but Actions is disabled at
-  the repo level) has never run on this branch.
+  the repo level) has never run on this branch — including the
+  `core_tests.yml` dependency change made in §2.9, which was validated by
+  simulating that dependency set locally, not by a CI run.
 
 ---
 
@@ -275,13 +358,15 @@ unverified beyond code review + the checks above:
 
 - **GitHub Actions is disabled** on `Cyruskraad/gsplat` at the repository
   level. Confirmed via the GitHub API returning zero registered workflows
-  despite workflow files existing in the tree. Neither this session nor the
+  despite workflow files existing in the tree — **re-checked in the §2.9
+  session and still zero.** Neither this session nor the
   repo owner has the admin access to flip **Settings → Actions → General →
   Allow all actions**. Until someone with org/repo admin rights does that,
   there is no automated CI signal on this PR — every round of changes has
   been validated by manual code review instead.
-- **PR #3 is still open and in draft state.** It needs a human to mark it
-  ready for review and merge it (or request changes). A ~60-minute
+- **PR #3 is still open and in draft state**, with no reviews, no review
+  comments and no check runs as of the §2.9 session. It needs a human to mark
+  it ready for review and merge it (or request changes). A ~60-minute
   self-scheduled check-in has been monitoring it for CI/mergeability/review
   activity throughout this work and will keep doing so.
 
@@ -292,6 +377,12 @@ unverified beyond code review + the checks above:
 Roughly in priority order:
 
 ### 5.1 Must happen before merge
+
+**All three below were re-checked in the §2.9 session and are still blocked**
+— they need repo-admin access and GPU hardware that no session so far has
+had. Re-check them each time, but don't wait on them: §5.2 is where the
+work is.
+
 1. **Get this PR reviewed and merged**, or get feedback on scope/direction.
    It's currently a draft; someone needs to mark it ready and approve it.
 2. **Enable GitHub Actions** on the repo (needs org/repo admin access this
@@ -309,38 +400,41 @@ Roughly in priority order:
    real-world numerical stability, actual runtime/memory behavior, and
    whether the produced mesh/metrics look sane on a real scene.
 
-### 5.2 Natural follow-on work (not started)
-- **UV-atlas texture baking.** `bake_texture` currently only produces
-  per-vertex colors (explicitly documented as a deliberate scope boundary,
-  not a bug) — a proper UV-unwrapped texture atlas (e.g. via `xatlas`) would
-  be a natural next step for anyone wanting textures usable in standard DCC
-  tools/game engines.
+### 5.2 Natural follow-on work
+
+**Done** (see §2.9 for what was executed vs. code-reviewed):
+- ~~UV-atlas texture baking~~ — `bake_texture_atlas` / `--texture_mode atlas`.
+  Used open3d's own `compute_uvatlas` rather than `xatlas`, so no new
+  dependency was needed.
+- ~~`priors` stage's mask-quality gate~~ — `pipeline.check_prior_quality`,
+  wired into `run_pipeline.py` (warns by default, fails under `--strict`).
+- ~~CI should exercise the photogrammetry suite~~ — the workflows do glob
+  `tests/` broadly, but `core_tests.yml` didn't install the suite's
+  dependencies, so 4 of its 6 files skipped wholesale (26 of 58 tests ran).
+  Its install step now adds them. **Still needs Actions on to confirm.**
+
+**Not started**, roughly in the order worth picking them up:
+- **Dense-MVS metrics wired into `run_pipeline.py`'s report table more
+  richly** — currently `densification_ratio` (dense vs. sparse point count)
+  is the only derived cross-stage metric; comparable cross-stage deltas
+  (e.g. mesh cloud-to-mesh fit vs. dense-cloud density) could be added. The
+  best remaining item that is fully verifiable without a GPU.
 - **Appearance-embedding checkpoint support for mesh extraction.**
   `extract_mesh_tsdf`/`bake_texture` currently only support SH-color
   checkpoints (trained without `--app_opt`), since per-image appearance
   variation doesn't map onto one canonical mesh texture — resolving that
-  (e.g. baking at a canonical appearance embedding) is unexplored.
-- **`priors` stage's mask-quality gate.** `run_pipeline.py`'s `priors` stage
-  currently just *reports* `mask_coverage_stats`/`depth_prior_stats`; it
-  could optionally fail/warn loudly (or auto-adjust `--strict` behavior) when
-  it detects a mask directory that excludes almost the entire frame, or a
-  depth-prior directory that's mostly degenerate — turning the sanity check
-  into an actual gate rather than an informational stat.
-- **Dense-MVS metrics wired into `run_pipeline.py`'s report table more
-  richly** — currently `densification_ratio` (dense vs. sparse point count)
-  is the only derived cross-stage metric; comparable cross-stage deltas
-  (e.g. mesh cloud-to-mesh fit vs. dense-cloud density) could be added.
-- **CI, once enabled**, should be extended to actually exercise the
-  photogrammetry test suite (`tests/test_bundle_adjustment.py`,
-  `test_mesh_extraction.py`, `test_neural_sfm.py`, `test_colmap_dataset.py`,
-  `test_photogrammetry_metrics.py`, `test_photogrammetry_pipeline.py`) if
-  the existing workflow files don't already glob `tests/` broadly — worth
-  double-checking once Actions is live.
+  (e.g. baking at a canonical appearance embedding) is unexplored. Needs a
+  GPU and a real `--app_opt` checkpoint to evaluate, so it is effectively
+  blocked alongside §5.1.
 - **Real-world AI-prior recipes.** The Depth Anything V2 and Mask R-CNN
   recipes in the docs are illustrative, tested only for API correctness
   against their respective libraries' documented interfaces — not run
   end-to-end against real images in this sandbox (no GPU). Worth a real
   pass once hardware is available.
+- **UV-atlas polish, once a real capture has been through it.** `--texture_size`
+  defaults to 2048 and the seam dilation to 4 texels; neither has been tuned
+  against a real scene. Multi-material output (one atlas per chart group) and
+  a non-square atlas are unimplemented.
 
 ### 5.3 Explicitly out of scope (by design, not oversight)
 - gsplat will **never** bundle code that runs a neural network itself for
@@ -377,6 +471,7 @@ New:
   tests/test_photogrammetry_metrics.py
   tests/test_photogrammetry_pipeline.py
   docs/photogrammetry.md
+  docs/photogrammetry_status.md    (this file)
   docs/source/apis/photogrammetry.rst
   docs/source/examples/photogrammetry.rst
 
@@ -390,6 +485,8 @@ Modified:
   setup.py                          (gsplat[mesh] extra: open3d)
   examples/requirements.txt         (open3d)
   README.md                         (news bullet)
+  .github/workflows/core_tests.yml  (install the photogrammetry suite's test
+                                      deps so CI actually runs it -- see §2.9)
 ```
 
 ---
@@ -406,10 +503,18 @@ python -m pytest tests/test_bundle_adjustment.py tests/test_mesh_extraction.py \
     tests/test_neural_sfm.py tests/test_colmap_dataset.py \
     tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -v
 
-# Try the one-command pipeline against a real capture
+# Try the one-command pipeline against a real capture. --strict now also
+# fails the run if the AI-prior directories look unusable (see 2.9).
 python examples/run_pipeline.py \
     --data_dir data/360_v2/garden --result_dir results/garden_pipeline \
     --mono_depth_dir <your_depth_dir> --mask_dir <your_mask_dir>
+
+# Extract a mesh with a real UV texture atlas rather than vertex colors
+# (writes mesh.obj + mesh.mtl + mesh_0.png)
+python examples/extract_mesh.py \
+    --ckpt results/garden_2dgs/ckpts/ckpt_29999_rank0.pt \
+    --data_dir data/360_v2/garden --result_dir results/garden_2dgs \
+    --texture_mode atlas --texture_size 4096
 
 # Read the full guide
 cat docs/photogrammetry.md
@@ -417,6 +522,7 @@ cat docs/photogrammetry.md
 
 ---
 
-*Generated by Claude Code, summarizing all work done in session
-`session_01FfVDvERXP1ppdzKd63waP7` on branch
-`claude/photogrammetry-techniques-plan-jb0pod`.*
+*Generated by Claude Code, summarizing all work done on branch
+`claude/photogrammetry-techniques-plan-jb0pod` across sessions
+`session_01FfVDvERXP1ppdzKd63waP7` (§1-§2.8) and
+`session_01Y7eAgYXjp1zBZCC2iMdTgU` (§2.9 and the §5 updates).*
