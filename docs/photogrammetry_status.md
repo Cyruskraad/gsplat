@@ -3,7 +3,7 @@
 **Repo:** `Cyruskraad/gsplat` (fork of `nerfstudio-project/gsplat`)
 **Branch:** `claude/photogrammetry-techniques-plan-jb0pod`
 **PR:** [#3 — Add state-of-the-art photogrammetry pipeline](https://github.com/Cyruskraad/gsplat/pull/3) (open, draft)
-**Diff size:** 29 files changed, ~+6,000 / −60 lines, 12 commits since branching from `main`
+**Diff size:** 29 files changed, +6,809 / −10 lines, 12 commits since branching from `main`
 
 ---
 
