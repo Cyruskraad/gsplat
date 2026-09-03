@@ -52,7 +52,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 import tyro
 
@@ -106,6 +106,12 @@ class Config:
     # Directory of precomputed transient-object masks (see
     # docs/photogrammetry.md).
     mask_dir: Optional[str] = None
+    # How the extracted mesh is textured. "vertex" writes per-vertex colors
+    # into mesh.ply; "atlas" UV-unwraps and bakes a texture image, writing
+    # mesh.obj + mesh.mtl + mesh_0.png (see docs/photogrammetry.md).
+    texture_mode: Literal["vertex", "atlas"] = "vertex"
+    # Atlas width/height in texels (--texture_mode atlas only).
+    texture_size: int = 2048
     # Torch device for the GPU stages.
     device: str = "cuda"
     # Print each stage's command without running anything.
@@ -383,6 +389,12 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                 ]
                 if cfg.mask_dir is not None:
                     cmd += ["--mask_dir", cfg.mask_dir]
+                cmd += [
+                    "--texture_mode",
+                    cfg.texture_mode,
+                    "--texture_size",
+                    str(cfg.texture_size),
+                ]
                 _run(cmd, cfg.dry_run)
                 if not cfg.dry_run:
                     mesh_stats = (
@@ -394,7 +406,10 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                         or {}
                     )
                     stage.metrics = mesh_stats
-                stage.outputs = [os.path.join(cfg.result_dir, "mesh.ply")]
+                # A UV atlas can't live in a .ply, so extract_mesh.py writes
+                # .obj on that path -- report the file it actually produced.
+                mesh_name = "mesh.obj" if cfg.texture_mode == "atlas" else "mesh.ply"
+                stage.outputs = [os.path.join(cfg.result_dir, mesh_name)]
     else:
         record_skipped(report, "extract_mesh", "not selected")
 

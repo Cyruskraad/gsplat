@@ -107,6 +107,15 @@ python examples/extract_mesh.py \
     --texture_mode atlas --texture_size 4096
 ```
 
+`run_pipeline.py` takes the same two flags and forwards them to this stage,
+so the one-command path can produce an atlas too:
+
+```bash
+python examples/run_pipeline.py \
+    --data_dir data/360_v2/garden --result_dir results/garden_pipeline \
+    --texture_mode atlas --texture_size 4096
+```
+
 This writes `mesh.obj`, `mesh.mtl` and `mesh_0.png` (instead of `mesh.ply`,
 which cannot carry UVs or a texture image), so the result opens with its
 texture already attached in Blender, MeshLab, Unreal, Unity and anything else

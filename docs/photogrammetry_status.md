@@ -21,7 +21,7 @@
        tests/test_neural_sfm.py tests/test_colmap_dataset.py \
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -q
    ```
-   Expect **67 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **69 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Then start from §5.1.** As of the latest session all three §5.1 items
    are still blocked (re-verified, see §4) — Actions is still off, the PR is
@@ -35,6 +35,11 @@
 - **CI cannot run** (§4), so every change must be validated by hand before
   committing: `python -m black --check --required-version 22.3.0 <files>`,
   `python -m py_compile <files>`, and the full test suite above.
+  **`py_compile` is not enough for `examples/*.py`:** it compiles without
+  executing, so it misses a `NameError` in a `tyro` dataclass's annotations
+  (a missing `Literal` import, say) that breaks the script on import. Also run
+  `cd examples && PYTHONPATH=<repo> python -c "import <script>"` for each
+  example script you touched -- that caught exactly this before a commit.
 - **gsplat never bundles model-running code.** AI-assisted features consume
   precomputed model output via files — a documented repo convention (§5.3).
 - The sandbox this was built in has **no GPU, no compiled CUDA extension, no
@@ -231,8 +236,8 @@ just re-asserting the buggy behavior):
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
 | `tests/test_colmap_dataset.py` | 14 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 6 | Geometry metrics against known analytic ground truth |
-| `tests/test_photogrammetry_pipeline.py` | 31 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
-| **Total** | **67** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
+| **Total** | **69** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -268,8 +273,12 @@ everything before them: by hand, since CI still cannot run.
   view-weighted blend out of `bake_texture` so both paths share one color
   signal; it also now chunks the ray cast, bounding memory for large atlases.
   `bake_mesh_texture(..., mode=...)` is the dispatcher both CLIs use, exposed
-  as `extract_mesh.py --texture_mode/--texture_size` and
-  `simple_trainer_2dgs.py --mesh_texture_mode/--mesh_texture_size`.
+  as `extract_mesh.py --texture_mode/--texture_size`,
+  `simple_trainer_2dgs.py --mesh_texture_mode/--mesh_texture_size`, and
+  `run_pipeline.py --texture_mode/--texture_size` (which forwards them to its
+  `extract_mesh` stage and records `mesh.obj` rather than `mesh.ply` as that
+  stage's output on the atlas path), so the one-command pipeline reaches the
+  feature too.
   **Sharp edge worth knowing:** open3d's `compute_uvatlas` requires a manifold
   mesh and **segfaults** rather than raising on non-manifold input (confirmed:
   exit 139). `bake_texture_atlas` therefore checks edge/vertex manifoldness up
@@ -357,7 +366,7 @@ write. This affected every stage, not just the new gate.
 **What was actually executed for these** (same sandbox: no GPU, no CUDA
 extension, no capture data):
 
-- Full suite 67 passed. Every new guard was mutation-checked rather than just
+- Full suite 69 passed. Every new guard was mutation-checked rather than just
   asserted: removing the depth-map squeeze/ndim guard fails its test;
   vertically flipping the baked atlas fails the UV-convention test;
   removing the seam-fill edge-blanking fails the wrap test; calling

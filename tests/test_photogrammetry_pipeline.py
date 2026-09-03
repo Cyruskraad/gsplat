@@ -761,3 +761,55 @@ def test_check_prior_quality_flags_unloadable_depth_maps():
         )
         == []
     )
+
+
+@pytest.mark.parametrize(
+    "texture_mode,expected_mesh",
+    [("vertex", "mesh.ply"), ("atlas", "mesh.obj")],
+)
+def test_run_pipeline_forwards_texture_mode_to_extract_mesh(
+    tmp_path, texture_mode, expected_mesh
+):
+    """The one-command pipeline can reach both texturing paths.
+
+    `--texture_mode atlas` has to arrive at `extract_mesh.py`, and the report
+    has to name the file that stage actually writes -- a UV atlas can't live
+    in a .ply, so that path produces .obj. Driven through `run_pipeline.py`
+    with `--dry_run`, which prints the exact command it would run.
+    """
+    pytest.importorskip("tyro", reason="tyro not installed")
+    import subprocess
+    import sys
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    script = os.path.join(repo_root, "examples", "run_pipeline.py")
+    result_dir = tmp_path / "out"
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--stages",
+            "extract_mesh",
+            "--dry_run",
+            "--texture_mode",
+            texture_mode,
+            "--texture_size",
+            "1024",
+            "--data_dir",
+            str(tmp_path / "data"),
+            "--result_dir",
+            str(result_dir),
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": repo_root},
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert f"--texture_mode {texture_mode}" in proc.stdout
+    assert "--texture_size 1024" in proc.stdout
+
+    report = json.loads((result_dir / "pipeline_report.json").read_text())
+    stage = {s["name"]: s for s in report["stages"]}["extract_mesh"]
+    assert stage["outputs"] == [os.path.join(str(result_dir), expected_mesh)]
