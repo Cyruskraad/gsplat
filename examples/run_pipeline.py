@@ -65,6 +65,8 @@ from gsplat.photogrammetry.pipeline import (
     PipelineReport,
     check_prior_quality,
     collect_artifact_metrics,
+    derive_cross_stage_metrics,
+    format_cross_stage_metrics,
     latest_metrics,
     record_skipped,
     run_stage,
@@ -254,17 +256,6 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                         )
                         or {}
                     )
-                    sparse_stage = report.get("sfm_input")
-                    num_sparse = (
-                        (sparse_stage.metrics or {}).get("num_points3D")
-                        if sparse_stage
-                        else None
-                    )
-                    num_dense = stage.metrics.get("num_points")
-                    if num_sparse and num_dense:
-                        stage.metrics["densification_ratio"] = float(
-                            num_dense / num_sparse
-                        )
                 # As above: set even under --dry_run so the training command
                 # printed below shows the dense initialization it would use.
                 dense_ply = os.path.join(dense_dir, "dense.ply")
@@ -437,8 +428,13 @@ def main(cfg: Config) -> None:
         report.context["artifact_metrics"] = collect_artifact_metrics(
             cfg.result_dir, cfg.data_dir
         )
+        # Derived last, from whichever stages actually completed, so a partial
+        # or failed run still gets whatever comparisons its stages support.
+        cross_stage = derive_cross_stage_metrics(report)
+        report.context["cross_stage_metrics"] = cross_stage
         report_path = report.write(os.path.join(cfg.result_dir, "pipeline_report.json"))
         print("\n" + report.format_table())
+        print("\n" + format_cross_stage_metrics(cross_stage))
         print(f"\n[run_pipeline] wrote {report_path}")
 
     if report.failed:

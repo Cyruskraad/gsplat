@@ -72,6 +72,8 @@ from .pipeline import (
     StageResult,
     check_prior_quality,
     collect_artifact_metrics,
+    derive_cross_stage_metrics,
+    format_cross_stage_metrics,
     record_skipped,
     run_stage,
 )
@@ -99,4 +101,6 @@ __all__ = [
     "record_skipped",
     "collect_artifact_metrics",
     "check_prior_quality",
+    "derive_cross_stage_metrics",
+    "format_cross_stage_metrics",
 ]

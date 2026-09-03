@@ -395,3 +395,143 @@ def check_prior_quality(
                 )
 
     return problems
+
+
+def _stage_metrics(report: "PipelineReport", name: str) -> Dict[str, Any]:
+    """A stage's metrics, or ``{}`` if it didn't run (or wasn't selected)."""
+    stage = report.get(name)
+    if stage is None or stage.status != STATUS_OK:
+        return {}
+    return stage.metrics or {}
+
+
+def _ratio(numerator: Any, denominator: Any) -> Optional[float]:
+    """``numerator / denominator``, or None if either is missing or unusable."""
+    try:
+        num = float(numerator)
+        den = float(denominator)
+    except (TypeError, ValueError):
+        return None
+    if den == 0.0:
+        return None
+    return num / den
+
+
+def _derive_cross_stage(
+    sfm: Dict[str, Any],
+    ba: Dict[str, Any],
+    dense: Dict[str, Any],
+    mesh: Dict[str, Any],
+) -> Dict[str, float]:
+    """Shared derivation behind :func:`derive_cross_stage_metrics` and
+    :func:`cross_stage_metrics_from_artifacts`, so the pipeline runner and the
+    standalone summarizer can never disagree on what a derived metric means.
+
+    Metrics that only exist by comparing two stages' results.
+
+    Each stage's own metrics answer "what did this stage produce?". These
+    answer "did it actually improve on, or agree with, what came before?" --
+    which is the question a photogrammetry run is really being judged on, and
+    which no single stage can see. They also make several numbers
+    *interpretable*: a cloud-to-mesh distance in raw scene units means nothing
+    on its own, but divided by the point cloud's own sample spacing it says
+    whether the mesh fits within the evidence's noise floor.
+
+    Every entry is omitted rather than guessed when either input stage is
+    missing, skipped or failed, so a partial run yields a partial (never
+    misleading) set.
+
+    Returns:
+        A dict of derived scalars, in a stable order:
+
+        - ``reprojection_error_reduction`` -- fraction of the input model's
+          mean reprojection error that bundle adjustment removed. 0.1 means a
+          10% improvement; a negative value means it made the fit worse.
+        - ``points_retained_after_bundle_adjust`` -- refined 3D points over
+          input 3D points. Well under 1.0 means bundle adjustment discarded a
+          lot of the sparse cloud.
+        - ``densification_ratio`` -- dense MVS points over sparse SfM points.
+        - ``mesh_fit_over_point_spacing`` -- mean cloud-to-mesh distance over
+          the dense cloud's mean k-NN spacing. **The headline end-to-end
+          number**: at or below ~1 the mesh tracks the point cloud to within its
+          own sampling noise; well above 1 the mesh genuinely misses geometry
+          the cloud captured.
+        - ``mesh_edge_over_point_spacing`` -- mean mesh edge length over that
+          same spacing. Much below 1 means the mesh is tessellated finer than
+          the evidence supports (``--voxel_size`` too small); much above 1
+          means it is throwing away detail the cloud has.
+    """
+    derived: Dict[str, float] = {}
+
+    before = ba.get("mean_reprojection_error_before")
+    after = ba.get("mean_reprojection_error_after")
+    if before is not None and after is not None:
+        reduction = _ratio(float(before) - float(after), before)
+        if reduction is not None:
+            derived["reprojection_error_reduction"] = reduction
+
+    retained = _ratio(ba.get("num_points3D"), sfm.get("num_points3D"))
+    if retained is not None:
+        derived["points_retained_after_bundle_adjust"] = retained
+
+    densification = _ratio(dense.get("num_points"), sfm.get("num_points3D"))
+    if densification is not None:
+        derived["densification_ratio"] = densification
+
+    spacing = dense.get("mean_knn_distance")
+    point_to_mesh = mesh.get("point_to_mesh") or {}
+    fit = _ratio(point_to_mesh.get("mean"), spacing)
+    if fit is not None:
+        derived["mesh_fit_over_point_spacing"] = fit
+
+    edge = _ratio(mesh.get("mean_edge_length"), spacing)
+    if edge is not None:
+        derived["mesh_edge_over_point_spacing"] = edge
+
+    return derived
+
+
+def derive_cross_stage_metrics(report: "PipelineReport") -> Dict[str, float]:
+    """Cross-stage metrics for a :class:`PipelineReport` (see
+    :func:`_derive_cross_stage` for what each one means).
+
+    Reads each stage's recorded metrics, ignoring stages that were skipped or
+    failed, so a partial run yields a partial rather than a misleading set.
+    """
+    return _derive_cross_stage(
+        _stage_metrics(report, "sfm_input"),
+        _stage_metrics(report, "bundle_adjust"),
+        _stage_metrics(report, "dense_mvs"),
+        _stage_metrics(report, "extract_mesh"),
+    )
+
+
+def cross_stage_metrics_from_artifacts(
+    collected: Dict[str, Dict[str, Any]]
+) -> Dict[str, float]:
+    """Cross-stage metrics for a :func:`collect_artifact_metrics` result.
+
+    The same derivation as :func:`derive_cross_stage_metrics`, for a sequence
+    of stages run by hand rather than through ``run_pipeline.py``. Only the
+    ``stats/*.json`` files those stages wrote are available here -- there is no
+    ``sfm_input`` baseline, since nothing writes one -- so the metrics keyed on
+    the input SfM model are simply absent.
+    """
+    return _derive_cross_stage(
+        {},
+        latest_metrics(collected.get("bundle_adjustment", {})) or {},
+        latest_metrics(collected.get("dense_point_cloud", {})) or {},
+        latest_metrics(collected.get("mesh_quality", {})) or {},
+    )
+
+
+def format_cross_stage_metrics(derived: Dict[str, float]) -> str:
+    """A short human-readable block for :func:`derive_cross_stage_metrics`."""
+    if not derived:
+        return "cross-stage metrics: none (needs at least two completed stages)"
+    width = max(len(k) for k in derived)
+    lines = ["CROSS-STAGE METRICS"]
+    lines.append("-" * max(len(lines[0]), width + 12))
+    for key, value in derived.items():
+        lines.append(f"{key:<{width}}  {value:.4g}")
+    return "\n".join(lines)

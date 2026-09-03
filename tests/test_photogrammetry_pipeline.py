@@ -40,6 +40,9 @@ from gsplat.photogrammetry.pipeline import (
     StageResult,
     check_prior_quality,
     collect_artifact_metrics,
+    cross_stage_metrics_from_artifacts,
+    derive_cross_stage_metrics,
+    format_cross_stage_metrics,
     latest_metrics,
     record_skipped,
     run_stage,
@@ -541,3 +544,170 @@ def test_run_pipeline_writes_the_report_even_when_a_stage_fails(tmp_path):
     assert "excludes its entire frame" in " ".join(
         stages["priors"]["metrics"]["problems"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Cross-stage metrics
+# ---------------------------------------------------------------------------
+
+
+def _report_with(**stage_metrics):
+    """A report whose named stages carry the given metrics, all status ok."""
+    report = PipelineReport()
+    for name, metrics in stage_metrics.items():
+        report.add(StageResult(name=name, status=STATUS_OK, metrics=metrics))
+    return report
+
+
+def test_derive_cross_stage_metrics_computes_every_comparison():
+    report = _report_with(
+        sfm_input={"num_points3D": 1000},
+        bundle_adjust={
+            "num_points3D": 900,
+            "mean_reprojection_error_before": 1.25,
+            "mean_reprojection_error_after": 1.0,
+        },
+        dense_mvs={"num_points": 50_000, "mean_knn_distance": 0.02},
+        extract_mesh={"mean_edge_length": 0.03, "point_to_mesh": {"mean": 0.01}},
+    )
+
+    derived = derive_cross_stage_metrics(report)
+
+    # (1.25 - 1.0) / 1.25 == 20% of the error removed.
+    assert derived["reprojection_error_reduction"] == pytest.approx(0.2)
+    assert derived["points_retained_after_bundle_adjust"] == pytest.approx(0.9)
+    assert derived["densification_ratio"] == pytest.approx(50.0)
+    # The mesh sits at half the cloud's own sample spacing -- a good fit.
+    assert derived["mesh_fit_over_point_spacing"] == pytest.approx(0.5)
+    assert derived["mesh_edge_over_point_spacing"] == pytest.approx(1.5)
+
+    # A run that got worse is reported as such, not clamped or hidden.
+    worse = derive_cross_stage_metrics(
+        _report_with(
+            bundle_adjust={
+                "mean_reprojection_error_before": 1.0,
+                "mean_reprojection_error_after": 1.5,
+            }
+        )
+    )
+    assert worse["reprojection_error_reduction"] == pytest.approx(-0.5)
+
+
+def test_derive_cross_stage_metrics_omits_what_it_cannot_compute():
+    """A partial run yields a partial set, never a guessed one."""
+    assert derive_cross_stage_metrics(PipelineReport()) == {}
+
+    # dense_mvs alone can't produce a ratio: it needs the sparse baseline.
+    only_dense = derive_cross_stage_metrics(
+        _report_with(dense_mvs={"num_points": 50_000, "mean_knn_distance": 0.02})
+    )
+    assert only_dense == {}
+
+    # A skipped or failed stage contributes nothing, even if it has metrics
+    # attached -- those numbers describe a stage that didn't really run.
+    report = PipelineReport()
+    report.add(
+        StageResult(name="sfm_input", status=STATUS_OK, metrics={"num_points3D": 100})
+    )
+    report.add(
+        StageResult(
+            name="dense_mvs", status=STATUS_SKIPPED, metrics={"num_points": 5000}
+        )
+    )
+    assert "densification_ratio" not in derive_cross_stage_metrics(report)
+
+    report = PipelineReport()
+    report.add(
+        StageResult(name="sfm_input", status=STATUS_OK, metrics={"num_points3D": 100})
+    )
+    report.add(
+        StageResult(
+            name="dense_mvs", status=STATUS_FAILED, metrics={"num_points": 5000}
+        )
+    )
+    assert "densification_ratio" not in derive_cross_stage_metrics(report)
+
+
+def test_derive_cross_stage_metrics_survives_missing_and_bad_values():
+    """Absent, None-valued and zero denominators are dropped, not raised on."""
+    derived = derive_cross_stage_metrics(
+        _report_with(
+            sfm_input={"num_points3D": 0},
+            bundle_adjust={
+                "num_points3D": 900,
+                "mean_reprojection_error_before": 0.0,
+                "mean_reprojection_error_after": 0.0,
+            },
+            dense_mvs={"num_points": 50_000, "mean_knn_distance": None},
+            extract_mesh={"point_to_mesh": {}},
+        )
+    )
+    # Every denominator here is zero, None or missing.
+    assert derived == {}
+
+    # `volume` is legitimately None in mesh_quality_stats for an open mesh;
+    # nothing downstream should choke on that.
+    derive_cross_stage_metrics(_report_with(extract_mesh={"volume": None}))
+
+
+def test_cross_stage_metrics_from_artifacts_matches_the_report_path():
+    """The summarizer derives the same numbers from the same stats files."""
+    collected = {
+        "bundle_adjustment": {
+            "a/bundle_adjust_stats.json": {
+                "mean_reprojection_error_before": 2.0,
+                "mean_reprojection_error_after": 1.0,
+            }
+        },
+        "dense_point_cloud": {
+            "a/dense_stats.json": {"num_points": 1000, "mean_knn_distance": 0.05}
+        },
+        "mesh_quality": {
+            "a/mesh_metrics.json": {
+                "mean_edge_length": 0.05,
+                "point_to_mesh": {"mean": 0.1},
+            }
+        },
+    }
+    from_artifacts = cross_stage_metrics_from_artifacts(collected)
+
+    assert from_artifacts["reprojection_error_reduction"] == pytest.approx(0.5)
+    assert from_artifacts["mesh_fit_over_point_spacing"] == pytest.approx(2.0)
+    assert from_artifacts["mesh_edge_over_point_spacing"] == pytest.approx(1.0)
+    # No sfm_input baseline exists on this path, so the count ratios are absent
+    # rather than wrong.
+    assert "densification_ratio" not in from_artifacts
+    assert "points_retained_after_bundle_adjust" not in from_artifacts
+
+    # Feeding the same stage numbers through the report path agrees exactly.
+    from_report = derive_cross_stage_metrics(
+        _report_with(
+            bundle_adjust={
+                "mean_reprojection_error_before": 2.0,
+                "mean_reprojection_error_after": 1.0,
+            },
+            dense_mvs={"num_points": 1000, "mean_knn_distance": 0.05},
+            extract_mesh={
+                "mean_edge_length": 0.05,
+                "point_to_mesh": {"mean": 0.1},
+            },
+        )
+    )
+    assert from_report == from_artifacts
+
+    assert cross_stage_metrics_from_artifacts({}) == {}
+
+
+def test_format_and_serialize_cross_stage_metrics():
+    derived = derive_cross_stage_metrics(
+        _report_with(
+            sfm_input={"num_points3D": 100},
+            dense_mvs={"num_points": 400, "mean_knn_distance": 0.01},
+        )
+    )
+    text = format_cross_stage_metrics(derived)
+    assert "densification_ratio" in text and "4" in text
+    # Lands in pipeline_report.json's context verbatim.
+    json.dumps(derived)
+
+    assert "none" in format_cross_stage_metrics({})

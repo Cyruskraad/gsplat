@@ -47,7 +47,11 @@ from typing import Optional
 
 import tyro
 
-from gsplat.photogrammetry.pipeline import collect_artifact_metrics
+from gsplat.photogrammetry.pipeline import (
+    collect_artifact_metrics,
+    cross_stage_metrics_from_artifacts,
+    format_cross_stage_metrics,
+)
 
 
 @dataclass
@@ -80,10 +84,20 @@ def main(cfg: Config) -> None:
                 if isinstance(v, (int, float, bool, str)):
                     print(f"    {k}: {v}")
 
+    # The same derived comparisons run_pipeline.py reports, from the same
+    # shared derivation -- so a hand-run sequence is judged identically to an
+    # orchestrated one.
+    cross_stage = cross_stage_metrics_from_artifacts(report)
+    print("\n" + format_cross_stage_metrics(cross_stage))
+
     os.makedirs(cfg.result_dir, exist_ok=True)
     out_path = os.path.join(cfg.result_dir, "stats_summary.json")
     with open(out_path, "w") as f:
-        json.dump(report, f, indent=2)
+        json.dump(
+            {"artifact_metrics": report, "cross_stage_metrics": cross_stage},
+            f,
+            indent=2,
+        )
     print(f"\n[summarize] wrote consolidated summary to {out_path}")
 
 

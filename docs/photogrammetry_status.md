@@ -21,7 +21,7 @@
        tests/test_neural_sfm.py tests/test_colmap_dataset.py \
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -q
    ```
-   Expect **58 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **63 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Then start from §5.1.** As of the latest session all three §5.1 items
    are still blocked (re-verified, see §4) — Actions is still off, the PR is
@@ -231,8 +231,8 @@ just re-asserting the buggy behavior):
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
 | `tests/test_colmap_dataset.py` | 11 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 6 | Geometry metrics against known analytic ground truth |
-| `tests/test_photogrammetry_pipeline.py` | 24 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, and report-on-failure (see §2.9) |
-| **Total** | **58** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| `tests/test_photogrammetry_pipeline.py` | 29 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
+| **Total** | **63** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -284,6 +284,26 @@ everything before them: by hand, since CI still cannot run.
   `--strict`, so the run stops *before* the training stage rather than after.
   Thresholds are CLI-tunable (`--max_excluded_fraction`,
   `--max_degenerate_fraction`) and pass on equality.
+- **Cross-stage derived metrics.** Each stage's metrics say what it produced;
+  these say whether it *improved on* what came before, which is what a
+  photogrammetry run is actually judged on. `pipeline.derive_cross_stage_metrics`
+  reports `reprojection_error_reduction`,
+  `points_retained_after_bundle_adjust`, `densification_ratio` (moved out of
+  the ad-hoc inline computation in `run_pipeline.py`),
+  `mesh_fit_over_point_spacing` and `mesh_edge_over_point_spacing`. The last
+  two are the point of the exercise: a cloud-to-mesh distance in raw scene
+  units means nothing on its own, but divided by the dense cloud's own k-NN
+  spacing it becomes a scale-free verdict on whether the mesh fits within the
+  evidence's noise floor, and whether `--voxel_size` matched the cloud's
+  density. Every metric is omitted rather than guessed when an input stage was
+  skipped or failed. `run_pipeline.py` prints the block and stores it in
+  `pipeline_report.json` under `context.cross_stage_metrics`;
+  `summarize_photogrammetry_stats.py` does the same via
+  `cross_stage_metrics_from_artifacts`, sharing one derivation so a hand-run
+  sequence is judged identically to an orchestrated one. **Note:**
+  `stats_summary.json`'s shape changed to
+  `{"artifact_metrics": ..., "cross_stage_metrics": ...}` (nothing else in the
+  tree reads that file).
 - **CI would exercise the photogrammetry suite** (§5.2's last item, which
   asked for exactly this double-check). Measured by simulating
   `core_tests.yml`'s dependency set: `pytest tests/` would **pass but be
@@ -308,15 +328,25 @@ write. This affected every stage, not just the new gate.
 **What was actually executed for these** (same sandbox: no GPU, no CUDA
 extension, no capture data):
 
-- Full suite 58 passed. Every new guard was mutation-checked rather than just
+- Full suite 63 passed. Every new guard was mutation-checked rather than just
   asserted: vertically flipping the baked atlas fails the UV-convention test;
   removing the seam-fill edge-blanking fails the wrap test; calling
   `compute_uvatlas` on the non-manifold test mesh without the guard dies with
-  SIGSEGV; reverting the `try`/`finally` fails the report-on-failure test.
+  SIGSEGV; reverting the `try`/`finally` fails the report-on-failure test;
+  and for the cross-stage metrics, letting skipped/failed stages contribute,
+  inverting the reprojection-reduction sign, and swapping the mesh-fit ratio
+  each fail their tests.
 - Real, non-dry-run runs of `run_pipeline.py --stages priors` against
   synthetic prior directories: warns and continues by default, fails the stage
   under `--strict` (exit 1, report written with `status="failed"`), clean on
   healthy priors.
+- A real, non-dry-run CPU run of `run_pipeline.py --stages sfm_input
+  bundle_adjust` against a synthetic COLMAP model with deliberately perturbed
+  3D points, which produced genuine cross-stage numbers rather than mocked
+  ones: `reprojection_error_reduction=0.9646`,
+  `points_retained_after_bundle_adjust=1`. `summarize_photogrammetry_stats.py`
+  was likewise run against real `stats/*.json` artifacts and produced the
+  matching block.
 - `extract_mesh.py --help` and `simple_trainer_2dgs.py --help` parse the new
   flags; `black --check --required-version 22.3.0` and `py_compile` on every
   changed file.
@@ -413,12 +443,11 @@ work is.
   dependencies, so 4 of its 6 files skipped wholesale (26 of 58 tests ran).
   Its install step now adds them. **Still needs Actions on to confirm.**
 
+- ~~Dense-MVS metrics wired into the report more richly~~ —
+  `derive_cross_stage_metrics`, shared by `run_pipeline.py` and
+  `summarize_photogrammetry_stats.py`.
+
 **Not started**, roughly in the order worth picking them up:
-- **Dense-MVS metrics wired into `run_pipeline.py`'s report table more
-  richly** — currently `densification_ratio` (dense vs. sparse point count)
-  is the only derived cross-stage metric; comparable cross-stage deltas
-  (e.g. mesh cloud-to-mesh fit vs. dense-cloud density) could be added. The
-  best remaining item that is fully verifiable without a GPU.
 - **Appearance-embedding checkpoint support for mesh extraction.**
   `extract_mesh_tsdf`/`bake_texture` currently only support SH-color
   checkpoints (trained without `--app_opt`), since per-image appearance

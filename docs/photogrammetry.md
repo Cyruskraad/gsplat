@@ -237,6 +237,47 @@ any `pipeline_report.json` from `run_pipeline.py` untouched) -- both share
 `examples/benchmarks/compression/summarize_stats.py`'s read-then-write
 pattern.
 
+#### Cross-stage metrics
+
+Each stage's own metrics answer "what did this stage produce?". Both writers
+also report a handful of numbers that only exist by *comparing* two stages --
+"did it actually improve on, or agree with, what came before?", which is what
+a photogrammetry run is really judged on and what no single stage can see.
+An illustrative block (a run whose stages all completed):
+
+```
+CROSS-STAGE METRICS
+-----------------------------------------------
+reprojection_error_reduction         0.9646
+points_retained_after_bundle_adjust  1
+densification_ratio                  53.3
+mesh_fit_over_point_spacing          0.9286
+mesh_edge_over_point_spacing         1.333
+```
+
+| Metric | Compares | Reading it |
+|---|---|---|
+| `reprojection_error_reduction` | bundle adjustment before vs. after | Fraction of the input model's mean reprojection error removed. `0.1` = 10% better; **negative means it made the fit worse**. |
+| `points_retained_after_bundle_adjust` | refined vs. input SfM model | Well under `1.0` means bundle adjustment discarded much of the sparse cloud. |
+| `densification_ratio` | dense MVS vs. sparse SfM | How many times denser the MVS cloud is than the SfM points it started from. |
+| `mesh_fit_over_point_spacing` | mesh vs. dense cloud | **The headline end-to-end number.** Mean cloud-to-mesh distance divided by the cloud's own mean k-NN spacing. At or below ~1 the mesh tracks the cloud to within its own sampling noise; well above 1 it genuinely misses geometry the cloud captured. |
+| `mesh_edge_over_point_spacing` | mesh vs. dense cloud | Mean mesh edge length over that same spacing. Much below 1 means the mesh is tessellated finer than the evidence supports (`--voxel_size` too small); much above 1 means it discards detail the cloud has. |
+
+The last two are why this matters: a raw cloud-to-mesh distance is in
+arbitrary scene units and means nothing on its own, but measured against the
+point cloud's own sample spacing it becomes a scale-free verdict on the mesh.
+
+`run_pipeline.py` prints these after its stage table and stores them in
+`pipeline_report.json` under `context.cross_stage_metrics`;
+`summarize_photogrammetry_stats.py` prints the same block and writes
+`stats_summary.json` as `{"artifact_metrics": ..., "cross_stage_metrics":
+...}`. Both go through one shared derivation
+(`gsplat.photogrammetry.pipeline.derive_cross_stage_metrics` /
+`cross_stage_metrics_from_artifacts`), so a hand-run sequence is judged
+identically to an orchestrated one. Any metric whose input stages didn't run
+is **omitted rather than guessed** -- so the summarizer, which has no
+`sfm_input` baseline to read, simply reports fewer of them.
+
 ### Monocular depth-prior supervision (AI-assisted)
 
 gsplat does not run any depth-estimation model itself -- consistent with how
@@ -443,6 +484,11 @@ something gsplat ships.
   `neural_sfm.merge_point_maps_to_tracks(...)["stats"]`-style track-length
   distribution; `mask_coverage_stats(mask_dir)` / `depth_prior_stats(dir)`
   sanity-check `--mask_dir`/`--mono_depth_dir` inputs before a long run.
+- `gsplat.photogrammetry.pipeline.derive_cross_stage_metrics(report)` /
+  `cross_stage_metrics_from_artifacts(collect_artifact_metrics(...))` return
+  the derived comparisons above as a plain dict, and
+  `format_cross_stage_metrics(...)` renders the block; `check_prior_quality(
+  depth_stats=..., mask_stats=...)` returns the `priors` gate's problem list.
 - `gsplat.photogrammetry.pipeline` -- `PipelineReport`/`run_stage`/
   `record_skipped` build a per-stage timing+metrics report like
   `examples/run_pipeline.py` does; `collect_artifact_metrics(result_dir,

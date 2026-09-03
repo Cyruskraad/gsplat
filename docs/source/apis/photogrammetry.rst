@@ -51,4 +51,6 @@ Pipeline Orchestration
 
 .. automodule:: gsplat.photogrammetry.pipeline
    :members: PipelineReport, StageResult, run_stage, record_skipped,
-             collect_artifact_metrics, latest_metrics, check_prior_quality
+             collect_artifact_metrics, latest_metrics, check_prior_quality,
+             derive_cross_stage_metrics, cross_stage_metrics_from_artifacts,
+             format_cross_stage_metrics
