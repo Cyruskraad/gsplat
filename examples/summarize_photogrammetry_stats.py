@@ -12,10 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Aggregate the photogrammetry pipeline's `stats/*.json` outputs -- from
-`bundle_adjust.py`, `dense_mvs.py`, `extract_mesh.py`, and
-`simple_trainer_2dgs.py`'s `eval()`/`--extract_mesh` -- into one consolidated
-report.
+"""Summarize the photogrammetry pipeline's `stats/*.json` outputs after the fact.
+
+The counterpart to `examples/run_pipeline.py`: that runs the stages and
+records what each one did as it goes, while this reads whatever a finished
+(or partially finished, or hand-run) result directory already contains and
+prints/writes one summary. Both share
+:func:`gsplat.photogrammetry.pipeline.collect_artifact_metrics`, so they
+agree on which files count and how they're grouped.
 
 Mirrors `examples/benchmarks/compression/summarize_stats.py`'s read-then-write
 convention, generalized because this pipeline's stages don't share one
@@ -29,33 +33,21 @@ Example:
     python examples/summarize_photogrammetry_stats.py \\
         --result_dir results/garden_2dgs --data_dir data/360_v2/garden
 
-writes `results/garden_2dgs/pipeline_report.json` and prints a summary table
-covering (whichever of these are present) bundle-adjustment reprojection
-error, dense point-cloud density, render PSNR/SSIM/LPIPS, and mesh
+writes `results/garden_2dgs/stats_summary.json` (leaving any
+`pipeline_report.json` from `run_pipeline.py` untouched) and prints a summary
+table covering, whichever are present, bundle-adjustment reprojection error,
+dense point-cloud density, render PSNR/SSIM/LPIPS, and mesh
 quality/cloud-to-mesh fit for one run.
 """
 
-import glob
 import json
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Optional
 
 import tyro
 
-
-def _find(root: Optional[str], pattern: str):
-    if root is None or not os.path.isdir(root):
-        return []
-    return sorted(glob.glob(os.path.join(root, "**", pattern), recursive=True))
-
-
-def _load_all(paths) -> Dict[str, dict]:
-    stats = {}
-    for path in paths:
-        with open(path, "r") as f:
-            stats[path] = json.load(f)
-    return stats
+from gsplat.photogrammetry.pipeline import collect_artifact_metrics
 
 
 @dataclass
@@ -72,26 +64,7 @@ class Config:
 
 
 def main(cfg: Config) -> None:
-    report: Dict[str, Dict[str, dict]] = {}
-
-    render_quality = _load_all(_find(cfg.result_dir, "val_step*.json"))
-    if render_quality:
-        report["render_quality"] = render_quality
-
-    mesh_quality = _load_all(_find(cfg.result_dir, "mesh_step*.json"))
-    mesh_quality.update(_load_all(_find(cfg.result_dir, "mesh_metrics.json")))
-    if mesh_quality:
-        report["mesh_quality"] = mesh_quality
-
-    dense_point_cloud = _load_all(_find(cfg.result_dir, "dense_stats.json"))
-    dense_point_cloud.update(_load_all(_find(cfg.data_dir, "dense_stats.json")))
-    if dense_point_cloud:
-        report["dense_point_cloud"] = dense_point_cloud
-
-    bundle_adjustment = _load_all(_find(cfg.result_dir, "bundle_adjust_stats.json"))
-    bundle_adjustment.update(_load_all(_find(cfg.data_dir, "bundle_adjust_stats.json")))
-    if bundle_adjustment:
-        report["bundle_adjustment"] = bundle_adjustment
+    report = collect_artifact_metrics(cfg.result_dir, cfg.data_dir)
 
     if not report:
         print(
@@ -108,10 +81,10 @@ def main(cfg: Config) -> None:
                     print(f"    {k}: {v}")
 
     os.makedirs(cfg.result_dir, exist_ok=True)
-    out_path = os.path.join(cfg.result_dir, "pipeline_report.json")
+    out_path = os.path.join(cfg.result_dir, "stats_summary.json")
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2)
-    print(f"\n[summarize] wrote consolidated report to {out_path}")
+    print(f"\n[summarize] wrote consolidated summary to {out_path}")
 
 
 if __name__ == "__main__":

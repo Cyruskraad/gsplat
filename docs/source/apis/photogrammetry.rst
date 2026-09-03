@@ -41,4 +41,13 @@ Automatic Metrics
 ------------------
 
 .. automodule:: gsplat.photogrammetry.metrics
-   :members: point_to_mesh_distance, mesh_quality_stats, point_cloud_stats
+   :members: point_to_mesh_distance, mesh_quality_stats, point_cloud_stats,
+             reconstruction_stats, track_stats, mask_coverage_stats,
+             depth_prior_stats
+
+Pipeline Orchestration
+-----------------------
+
+.. automodule:: gsplat.photogrammetry.pipeline
+   :members: PipelineReport, StageResult, run_stage, record_skipped,
+             collect_artifact_metrics, latest_metrics

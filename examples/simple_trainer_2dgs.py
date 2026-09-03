@@ -80,6 +80,18 @@ class Config:
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
+    # COLMAP sparse model to train against, overriding the default
+    # <data_dir>/sparse/0. Point this at a bundle-adjusted model (see
+    # examples/bundle_adjust.py) or an imported neural-SfM one (see
+    # gsplat.photogrammetry.neural_sfm) to train on refined poses.
+    colmap_dir: Optional[str] = None
+    # Path to a dense MVS point cloud (see examples/dense_mvs.py) used to
+    # densify Gaussian initialization -- init_type="sfm" picks up the denser
+    # point set automatically.
+    dense_points_path: Optional[str] = None
+    # How to use dense_points_path: "augment" the sparse SfM points with it,
+    # or "replace" them entirely.
+    dense_mode: Literal["augment", "replace"] = "augment"
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -357,6 +369,9 @@ class Runner:
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            colmap_dir=cfg.colmap_dir,
+            dense_points_path=cfg.dense_points_path,
+            dense_mode=cfg.dense_mode,
         )
         self.trainset = Dataset(
             self.parser,

@@ -29,24 +29,44 @@ This package closes the SfM -> dense MVS -> Gaussian Splatting -> mesh loop:
 - :mod:`gsplat.photogrammetry.neural_sfm` - imports feed-forward neural-SfM
   output (DUSt3R/MASt3R/VGGT-style, run externally) as a COLMAP model, so it
   becomes a drop-in alternative to COLMAP for the rest of the pipeline.
-- :mod:`gsplat.photogrammetry.metrics` - automatic quality metrics (mesh
-  quality, cloud-to-mesh fit, point-cloud density) for the stages above that
-  don't already report stats, written to ``stats/*.json`` files alongside
-  the trainers' existing render-quality evaluation.
+- :mod:`gsplat.photogrammetry.metrics` - automatic quality metrics for every
+  stage above (reconstruction/track quality, mesh quality, cloud-to-mesh fit,
+  point-cloud density, AI-prior coverage), written to ``stats/*.json`` files
+  alongside the trainers' existing render-quality evaluation.
+- :mod:`gsplat.photogrammetry.pipeline` - stage orchestration and reporting,
+  turning the stages above into one end-to-end run
+  (``examples/run_pipeline.py``) whose per-stage status, wall-clock timing
+  and metrics land in a single ``pipeline_report.json``.
 
 ``mesh_extraction``/``metrics`` require the optional ``open3d`` dependency
-(``pip install gsplat[mesh]``); ``bundle_adjustment``/``neural_sfm`` require
-``pycolmap`` (already required by the example COLMAP data loader);
-``neural_sfm``'s point-merging step and ``metrics.point_cloud_stats`` also
-require ``scikit-learn``; ``dense_mvs`` requires the ``colmap``
-command-line tool (built with CUDA support) on ``PATH``.
+(``pip install gsplat[mesh]``); ``bundle_adjustment``/``neural_sfm`` and
+``metrics.reconstruction_stats`` require ``pycolmap`` (already required by
+the example COLMAP data loader); ``neural_sfm``'s point-merging step and
+``metrics.point_cloud_stats`` also require ``scikit-learn``; ``dense_mvs``
+requires the ``colmap`` command-line tool (built with CUDA support) on
+``PATH``. ``pipeline`` is pure stdlib and always importable.
 """
 
 from .bundle_adjustment import refine_reconstruction
 from .dense_mvs import run_dense_mvs
 from .mesh_extraction import bake_texture, extract_mesh_poisson, extract_mesh_tsdf
-from .metrics import mesh_quality_stats, point_cloud_stats, point_to_mesh_distance
+from .metrics import (
+    depth_prior_stats,
+    mask_coverage_stats,
+    mesh_quality_stats,
+    point_cloud_stats,
+    point_to_mesh_distance,
+    reconstruction_stats,
+    track_stats,
+)
 from .neural_sfm import merge_point_maps_to_tracks, write_colmap_reconstruction
+from .pipeline import (
+    PipelineReport,
+    StageResult,
+    collect_artifact_metrics,
+    record_skipped,
+    run_stage,
+)
 
 __all__ = [
     "refine_reconstruction",
@@ -59,4 +79,13 @@ __all__ = [
     "point_to_mesh_distance",
     "mesh_quality_stats",
     "point_cloud_stats",
+    "reconstruction_stats",
+    "track_stats",
+    "mask_coverage_stats",
+    "depth_prior_stats",
+    "PipelineReport",
+    "StageResult",
+    "run_stage",
+    "record_skipped",
+    "collect_artifact_metrics",
 ]

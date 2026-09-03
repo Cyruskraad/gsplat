@@ -17,19 +17,24 @@ changes required:
   fusion of rendered depth/normal maps or Poisson reconstruction from a dense
   point cloud, with vertex-color texture baking from the training images.
 - **Automatic metrics** (`gsplat.photogrammetry.metrics`) reports
-  quantitative quality stats -- mesh watertightness/connected-components,
-  cloud-to-mesh fit, point-cloud density -- for the stages above, written to
-  `stats/*.json` files next to the trainer's existing PSNR/SSIM/LPIPS
-  render-quality reports.
+  quantitative quality stats for every stage -- SfM/track quality, mesh
+  watertightness/connected-components, cloud-to-mesh fit, point-cloud
+  density, AI-prior coverage -- written to `stats/*.json` files next to the
+  trainer's existing PSNR/SSIM/LPIPS render-quality reports.
 - **Transient/dynamic-object masking** (`Dataset(..., mask_dir=...)`,
   `--mask_dir`) excludes externally-segmented moving content (people,
   vehicles, ...) from training supervision and mesh fusion via
   `gsplat.losses.masked_l1`/`masked_ssim`.
+- **Pipeline orchestration** (`gsplat.photogrammetry.pipeline`,
+  `examples/run_pipeline.py`) chains every stage above into one command,
+  wiring each stage's output into the next and recording per-stage status,
+  timing and metrics into a single `pipeline_report.json`.
 
 `mesh_extraction`/`metrics` require the optional `open3d` dependency: `pip
 install gsplat[mesh]`. `dense_mvs` requires a CUDA-enabled `colmap`
 command-line install (see https://colmap.github.io/install.html) --
-`pycolmap` alone does not expose patch-match stereo.
+`pycolmap` alone does not expose patch-match stereo. `pipeline` itself is
+pure stdlib and always importable.
 
 ## How to Use
 
@@ -46,13 +51,15 @@ python examples/bundle_adjust.py --data_dir data/360_v2/garden
 python examples/dense_mvs.py --data_dir data/360_v2/garden \
     --colmap_dir data/360_v2/garden/sparse/refined
 
-# 3. Train as usual, pointing the trainer at the refined poses via
-#    Parser(..., colmap_dir=...) / dense-augmented init via
-#    Parser(..., dense_points_path=...) -- see "For users using gsplat's API"
-#    below for wiring these into examples/simple_trainer_2dgs.py's Config.
+# 3. Train, pointing the trainer at the refined poses (--colmap_dir) and
+#    densifying Gaussian initialization from the dense cloud
+#    (--dense_points_path); both are optional -- omit either to train on
+#    the un-refined/un-densified input instead.
 python examples/simple_trainer_2dgs.py \
     --data_dir data/360_v2/garden --data_factor 4 \
-    --result_dir results/garden_2dgs
+    --result_dir results/garden_2dgs \
+    --colmap_dir data/360_v2/garden/sparse/refined \
+    --dense_points_path data/360_v2/garden/dense/dense.ply
 
 # 4. Mesh extraction: TSDF fusion of the trained 2DGS scene's rendered
 #    depth maps, with texture baking from the training images.
@@ -104,14 +111,46 @@ point cloud of its own to reconstruct from. It writes mesh quality stats to
 `results/garden_2dgs/stats/mesh_step<step>.json`, next to `eval()`'s own
 `stats/val_step<step>.json` render-quality reports.
 
+### One-command end-to-end pipeline
+
+Steps 1-4 above (plus a baseline stats pass on the input SfM model, and
+validating any AI-assisted priors) can also be run as a single command,
+which wires each stage's output into the next exactly the way the manual
+steps do -- the refined poses and dense point cloud both feed the trainer,
+whose checkpoint feeds mesh extraction:
+
+```bash
+python examples/run_pipeline.py \
+    --data_dir data/360_v2/garden --result_dir results/garden_pipeline
+```
+
+Add `--mono_depth_dir`/`--mask_dir` to run the AI-assisted stages too. Each
+stage is invoked as a subprocess of its own standalone script (the same way
+`dense_mvs.py` itself shells out to `colmap`), so `run_pipeline.py` stays
+dependency-light and every stage keeps its own CLI as the source of truth
+for its options; a stage that needs something the machine doesn't have (a
+CUDA `colmap` build, a GPU) is recorded as `skipped` with the reason rather
+than failing the run (pass `--strict` to fail instead). `--stages` selects a
+subset (e.g. `--stages sfm_input bundle_adjust` to only refine poses and
+report on it), and `--dry_run` prints the commands it would run without
+running them. This writes `results/garden_pipeline/pipeline_report.json`:
+per-stage status/timing/metrics plus every `stats/*.json` artifact found
+under `--result_dir`/`--data_dir`, from
+`gsplat.photogrammetry.pipeline.PipelineReport`.
+
 ### Automatic metrics & the consolidated report
 
-Every stage above that produces a geometric artifact (bundle adjustment,
-dense MVS, mesh extraction) now writes a `stats/*.json` file of automatic
-quality metrics (`gsplat.photogrammetry.metrics`) next to its output, using
-the same convention the trainer's `eval()` already uses for render quality
-(PSNR/SSIM/LPIPS). To pull everything for one run together into a single
-report:
+Every stage above now reports automatic quality metrics
+(`gsplat.photogrammetry.metrics`) -- bundle adjustment/dense MVS/mesh
+extraction write a `stats/*.json` file next to their output, using the same
+convention the trainer's `eval()` already uses for render quality
+(PSNR/SSIM/LPIPS); `run_pipeline.py`'s `sfm_input`/`priors` stages compute
+theirs directly (`reconstruction_stats`, `mask_coverage_stats`,
+`depth_prior_stats`) since those don't otherwise write files. Running
+`run_pipeline.py` already collects all of this into its
+`pipeline_report.json` (above); to instead aggregate `stats/*.json` files
+from a run you drove manually (steps 1-4), or to refresh a report after
+extra runs of the individual scripts:
 
 ```bash
 python examples/summarize_photogrammetry_stats.py \
@@ -121,9 +160,11 @@ python examples/summarize_photogrammetry_stats.py \
 This finds and aggregates whichever of `bundle_adjust_stats.json`,
 `dense_stats.json`, `mesh_metrics.json`/`mesh_step*.json`, and
 `val_step*.json` are present under `--result_dir`/`--data_dir`, prints a
-summary table, and writes `results/garden_2dgs/pipeline_report.json` --
-mirroring `examples/benchmarks/compression/summarize_stats.py`'s
-read-then-write pattern.
+summary table, and writes `results/garden_2dgs/stats_summary.json` (leaving
+any `pipeline_report.json` from `run_pipeline.py` untouched) -- both share
+`gsplat.photogrammetry.pipeline.collect_artifact_metrics`, mirroring
+`examples/benchmarks/compression/summarize_stats.py`'s read-then-write
+pattern.
 
 ### Monocular depth-prior supervision (AI-assisted)
 
@@ -261,6 +302,11 @@ merged = merge_point_maps_to_tracks(
     confidence_per_image=confidence_per_image, confidence_threshold=0.5,
     merge_radius=0.01, min_track_length=2, max_points_per_image=2000,
 )
+# merged["stats"] (gsplat.photogrammetry.metrics.track_stats, plus
+# num_input_points/merge_radius) -- check multi_view_track_fraction before
+# writing anything: a low value means most points didn't merge into a
+# cross-view track, so bundle adjustment will have little to work with.
+print(merged["stats"])
 
 # 3. Write it as a COLMAP model.
 write_colmap_reconstruction(
@@ -313,3 +359,13 @@ something gsplat ships.
   `mesh_quality_stats(mesh)` / `point_cloud_stats(points, ...)` return plain
   dicts of quality stats for a mesh or point cloud, independent of how it was
   produced -- the functions the CLIs above write to `stats/*.json` with.
+  `reconstruction_stats(colmap_dir)` measures a COLMAP model itself (image/
+  point/observation counts, mean track length, mean reprojection error);
+  `track_stats(tracks)` summarizes a
+  `neural_sfm.merge_point_maps_to_tracks(...)["stats"]`-style track-length
+  distribution; `mask_coverage_stats(mask_dir)` / `depth_prior_stats(dir)`
+  sanity-check `--mask_dir`/`--mono_depth_dir` inputs before a long run.
+- `gsplat.photogrammetry.pipeline` -- `PipelineReport`/`run_stage`/
+  `record_skipped` build a per-stage timing+metrics report like
+  `examples/run_pipeline.py` does; `collect_artifact_metrics(result_dir,
+  data_dir)` reads back every `stats/*.json` file the stages above wrote.

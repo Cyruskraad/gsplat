@@ -47,6 +47,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from .metrics import track_stats
+
 
 def merge_point_maps_to_tracks(
     points_per_image: Sequence[np.ndarray],
@@ -85,9 +87,14 @@ def merge_point_maps_to_tracks(
 
     Returns:
         A dict with ``"points_xyz"`` ``(T, 3)`` float64, ``"points_rgb"``
-        ``(T, 3)`` uint8 (or None if no colors given), and ``"tracks"``: a
+        ``(T, 3)`` uint8 (or None if no colors given), ``"tracks"``: a
         list of length ``T``, each entry a list of ``(image_idx, (x, y))``
-        observations for that merged point.
+        observations for that merged point, and ``"stats"``: the merge's own
+        quality metrics (see
+        :func:`gsplat.photogrammetry.metrics.track_stats`, plus
+        ``num_input_points`` and ``merge_radius``) --
+        ``multi_view_track_fraction`` in particular says how much of the
+        input actually became usable cross-view constraints.
     """
     try:
         from sklearn.cluster import AgglomerativeClustering
@@ -126,7 +133,12 @@ def merge_point_maps_to_tracks(
             all_colors.append(np.asarray(colors_per_image[i], dtype=np.float64)[idx])
 
     if sum(p.shape[0] for p in all_points) == 0:
-        return {"points_xyz": np.zeros((0, 3)), "points_rgb": None, "tracks": []}
+        return {
+            "points_xyz": np.zeros((0, 3)),
+            "points_rgb": None,
+            "tracks": [],
+            "stats": track_stats([]),
+        }
 
     points = np.concatenate(all_points, axis=0)
     pixel_xy = np.concatenate(all_pixel_xy, axis=0)
@@ -173,7 +185,15 @@ def merge_point_maps_to_tracks(
         merged_rgb = merged_rgb[keep] if merged_rgb is not None else None
         tracks = [tracks[c] for c in keep]
 
-    return {"points_xyz": merged_xyz, "points_rgb": merged_rgb, "tracks": tracks}
+    stats = track_stats(tracks)
+    stats["num_input_points"] = int(points.shape[0])
+    stats["merge_radius"] = float(merge_radius)
+    return {
+        "points_xyz": merged_xyz,
+        "points_rgb": merged_rgb,
+        "tracks": tracks,
+        "stats": stats,
+    }
 
 
 def write_colmap_reconstruction(
