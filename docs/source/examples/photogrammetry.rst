@@ -65,5 +65,12 @@ writing ``mesh.obj`` + ``mesh.mtl`` + ``mesh_0.png`` -- a mesh that loads with
 its texture attached in standard DCC tools and game engines. See "Texture:
 per-vertex colors or a UV atlas" in ``docs/photogrammetry.md``.
 
+When ``--mask_dir``/``--mono_depth_dir`` are given, ``run_pipeline.py``'s
+``priors`` stage also *gates* them: it flags an empty prior directory, masks
+that exclude (almost) the whole frame or nothing at all, and depth maps that
+are constant or mostly non-finite -- before the training stage spends hours
+on them. It warns by default and fails the run under ``--strict``. See "The
+``priors`` quality gate" in ``docs/photogrammetry.md``.
+
 See ``docs/photogrammetry.md`` (repo root) for the full guide and
 :doc:`../apis/photogrammetry` for the Python API.

@@ -30,7 +30,9 @@ Stages run in a fixed order and can be selected individually:
   sfm_input     Baseline stats for the input COLMAP model (no side effects).
   bundle_adjust Refine poses/points        -> <data_dir>/sparse/refined
   dense_mvs     Densify the point cloud    -> <data_dir>/dense/dense.ply
-  priors        Validate AI-assisted inputs (--mono_depth_dir/--mask_dir).
+  priors        Gate the AI-assisted inputs (--mono_depth_dir/--mask_dir):
+                warns (or, with --strict, stops) on a prior directory that
+                would waste the training run.
   train         Train 2DGS on the refined  -> <result_dir>/ckpts, stats/
                 poses + dense init
   extract_mesh  TSDF mesh + texture bake   -> <result_dir>/mesh.ply
@@ -40,7 +42,8 @@ Heavy stages are invoked as subprocesses of the existing per-stage scripts
 dependency-light and each stage keeps its own CLI as the source of truth for
 its options. Stages that need something this machine doesn't have (a CUDA
 `colmap` build, a GPU) are recorded as `skipped` with the reason rather than
-failing the run, unless `--strict` is set.
+failing the run, unless `--strict` is set -- which also turns the `priors`
+stage's warnings into a failure.
 """
 
 import glob
@@ -60,6 +63,7 @@ from gsplat.photogrammetry.metrics import (
 )
 from gsplat.photogrammetry.pipeline import (
     PipelineReport,
+    check_prior_quality,
     collect_artifact_metrics,
     latest_metrics,
     record_skipped,
@@ -104,9 +108,15 @@ class Config:
     device: str = "cuda"
     # Print each stage's command without running anything.
     dry_run: bool = False
-    # Treat an unavailable stage (missing colmap CLI, missing checkpoint) as
-    # a failure instead of skipping it.
+    # Treat an unavailable stage (missing colmap CLI, missing checkpoint), or
+    # an unusable AI-prior directory, as a failure instead of skipping/warning.
     strict: bool = False
+    # `priors` gate: flag masks that exclude more than this fraction of the
+    # average frame. Raise it if the capture really is mostly transient.
+    max_excluded_fraction: float = 0.9
+    # `priors` gate: flag a --mono_depth_dir where more than this fraction of
+    # depth maps are constant or entirely non-finite.
+    max_degenerate_fraction: float = 0.5
     # Keep going after a stage fails, instead of stopping at the first one.
     continue_on_error: bool = False
 
@@ -140,23 +150,12 @@ def _latest_checkpoint(result_dir: str) -> Optional[str]:
     return max(paths, key=step_of)
 
 
-def main(cfg: Config) -> None:
-    unknown = [s for s in cfg.stages if s not in ALL_STAGES]
-    if unknown:
-        raise ValueError(f"Unknown stage(s) {unknown}. Choose from {ALL_STAGES}.")
-    # Always run in canonical pipeline order, whatever order they were given.
-    selected = [s for s in ALL_STAGES if s in cfg.stages]
+def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> None:
+    """Run the selected stages, recording each one into ``report``.
 
-    os.makedirs(cfg.result_dir, exist_ok=True)
-    report = PipelineReport(
-        context={
-            "data_dir": cfg.data_dir,
-            "result_dir": cfg.result_dir,
-            "data_factor": cfg.data_factor,
-            "stages_requested": selected,
-            "dry_run": cfg.dry_run,
-        }
-    )
+    May raise: without ``--continue_on_error`` a failing stage re-raises after
+    being recorded. :func:`main` writes the report either way.
+    """
     reraise = not cfg.continue_on_error
 
     # The COLMAP model the downstream stages read: the refined one once
@@ -300,6 +299,31 @@ def main(cfg: Config) -> None:
                     stage.metrics["num_degenerate_depth_maps"] = metrics["mono_depth"][
                         "num_degenerate_maps"
                     ]
+
+                # This stage exists to catch a bad prior directory *before*
+                # the hours-long training stage consumes it, so don't just
+                # record the numbers -- judge them, and say so loudly.
+                problems = check_prior_quality(
+                    depth_stats=metrics.get("mono_depth"),
+                    mask_stats=metrics.get("masks"),
+                    max_excluded_fraction=cfg.max_excluded_fraction,
+                    max_degenerate_fraction=cfg.max_degenerate_fraction,
+                )
+                stage.metrics["problems"] = problems
+                stage.metrics["num_problems"] = len(problems)
+                for problem in problems:
+                    print(f"[priors] WARNING: {problem}", flush=True)
+                if problems and cfg.strict:
+                    raise RuntimeError(
+                        f"--strict: {len(problems)} unusable AI-prior "
+                        "input(s): " + " ".join(problems)
+                    )
+                if problems:
+                    print(
+                        f"[priors] {len(problems)} problem(s) found; continuing "
+                        "anyway (pass --strict to stop here instead).",
+                        flush=True,
+                    )
     else:
         record_skipped(report, "priors", "not selected")
 
@@ -383,14 +407,39 @@ def main(cfg: Config) -> None:
     else:
         record_skipped(report, "extract_mesh", "not selected")
 
-    # -- Report ------------------------------------------------------------
-    report.context["artifact_metrics"] = collect_artifact_metrics(
-        cfg.result_dir, cfg.data_dir
-    )
-    report_path = report.write(os.path.join(cfg.result_dir, "pipeline_report.json"))
 
-    print("\n" + report.format_table())
-    print(f"\n[run_pipeline] wrote {report_path}")
+def main(cfg: Config) -> None:
+    unknown = [s for s in cfg.stages if s not in ALL_STAGES]
+    if unknown:
+        raise ValueError(f"Unknown stage(s) {unknown}. Choose from {ALL_STAGES}.")
+    # Always run in canonical pipeline order, whatever order they were given.
+    selected = [s for s in ALL_STAGES if s in cfg.stages]
+
+    os.makedirs(cfg.result_dir, exist_ok=True)
+    report = PipelineReport(
+        context={
+            "data_dir": cfg.data_dir,
+            "result_dir": cfg.result_dir,
+            "data_factor": cfg.data_factor,
+            "stages_requested": selected,
+            "dry_run": cfg.dry_run,
+        }
+    )
+
+    # The report is the point of this script, and a failed run is exactly when
+    # it matters most -- so write it even when a stage raises. Otherwise the
+    # `status="failed"` record `run_stage` just built is lost to the traceback,
+    # and any `pipeline_report.json` left from an earlier run stays on disk
+    # still claiming success.
+    try:
+        _run_stages(cfg, report, selected)
+    finally:
+        report.context["artifact_metrics"] = collect_artifact_metrics(
+            cfg.result_dir, cfg.data_dir
+        )
+        report_path = report.write(os.path.join(cfg.result_dir, "pipeline_report.json"))
+        print("\n" + report.format_table())
+        print(f"\n[run_pipeline] wrote {report_path}")
 
     if report.failed:
         raise SystemExit(

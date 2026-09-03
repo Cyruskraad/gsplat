@@ -38,6 +38,7 @@ from gsplat.photogrammetry.pipeline import (
     STATUS_SKIPPED,
     PipelineReport,
     StageResult,
+    check_prior_quality,
     collect_artifact_metrics,
     latest_metrics,
     record_skipped,
@@ -301,3 +302,242 @@ def test_reconstruction_stats_on_synthetic_model(tmp_path):
 
     # Passing an already-loaded Reconstruction gives the same answer.
     assert reconstruction_stats(recon) == stats
+
+
+# ---------------------------------------------------------------------------
+# AI-prior quality gate
+# ---------------------------------------------------------------------------
+
+
+def test_check_prior_quality_passes_healthy_priors():
+    """Ordinary priors produce no problems at all."""
+    assert (
+        check_prior_quality(
+            depth_stats={
+                "num_maps": 10,
+                "num_degenerate_maps": 0,
+                "mean_finite_fraction": 1.0,
+            },
+            mask_stats={
+                "num_masks": 10,
+                "mean_excluded_fraction": 0.12,
+                "min_kept_fraction": 0.6,
+            },
+        )
+        == []
+    )
+    # Nothing to judge when neither prior was given.
+    assert check_prior_quality() == []
+
+
+def test_check_prior_quality_flags_empty_directories():
+    """A directory that matched no files is the quietest way to waste a run."""
+    problems = check_prior_quality(
+        depth_stats={"num_maps": 0},
+        mask_stats={"num_masks": 0},
+    )
+    assert len(problems) == 2
+    assert any("--mask_dir contains no .png masks" in p for p in problems)
+    assert any("--mono_depth_dir contains no .npy" in p for p in problems)
+
+
+def test_check_prior_quality_flags_over_and_under_aggressive_masks():
+    over = check_prior_quality(
+        mask_stats={
+            "num_masks": 5,
+            "mean_excluded_fraction": 0.95,
+            "min_kept_fraction": 0.02,
+        }
+    )
+    assert len(over) == 1 and "95.0% of the average frame" in over[0]
+
+    # A segmenter that found nothing is a different bug with the same cause.
+    none_excluded = check_prior_quality(
+        mask_stats={
+            "num_masks": 5,
+            "mean_excluded_fraction": 0.0,
+            "min_kept_fraction": 1.0,
+        }
+    )
+    assert len(none_excluded) == 1 and "exclude nothing" in none_excluded[0]
+
+    # A fully-excluded frame is flagged even when the average looks fine.
+    fully_excluded = check_prior_quality(
+        mask_stats={
+            "num_masks": 5,
+            "mean_excluded_fraction": 0.3,
+            "min_kept_fraction": 0.0,
+        }
+    )
+    assert len(fully_excluded) == 1
+    assert "excludes its entire frame" in fully_excluded[0]
+
+    # The threshold is honoured, so a legitimately aggressive capture can opt
+    # out rather than being forced to disable the gate.
+    assert (
+        check_prior_quality(
+            mask_stats={
+                "num_masks": 5,
+                "mean_excluded_fraction": 0.95,
+                "min_kept_fraction": 0.02,
+            },
+            max_excluded_fraction=0.99,
+        )
+        == []
+    )
+
+
+def test_check_prior_quality_flags_degenerate_and_sparse_depth():
+    problems = check_prior_quality(
+        depth_stats={
+            "num_maps": 10,
+            "num_degenerate_maps": 8,
+            "mean_finite_fraction": 1.0,
+        }
+    )
+    assert len(problems) == 1
+    assert "8/10 depth maps (80.0%)" in problems[0]
+
+    # A minority of bad maps is normal and must not trip the gate.
+    assert (
+        check_prior_quality(
+            depth_stats={
+                "num_maps": 10,
+                "num_degenerate_maps": 1,
+                "mean_finite_fraction": 1.0,
+            }
+        )
+        == []
+    )
+
+    mostly_nan = check_prior_quality(
+        depth_stats={
+            "num_maps": 10,
+            "num_degenerate_maps": 0,
+            "mean_finite_fraction": 0.2,
+        }
+    )
+    assert len(mostly_nan) == 1 and "20.0% finite" in mostly_nan[0]
+
+
+def test_check_prior_quality_consumes_the_real_metrics_dicts(tmp_path):
+    """The gate reads exactly what the metrics functions produce.
+
+    Guards against the gate and the stats functions drifting apart on key
+    names -- the failure mode that would make it silently pass everything.
+    """
+    imageio = pytest.importorskip("imageio.v2", reason="imageio not installed")
+
+    mask_dir = tmp_path / "masks"
+    mask_dir.mkdir()
+    # Both masks exclude the whole frame.
+    imageio.imwrite(str(mask_dir / "a.png"), np.zeros((8, 8), dtype=np.uint8))
+    imageio.imwrite(str(mask_dir / "b.png"), np.zeros((8, 8), dtype=np.uint8))
+
+    depth_dir = tmp_path / "depth"
+    depth_dir.mkdir()
+    np.save(depth_dir / "a.npy", np.full((8, 8), 2.0, dtype=np.float32))
+    np.save(depth_dir / "b.npy", np.full((8, 8), np.nan, dtype=np.float32))
+    np.save(depth_dir / "c.npy", np.full((8, 8), np.nan, dtype=np.float32))
+
+    problems = check_prior_quality(
+        depth_stats=depth_prior_stats(str(depth_dir)),
+        mask_stats=mask_coverage_stats(str(mask_dir)),
+    )
+    joined = " ".join(problems)
+    assert "100.0% of the average frame" in joined
+    assert "excludes its entire frame" in joined
+    assert "3/3 depth maps (100.0%)" in joined
+    # 1 of 3 maps is finite -> 33.3%, below the 50% default.
+    assert "33.3% finite" in joined
+
+
+def test_check_prior_quality_thresholds_pass_on_equality():
+    """A directory sitting exactly on a threshold is accepted, not flagged."""
+    assert (
+        check_prior_quality(
+            depth_stats={
+                "num_maps": 10,
+                "num_degenerate_maps": 5,
+                "mean_finite_fraction": 0.5,
+            },
+            mask_stats={
+                "num_masks": 10,
+                "mean_excluded_fraction": 0.9,
+                "min_kept_fraction": 0.1,
+            },
+        )
+        == []
+    )
+
+
+def test_check_prior_quality_problems_are_json_serializable():
+    """The stage records these into pipeline_report.json verbatim."""
+    problems = check_prior_quality(mask_stats={"num_masks": 0})
+    json.dumps({"problems": problems, "num_problems": len(problems)})
+
+
+def test_run_pipeline_writes_the_report_even_when_a_stage_fails(tmp_path):
+    """A failed run must still leave a `pipeline_report.json` behind.
+
+    `run_stage` carefully records a failure as `status="failed"`, but without
+    `--continue_on_error` it then re-raises -- so if the report were only
+    written at the end of a successful run, that record would be lost to the
+    traceback and any report from an earlier run would stay on disk still
+    claiming success. Driven through `run_pipeline.py` as a subprocess, the
+    way a user hits it.
+    """
+    pytest.importorskip("tyro", reason="tyro not installed")
+    imageio = pytest.importorskip("imageio.v2", reason="imageio not installed")
+    import subprocess
+    import sys
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    script = os.path.join(repo_root, "examples", "run_pipeline.py")
+
+    data_dir = tmp_path / "data"
+    mask_dir = data_dir / "masks"
+    mask_dir.mkdir(parents=True)
+    # Masks that exclude every pixel of every frame: the `priors` gate fails
+    # this under --strict.
+    for name in ("a", "b"):
+        imageio.imwrite(str(mask_dir / f"{name}.png"), np.zeros((8, 8), dtype=np.uint8))
+
+    result_dir = tmp_path / "out"
+    report_path = result_dir / "pipeline_report.json"
+    # Leave a stale success report behind, so a run that never wrote its own
+    # would silently leave this one in place.
+    result_dir.mkdir()
+    report_path.write_text(json.dumps({"stages": [{"name": "stale", "status": "ok"}]}))
+
+    proc = subprocess.run(
+        [
+            sys.executable,
+            script,
+            "--stages",
+            "priors",
+            "--strict",
+            "--data_dir",
+            str(data_dir),
+            "--result_dir",
+            str(result_dir),
+            "--mask_dir",
+            str(mask_dir),
+        ],
+        capture_output=True,
+        text=True,
+        # The script imports `gsplat`; a source checkout isn't necessarily
+        # installed, and `python examples/run_pipeline.py` only puts
+        # `examples/` on sys.path.
+        env={**os.environ, "PYTHONPATH": repo_root},
+    )
+
+    assert proc.returncode != 0, proc.stdout + proc.stderr
+    report = json.loads(report_path.read_text())
+    stages = {s["name"]: s for s in report["stages"]}
+    assert "stale" not in stages, "the stale report was left in place"
+    assert stages["priors"]["status"] == STATUS_FAILED
+    assert stages["priors"]["metrics"]["num_problems"] > 0
+    assert "excludes its entire frame" in " ".join(
+        stages["priors"]["metrics"]["problems"]
+    )

@@ -305,3 +305,93 @@ def latest_metrics(entries: Dict[str, Any]) -> Optional[Any]:
     if not entries:
         return None
     return entries[sorted(entries)[-1]]
+
+
+def check_prior_quality(
+    depth_stats: Optional[Dict[str, Any]] = None,
+    mask_stats: Optional[Dict[str, Any]] = None,
+    max_excluded_fraction: float = 0.9,
+    max_degenerate_fraction: float = 0.5,
+    min_finite_fraction: float = 0.5,
+) -> List[str]:
+    """Turn AI-prior sanity stats into concrete problems worth stopping for.
+
+    :func:`gsplat.photogrammetry.metrics.mask_coverage_stats` and
+    :func:`~gsplat.photogrammetry.metrics.depth_prior_stats` only *describe* a
+    prior directory. This judges those numbers, so a pipeline can refuse to
+    spend hours training on priors that cannot help -- an empty directory, a
+    segmenter that masked away the whole scene (or nothing at all), depth maps
+    that are constant or mostly NaN.
+
+    Every check is on the *directory as a whole*: a single odd frame is normal,
+    a directory-wide pattern is a setup mistake.
+
+    Args:
+        depth_stats: A ``depth_prior_stats(...)`` dict, or None if
+            ``--mono_depth_dir`` wasn't given.
+        mask_stats: A ``mask_coverage_stats(...)`` dict, or None if
+            ``--mask_dir`` wasn't given.
+        max_excluded_fraction: Flag masks excluding more than this fraction of
+            the average frame.
+        max_degenerate_fraction: Flag a depth directory where more than this
+            fraction of maps are constant or entirely non-finite.
+        min_finite_fraction: Flag depth maps whose average finite-pixel
+            fraction falls below this.
+
+    Returns:
+        A list of human-readable problem descriptions, in a stable order.
+        Empty means the priors look usable.
+    """
+    problems: List[str] = []
+
+    if mask_stats is not None:
+        num_masks = int(mask_stats.get("num_masks", 0))
+        if num_masks == 0:
+            problems.append(
+                "--mask_dir contains no .png masks: training would silently "
+                "run with no transient-object masking at all."
+            )
+        else:
+            excluded = float(mask_stats.get("mean_excluded_fraction", 0.0))
+            if excluded > max_excluded_fraction:
+                problems.append(
+                    f"masks exclude {excluded:.1%} of the average frame "
+                    f"(> {max_excluded_fraction:.1%}): little photometric "
+                    "signal would be left to train on."
+                )
+            elif excluded <= 0.0:
+                problems.append(
+                    "masks exclude nothing (every pixel is kept in every "
+                    "mask): --mask_dir is a no-op as generated."
+                )
+            if float(mask_stats.get("min_kept_fraction", 1.0)) <= 0.0:
+                problems.append(
+                    "at least one mask excludes its entire frame: that image "
+                    "contributes nothing to the photometric loss."
+                )
+
+    if depth_stats is not None:
+        num_maps = int(depth_stats.get("num_maps", 0))
+        if num_maps == 0:
+            problems.append(
+                "--mono_depth_dir contains no .npy depth maps: training would "
+                "silently run with no depth-prior supervision at all."
+            )
+        else:
+            degenerate = int(depth_stats.get("num_degenerate_maps", 0))
+            degenerate_fraction = degenerate / num_maps
+            if degenerate_fraction > max_degenerate_fraction:
+                problems.append(
+                    f"{degenerate}/{num_maps} depth maps "
+                    f"({degenerate_fraction:.1%}) are constant or entirely "
+                    "non-finite, and carry no gradient for the depth loss."
+                )
+            finite = float(depth_stats.get("mean_finite_fraction", 1.0))
+            if finite < min_finite_fraction:
+                problems.append(
+                    f"depth maps are only {finite:.1%} finite on average "
+                    f"(< {min_finite_fraction:.1%}): most pixels would drop "
+                    "out of the depth loss."
+                )
+
+    return problems

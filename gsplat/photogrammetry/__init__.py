@@ -70,6 +70,7 @@ from .neural_sfm import merge_point_maps_to_tracks, write_colmap_reconstruction
 from .pipeline import (
     PipelineReport,
     StageResult,
+    check_prior_quality,
     collect_artifact_metrics,
     record_skipped,
     run_stage,
@@ -97,4 +98,5 @@ __all__ = [
     "run_stage",
     "record_skipped",
     "collect_artifact_metrics",
+    "check_prior_quality",
 ]

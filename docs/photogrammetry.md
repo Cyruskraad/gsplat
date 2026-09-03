@@ -175,7 +175,39 @@ report on it), and `--dry_run` prints the commands it would run without
 running them. This writes `results/garden_pipeline/pipeline_report.json`:
 per-stage status/timing/metrics plus every `stats/*.json` artifact found
 under `--result_dir`/`--data_dir`, from
-`gsplat.photogrammetry.pipeline.PipelineReport`.
+`gsplat.photogrammetry.pipeline.PipelineReport`. The report is written even
+when a stage fails, since that is when it matters most.
+
+#### The `priors` quality gate
+
+Training is the expensive stage, and a bad prior directory is silent: a
+segmenter run with an inverted keep/exclude convention, a depth model that
+emitted constant maps, or a `--mask_dir` that simply matched no files all
+look like a normal run until hours later. The `priors` stage judges the
+`mask_coverage_stats`/`depth_prior_stats` numbers before that happens
+(`gsplat.photogrammetry.pipeline.check_prior_quality`), printing each problem
+it finds and recording them in the report as
+`stages[priors].metrics.problems`:
+
+```
+[priors] WARNING: masks exclude 100.0% of the average frame (> 90.0%): little
+photometric signal would be left to train on.
+[priors] WARNING: 3/3 depth maps (100.0%) are constant or entirely
+non-finite, and carry no gradient for the depth loss.
+```
+
+It flags a prior directory with no files at all, masks that exclude more than
+`--max_excluded_fraction` (default 0.9) of the average frame or that exclude
+nothing whatsoever, any mask that excludes its entire frame, a depth
+directory more than `--max_degenerate_fraction` (default 0.5) of whose maps
+are constant or entirely non-finite, and depth maps that are mostly
+non-finite. Every check is on the directory as a whole -- one odd frame is
+normal, a directory-wide pattern is a setup mistake.
+
+By default this warns and the pipeline continues; `--strict` turns the
+warnings into a stage failure, so the run stops before training instead of
+after. Raise `--max_excluded_fraction` if your capture really is mostly
+transient content.
 
 ### Automatic metrics & the consolidated report
 
