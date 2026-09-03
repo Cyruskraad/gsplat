@@ -110,7 +110,9 @@ def extract_mesh_tsdf(
             (3, 3) tensors and an ``"image"`` tensor whose shape gives the
             render resolution) providing the camera poses to render+fuse
             from. Using a dataset built with a larger ``test_every`` (i.e.
-            more train views) improves mesh coverage.
+            more train views) improves mesh coverage. If items include a
+            ``"mask"`` (e.g. ``Dataset(..., mask_dir=...)``), pixels where
+            it's ``0`` are excluded from TSDF fusion.
         renderer: ``"2dgs"`` (recommended -- surfels give much better depth
             for TSDF fusion) or ``"3dgs"``.
         sh_degree: SH degree to evaluate ``splats``' colors at.
@@ -186,10 +188,17 @@ def extract_mesh_tsdf(
         else:
             raise ValueError(f"Unknown renderer: {renderer!r}. Use '2dgs' or '3dgs'.")
 
+        depth_np = depth.cpu().numpy().astype(np.float32)
+        if "mask" in data:
+            # Zero out depth at excluded (e.g. transient-object) pixels --
+            # Open3D's RGBDImage treats depth == 0 as "no data", so those
+            # pixels contribute nothing to the fused mesh.
+            depth_np = depth_np * data["mask"].cpu().numpy().astype(np.float32)
+
         views.append(
             {
                 "color": (color.clamp(0, 1).cpu().numpy() * 255).astype(np.uint8),
-                "depth": depth.cpu().numpy().astype(np.float32),
+                "depth": depth_np,
                 "K": K.cpu().numpy(),
                 # `extrinsic` is the world-to-camera transform.
                 "extrinsic": viewmat.cpu().numpy().astype(np.float64),

@@ -35,6 +35,10 @@ to a ``stats/*.json`` file next to its output -- run
 ``python examples/summarize_photogrammetry_stats.py --result_dir results/garden_2dgs
 --data_dir data/360_v2/garden`` to aggregate them into one report.
 
+Pass ``--mask_dir`` (step 3/4) to exclude externally-segmented transient
+content (people, vehicles, ...) from training and mesh fusion -- see
+"Transient/dynamic-object masking" in ``docs/photogrammetry.md``.
+
 See ``docs/photogrammetry.md`` (repo root) for the full guide, including how
 to wire the refined poses / dense point cloud into the trainer's
 ``Parser(..., colmap_dir=..., dense_points_path=...)`` arguments, and

@@ -21,6 +21,10 @@ changes required:
   cloud-to-mesh fit, point-cloud density -- for the stages above, written to
   `stats/*.json` files next to the trainer's existing PSNR/SSIM/LPIPS
   render-quality reports.
+- **Transient/dynamic-object masking** (`Dataset(..., mask_dir=...)`,
+  `--mask_dir`) excludes externally-segmented moving content (people,
+  vehicles, ...) from training supervision and mesh fusion via
+  `gsplat.losses.masked_l1`/`masked_ssim`.
 
 `mesh_extraction`/`metrics` require the optional `open3d` dependency: `pip
 install gsplat[mesh]`. `dense_mvs` requires a CUDA-enabled `colmap`
@@ -159,6 +163,69 @@ python examples/simple_trainer_2dgs.py \
     --data_dir data/360_v2/garden --data_factor 4 \
     --result_dir results/garden_2dgs \
     --mono_depth_loss --mono_depth_dir data/360_v2/garden/mono_depth
+```
+
+### Transient/dynamic-object masking (AI-assisted)
+
+Real captures often contain moving people, vehicles, or pets that corrupt a
+static-scene reconstruction. As with monocular depth, gsplat does not run
+any segmentation model itself -- run one externally over your training
+images and save one `<image_stem>.png` mask per image into a directory
+(any resolution -- resized/warped to match automatically), where **nonzero
+= keep (static content)**, **0 = exclude (transient content)**. This
+matches the convention of the existing fisheye undistortion ROI mask, which
+this feature composes with (both are combined, so a fisheye capture with
+moving people gets both border cropping and transient exclusion). Pass
+`--mask_dir <that directory>` to `simple_trainer_2dgs.py`, `extract_mesh.py`,
+or `Parser`'s `Dataset(..., mask_dir=...)` directly.
+
+Excluded pixels are dropped from the photometric loss
+(`gsplat.losses.masked_l1`/`masked_ssim` -- mean taken over the kept region
+only, rather than diluting the loss by zeroing pixels and averaging over the
+full frame) and from `--mono_depth_loss`'s depth-prior supervision, and (via
+`Runner.extract_mesh()`/`extract_mesh.py --mask_dir`) from TSDF mesh fusion,
+so transient content isn't baked into an extracted mesh either. There is no
+separate enable flag -- masks are used whenever `--mask_dir` is given.
+
+Example using `torchvision`'s pretrained Mask R-CNN (COCO instance
+segmentation; not a gsplat dependency) to exclude common movable classes:
+
+```python
+import os
+import numpy as np
+import torch
+from PIL import Image
+from torchvision.io import decode_image
+from torchvision.models.detection import maskrcnn_resnet50_fpn, MaskRCNN_ResNet50_FPN_Weights
+
+# COCO category ids for commonly-moving objects (person, bicycle, car,
+# motorcycle, bus, train, truck, boat, cat, dog).
+MOVABLE_CATEGORY_IDS = {1, 2, 3, 4, 6, 7, 8, 9, 17, 18}
+
+weights = MaskRCNN_ResNet50_FPN_Weights.DEFAULT
+model = maskrcnn_resnet50_fpn(weights=weights).eval()
+preprocess = weights.transforms()
+
+image_dir, out_dir = "data/360_v2/garden/images", "data/360_v2/garden/masks"
+os.makedirs(out_dir, exist_ok=True)
+for fname in os.listdir(image_dir):
+    image = decode_image(os.path.join(image_dir, fname))
+    with torch.no_grad():
+        pred = model([preprocess(image)])[0]
+    keep_mask = np.ones(image.shape[1:], dtype=bool)  # (H, W), True = keep
+    for label, score, obj_mask in zip(pred["labels"], pred["scores"], pred["masks"]):
+        if score > 0.7 and int(label) in MOVABLE_CATEGORY_IDS:
+            keep_mask &= obj_mask[0].numpy() < 0.5  # exclude this instance
+    stem = os.path.splitext(fname)[0]
+    Image.fromarray((keep_mask * 255).astype(np.uint8)).save(
+        os.path.join(out_dir, f"{stem}.png")
+    )
+```
+
+```bash
+python examples/simple_trainer_2dgs.py \
+    --data_dir data/360_v2/garden --data_factor 4 \
+    --result_dir results/garden_2dgs --mask_dir data/360_v2/garden/masks
 ```
 
 ### Starting from a neural SfM tool instead of COLMAP (AI-assisted)

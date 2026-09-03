@@ -72,6 +72,11 @@ class Config:
     sdf_trunc: float = 0.04
     # Poisson reconstruction octree depth.
     poisson_depth: int = 9
+    # Directory of precomputed per-image transient/dynamic-object masks (see
+    # docs/photogrammetry.md), one `<image_stem>.png` per training image:
+    # nonzero = keep (static content), 0 = exclude. Excluded pixels are
+    # dropped from TSDF fusion (--method tsdf only).
+    mask_dir: Optional[str] = None
     # Directory to write mesh.ply to.
     result_dir: str = "results/garden"
     # Whether to bake per-vertex texture from the training images.
@@ -88,7 +93,7 @@ def main(cfg: Config) -> None:
         normalize=True,
         test_every=cfg.test_every,
     )
-    dataset = Dataset(parser, split="train")
+    dataset = Dataset(parser, split="train", mask_dir=cfg.mask_dir)
 
     if cfg.method == "tsdf":
         ckpt = torch.load(cfg.ckpt, map_location=cfg.device)

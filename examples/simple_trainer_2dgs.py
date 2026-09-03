@@ -32,7 +32,14 @@ import tyro
 import viser
 from datasets.colmap import Dataset, Parser
 from datasets.traj import generate_interpolated_path
-from gsplat.losses import depth_l1_loss, l1_loss, pearson_depth_loss, ssim_loss
+from gsplat.losses import (
+    depth_l1_loss,
+    l1_loss,
+    masked_l1,
+    masked_ssim,
+    pearson_depth_loss,
+    ssim_loss,
+)
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -191,6 +198,17 @@ class Config:
     # mono_depth_loss is enabled.
     mono_depth_dir: Optional[str] = None
 
+    # Directory of precomputed per-image transient/dynamic-object masks
+    # (e.g. people, vehicles -- segmented externally, gsplat does not run
+    # any segmentation model itself, see docs/photogrammetry.md), one
+    # `<image_stem>.png` per training image, any resolution: nonzero = keep
+    # (static content), 0 = exclude (transient content). Used whenever set
+    # -- no separate enable flag, since there's no reason to load masks and
+    # not use them. Excluded regions are dropped from the photometric and
+    # mono-depth losses (via gsplat.losses.masked_l1/masked_ssim) and from
+    # TSDF mesh fusion in Runner.extract_mesh().
+    mask_dir: Optional[str] = None
+
     # Enable normal consistency loss. (Currently for 2DGS only)
     normal_loss: bool = False
     # Weight for normal loss
@@ -346,6 +364,7 @@ class Runner:
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
             mono_depth_dir=cfg.mono_depth_dir if cfg.mono_depth_loss else None,
+            mask_dir=cfg.mask_dir,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -661,13 +680,24 @@ class Runner:
                 info=info,
             )
             masks = data["mask"].to(device) if "mask" in data else None
-            if masks is not None:
-                pixels = pixels * masks[..., None]
-                colors = colors * masks[..., None]
 
             # loss
-            l1loss = l1_loss(colors, pixels).mean()
-            ssimloss = ssim_loss(colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2))
+            colors_chw = colors.permute(0, 3, 1, 2)
+            pixels_chw = pixels.permute(0, 3, 1, 2)
+            if masks is not None:
+                # Mask-aware reduction (mean over the `mask != 0` region
+                # only) rather than zeroing pixels/colors and taking an
+                # unmasked mean -- the latter dilutes the loss by the
+                # masked-out fraction, which matters once masks cover a
+                # non-trivial part of the frame (e.g. a transient-object
+                # mask, vs. the small fisheye ROI border this path also
+                # serves).
+                mask_chw = masks.unsqueeze(1)  # [1, 1, H, W]
+                l1loss = masked_l1(colors_chw, pixels_chw, mask_chw)
+                ssimloss = masked_ssim(colors_chw, pixels_chw, mask_chw)
+            else:
+                l1loss = l1_loss(colors, pixels).mean()
+                ssimloss = ssim_loss(colors_chw, pixels_chw)
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
             if cfg.mono_depth_loss:
                 # Dense, scale/shift-invariant supervision against a
@@ -676,6 +706,8 @@ class Runner:
                 # a sparse point-sampled version.
                 mono_depth_gt = data["mono_depth"].to(device)  # [1, H, W]
                 valid_mask = alphas.squeeze(-1) > 0.5  # [1, H, W]
+                if masks is not None:
+                    valid_mask = valid_mask & masks
                 mono_depth_loss_val = pearson_depth_loss(
                     depths.squeeze(-1), mono_depth_gt, mask=valid_mask
                 )

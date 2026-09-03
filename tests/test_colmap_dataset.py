@@ -26,6 +26,7 @@ import sys
 
 import numpy as np
 import pytest
+import torch
 
 SCRIPT_DIR = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(SCRIPT_DIR, "../examples"))
@@ -38,7 +39,7 @@ pycolmap = pytest.importorskip(
     "pycolmap",
     reason="pycolmap not installed (pip install -r examples/requirements.txt)",
 )
-pytest.importorskip("cv2", reason="opencv not installed")
+cv2 = pytest.importorskip("cv2", reason="opencv not installed")
 imageio = pytest.importorskip("imageio.v2", reason="imageio not installed")
 pytest.importorskip("piexif", reason="piexif not installed")
 
@@ -301,3 +302,176 @@ def test_dataset_mono_depth_dir_stays_aligned_under_distortion(tmp_path):
     mono = item["mono_depth"].numpy()
     assert image_red.shape == mono.shape
     np.testing.assert_allclose(mono, image_red, atol=2.0)
+
+
+def test_dataset_mask_dir_basic(synthetic_dataset, tmp_path):
+    """A mask_dir PNG (nonzero = keep, 0 = exclude) should come back in
+    `data["mask"]` as a matching-shape bool tensor, True where nonzero.
+    """
+    parser = Parser(
+        data_dir=synthetic_dataset, factor=1, normalize=False, test_every=100
+    )
+
+    mask_dir = str(tmp_path / "masks")
+    os.makedirs(mask_dir, exist_ok=True)
+    for i in range(4):
+        mask = np.full((HEIGHT, WIDTH), 255, dtype=np.uint8)
+        mask[:, : WIDTH // 2] = 0  # left half excluded ("transient")
+        imageio.imwrite(os.path.join(mask_dir, f"img{i:03d}.png"), mask)
+
+    dataset = Dataset(parser, split="train", mask_dir=mask_dir)
+    item = dataset[0]
+    assert "mask" in item
+    assert item["mask"].shape == item["image"].shape[:2]
+    assert item["mask"].dtype == torch.bool
+    assert not item["mask"][:, : WIDTH // 2].any()
+    assert item["mask"][:, WIDTH // 2 :].all()
+
+
+def test_dataset_mask_dir_with_patch_crop(synthetic_dataset, tmp_path):
+    """The mask must be cropped in step with `image` under patch_size, the
+    same as mono_depth -- otherwise the two land at different shapes/content.
+    """
+    parser = Parser(
+        data_dir=synthetic_dataset, factor=1, normalize=False, test_every=100
+    )
+
+    mask_dir = str(tmp_path / "masks")
+    os.makedirs(mask_dir, exist_ok=True)
+    for i in range(4):
+        mask = np.full((HEIGHT, WIDTH), 255, dtype=np.uint8)
+        mask[:, : WIDTH // 2] = 0
+        imageio.imwrite(os.path.join(mask_dir, f"img{i:03d}.png"), mask)
+
+    dataset = Dataset(parser, split="train", patch_size=16, mask_dir=mask_dir)
+    item = dataset[0]
+    assert item["image"].shape[:2] == (16, 16)
+    assert item["mask"].shape == (16, 16)
+
+
+def test_dataset_mask_dir_stays_aligned_under_distortion(tmp_path):
+    """Same alignment contract as mono_depth: a mask must undergo the same
+    undistortion remap + ROI crop as the image, not a plain resize. Build the
+    mask as a binarized copy of the image's own red channel (thresholded),
+    then re-derive the same threshold from the *undistorted* image and check
+    they match -- if the mask took a different geometric path, they wouldn't.
+    """
+    data_dir = str(tmp_path)
+    sparse_dir = os.path.join(data_dir, "sparse", "0")
+    images_dir = os.path.join(data_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+
+    width, height = 80, 60
+    recon = pycolmap.Reconstruction()
+    camera = pycolmap.Camera.create_from_model_id(
+        1, pycolmap.CameraModelId.SIMPLE_RADIAL, 60.0, width, height
+    )
+    camera.params = np.array([60.0, width / 2, height / 2, -0.25], dtype=np.float64)
+    recon.add_camera_with_trivial_rig(camera)
+
+    img = pycolmap.Image()
+    img.image_id = 1
+    img.camera_id = 1
+    img.name = "img000.png"
+    img.points2D = []
+    cam_from_world = pycolmap.Rigid3d(pycolmap.Rotation3d(np.eye(3)), np.zeros(3))
+    recon.add_image_with_trivial_frame(img, cam_from_world)
+
+    os.makedirs(sparse_dir, exist_ok=True)
+    recon.write(sparse_dir)
+
+    rng = np.random.default_rng(6)
+    image = rng.uniform(0, 255, size=(height, width, 3)).astype(np.uint8)
+    imageio.imwrite(os.path.join(images_dir, "img000.png"), image)
+
+    mask_dir = str(tmp_path / "masks")
+    os.makedirs(mask_dir, exist_ok=True)
+    rng_mask = np.random.default_rng(9)
+    original_mask = (rng_mask.uniform(0, 1, size=(height, width)) > 0.5).astype(
+        np.uint8
+    ) * 255
+    imageio.imwrite(os.path.join(mask_dir, "img000.png"), original_mask)
+
+    parser = Parser(data_dir=data_dir, factor=1, normalize=False, test_every=100)
+    assert len(parser.params_dict[1]) > 0, "camera should have distortion params"
+
+    dataset = Dataset(parser, split="val", mask_dir=mask_dir)
+    item = dataset[0]
+
+    # Independently reproduce the expected warp from the parser's own
+    # undistortion maps -- exactly the transform `image` itself goes
+    # through -- rather than relying on any numerical coincidence with the
+    # (bilinearly-interpolated) image channel.
+    mapx, mapy = parser.mapx_dict[1], parser.mapy_dict[1]
+    x, y, w, h = parser.roi_undist_dict[1]
+    expected_mask = cv2.remap(
+        (original_mask != 0).astype(np.uint8), mapx, mapy, cv2.INTER_NEAREST
+    )
+    expected_mask = expected_mask[y : y + h, x : x + w].astype(bool)
+
+    np.testing.assert_array_equal(item["mask"].numpy(), expected_mask)
+
+
+def test_dataset_mask_dir_combines_with_fisheye_roi(tmp_path):
+    """When both the fisheye ROI mask (from Parser) and a mask_dir transient
+    mask are present, `data["mask"]` should be their logical AND.
+    """
+    data_dir = str(tmp_path)
+    sparse_dir = os.path.join(data_dir, "sparse", "0")
+    images_dir = os.path.join(data_dir, "images")
+    os.makedirs(images_dir, exist_ok=True)
+
+    width, height = 80, 60
+    recon = pycolmap.Reconstruction()
+    camera = pycolmap.Camera.create_from_model_id(
+        1, pycolmap.CameraModelId.OPENCV_FISHEYE, 40.0, width, height
+    )
+    # A non-zero k1 (unlike an all-zero-distortion fisheye, which reduces to
+    # an identity mapping) so the undistortion maps actually push some
+    # border pixels out of the source image, producing a genuine
+    # (non-all-True) ROI mask.
+    camera.params = np.array(
+        [40.0, 40.0, width / 2, height / 2, 0.5, 0.0, 0.0, 0.0], dtype=np.float64
+    )
+    recon.add_camera_with_trivial_rig(camera)
+
+    img = pycolmap.Image()
+    img.image_id = 1
+    img.camera_id = 1
+    img.name = "img000.png"
+    img.points2D = []
+    cam_from_world = pycolmap.Rigid3d(pycolmap.Rotation3d(np.eye(3)), np.zeros(3))
+    recon.add_image_with_trivial_frame(img, cam_from_world)
+
+    os.makedirs(sparse_dir, exist_ok=True)
+    recon.write(sparse_dir)
+
+    rng = np.random.default_rng(7)
+    image = rng.uniform(0, 255, size=(height, width, 3)).astype(np.uint8)
+    imageio.imwrite(os.path.join(images_dir, "img000.png"), image)
+
+    parser = Parser(data_dir=data_dir, factor=1, normalize=False, test_every=100)
+    fisheye_roi_mask = parser.mask_dict[1]
+    assert fisheye_roi_mask is not None, "fisheye camera should produce an ROI mask"
+    assert not fisheye_roi_mask.all(), "ROI mask should exclude some border pixels"
+
+    out_h, out_w = fisheye_roi_mask.shape
+    mask_dir = str(tmp_path / "masks")
+    os.makedirs(mask_dir, exist_ok=True)
+    # An all-True transient mask at the *original* resolution -- after
+    # undergoing the same undistortion remap+crop as the image, it should
+    # end up all-True too, so the combination equals the ROI mask exactly.
+    all_keep = np.full((height, width), 255, dtype=np.uint8)
+    imageio.imwrite(os.path.join(mask_dir, "img000.png"), all_keep)
+
+    dataset = Dataset(parser, split="val", mask_dir=mask_dir)
+    item = dataset[0]
+    assert item["mask"].shape == (out_h, out_w)
+    # Should match the ROI mask almost everywhere -- nearest-neighbor
+    # remap's rounding can disagree with the parser's strict in-bounds
+    # inequalities on a handful of boundary pixels.
+    mismatch_frac = (item["mask"].numpy() != fisheye_roi_mask).mean()
+    assert mismatch_frac < 0.05, f"combined mask diverged: {mismatch_frac:.3f}"
+    # And it should genuinely be a combination, not just one input passed
+    # through: some pixels must be excluded (from the ROI mask).
+    assert not item["mask"].numpy().all()

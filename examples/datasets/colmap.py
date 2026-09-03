@@ -506,12 +506,14 @@ class Dataset:
         patch_size: Optional[int] = None,
         load_depths: bool = False,
         mono_depth_dir: Optional[str] = None,
+        mask_dir: Optional[str] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
         self.mono_depth_dir = mono_depth_dir
+        self.mask_dir = mask_dir
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -548,6 +550,27 @@ class Dataset:
                     interpolation=cv2.INTER_LINEAR,
                 )
 
+        transient_mask = None
+        if self.mask_dir is not None:
+            # A precomputed per-image mask excluding transient/dynamic
+            # content (people, vehicles, ...) from supervision -- nonzero =
+            # keep/static, 0 = exclude/transient, matching the convention of
+            # the fisheye ROI `mask` above. Same alignment rationale as
+            # `mono_depth`: resize to the *original* resolution first, then
+            # undergo the identical undistortion remap + ROI crop below.
+            image_name = self.parser.image_names[index]
+            stem = os.path.splitext(os.path.basename(image_name))[0]
+            transient_mask = imageio.imread(os.path.join(self.mask_dir, f"{stem}.png"))
+            if transient_mask.ndim == 3:
+                transient_mask = transient_mask[..., 0]
+            transient_mask = (transient_mask != 0).astype(np.uint8)
+            if transient_mask.shape[:2] != image.shape[:2]:
+                transient_mask = cv2.resize(
+                    transient_mask,
+                    (image.shape[1], image.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
         if len(params) > 0:
             # Images are distorted. Undistort them.
             mapx, mapy = (
@@ -560,6 +583,17 @@ class Dataset:
             if mono_depth is not None:
                 mono_depth = cv2.remap(mono_depth, mapx, mapy, cv2.INTER_LINEAR)
                 mono_depth = mono_depth[y : y + h, x : x + w]
+            if transient_mask is not None:
+                transient_mask = cv2.remap(
+                    transient_mask, mapx, mapy, cv2.INTER_NEAREST
+                )
+                transient_mask = transient_mask[y : y + h, x : x + w]
+
+        if transient_mask is not None:
+            # Combine with the fisheye ROI mask, if any -- both are now in
+            # the same (post-undistortion-crop) resolution/frame.
+            transient_mask = transient_mask.astype(bool)
+            mask = transient_mask if mask is None else (mask & transient_mask)
 
         if self.patch_size is not None:
             # Random crop.
@@ -573,6 +607,8 @@ class Dataset:
                 mono_depth = mono_depth[
                     y : y + self.patch_size, x : x + self.patch_size
                 ]
+            if mask is not None:
+                mask = mask[y : y + self.patch_size, x : x + self.patch_size]
 
         data = {
             "K": torch.from_numpy(K).float(),
