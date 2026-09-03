@@ -541,8 +541,25 @@ class Dataset:
             # under any non-trivial lens distortion.
             image_name = self.parser.image_names[index]
             stem = os.path.splitext(os.path.basename(image_name))[0]
-            mono_depth = np.load(os.path.join(self.mono_depth_dir, f"{stem}.npy"))
+            mono_depth_path = os.path.join(self.mono_depth_dir, f"{stem}.npy")
+            mono_depth = np.load(mono_depth_path)
             mono_depth = mono_depth.astype(np.float32)
+            # Depth models commonly emit (1, H, W) or (H, W, 1) rather than a
+            # bare (H, W) -- e.g. a transformers depth-estimation pipeline's
+            # `predicted_depth`. Left alone, such an array silently survives
+            # the resize below as garbage: cv2 reads a (1, H, W) array as a
+            # 1-row image with W channels and happily returns (H, W, W). Drop
+            # singleton axes, and refuse anything still not 2D rather than
+            # feeding a corrupt depth prior into a long training run.
+            mono_depth = np.squeeze(mono_depth)
+            if mono_depth.ndim != 2:
+                raise ValueError(
+                    f"mono_depth map {mono_depth_path!r} has shape "
+                    f"{np.load(mono_depth_path).shape}, which is not a single "
+                    "(H, W) depth map. Save one 2D float array per image "
+                    "(np.squeeze the model's output if it has a leading "
+                    "batch/channel axis)."
+                )
             if mono_depth.shape[:2] != image.shape[:2]:
                 mono_depth = cv2.resize(
                     mono_depth,

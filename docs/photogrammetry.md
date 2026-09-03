@@ -307,9 +307,19 @@ image_dir, out_dir = "data/360_v2/garden/images", "data/360_v2/garden/mono_depth
 os.makedirs(out_dir, exist_ok=True)
 for fname in os.listdir(image_dir):
     depth = pipe(Image.open(os.path.join(image_dir, fname)))["predicted_depth"]
+    # Save a bare (H, W) array: depending on the transformers version,
+    # `predicted_depth` can carry a leading batch axis, and an unsqueezed
+    # (1, H, W) map is not loadable as a depth prior.
+    depth = np.squeeze(depth.numpy()).astype(np.float32)
+    assert depth.ndim == 2, f"expected one (H, W) depth map, got {depth.shape}"
     stem = os.path.splitext(fname)[0]
-    np.save(os.path.join(out_dir, f"{stem}.npy"), depth.numpy().astype(np.float32))
+    np.save(os.path.join(out_dir, f"{stem}.npy"), depth)
 ```
+
+Each `.npy` must be a single 2D `(H, W)` array (any resolution). Loading one
+that isn't fails with a message naming the file, and
+`run_pipeline.py`'s [`priors` gate](#the-priors-quality-gate) reports
+`num_not_2d_maps` for the whole directory before training starts.
 
 ```bash
 python examples/simple_trainer_2dgs.py \

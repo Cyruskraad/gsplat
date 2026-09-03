@@ -371,9 +371,11 @@ def depth_prior_stats(
 
     Returns:
         A dict with ``num_maps``, ``mean_finite_fraction``,
-        ``mean_value``/``min_value``/``max_value``, and
+        ``mean_value``/``min_value``/``max_value``,
         ``num_degenerate_maps`` (maps that are constant or entirely
-        non-finite, and so useless as supervision).
+        non-finite, and so useless as supervision), and ``num_not_2d_maps``
+        (maps that aren't a single (H, W) array and so can't be loaded at
+        all -- typically a model's raw ``(1, H, W)`` output saved unsqueezed).
     """
     names = sorted(f for f in os.listdir(mono_depth_dir) if f.endswith(".npy"))
     if max_maps is not None:
@@ -381,8 +383,14 @@ def depth_prior_stats(
 
     finite_fractions, mins, maxs, means = [], [], [], []
     num_degenerate = 0
+    num_not_2d = 0
     for name in names:
         depth = np.load(os.path.join(mono_depth_dir, name)).astype(np.float64)
+        # A map that isn't a bare (H, W) array once singleton axes are dropped
+        # can't be used as a depth prior -- the loader rejects it. Count it
+        # here so a whole directory of them is caught before training starts.
+        if np.squeeze(depth).ndim != 2:
+            num_not_2d += 1
         finite = np.isfinite(depth)
         finite_fractions.append(float(finite.mean()))
         if not finite.any():
@@ -403,6 +411,7 @@ def depth_prior_stats(
             "min_value": 0.0,
             "max_value": 0.0,
             "num_degenerate_maps": 0,
+            "num_not_2d_maps": 0,
         }
 
     return {
@@ -412,4 +421,5 @@ def depth_prior_stats(
         "min_value": float(np.min(mins)) if mins else 0.0,
         "max_value": float(np.max(maxs)) if maxs else 0.0,
         "num_degenerate_maps": int(num_degenerate),
+        "num_not_2d_maps": int(num_not_2d),
     }

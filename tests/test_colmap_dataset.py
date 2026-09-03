@@ -475,3 +475,94 @@ def test_dataset_mask_dir_combines_with_fisheye_roi(tmp_path):
     # And it should genuinely be a combination, not just one input passed
     # through: some pixels must be excluded (from the ROI mask).
     assert not item["mask"].numpy().all()
+
+
+def test_dataset_loads_masks_in_the_documented_recipe_format(
+    synthetic_dataset, tmp_path
+):
+    """A mask written exactly the way `docs/photogrammetry.md`'s Mask R-CNN
+    recipe writes it must load.
+
+    The recipe's last step is
+    `Image.fromarray((keep_mask * 255).astype(np.uint8)).save(...)` -- a
+    single-channel PIL PNG built from a *bool* array, which is a different
+    writer and a different code path from the `imageio` masks the other tests
+    use. Documented instructions that silently stop producing loadable output
+    are worse than none, so pin the recipe's actual output format here.
+    """
+    Image = pytest.importorskip("PIL.Image", reason="Pillow not installed")
+
+    parser = Parser(
+        data_dir=synthetic_dataset, factor=1, normalize=False, test_every=100
+    )
+
+    mask_dir = str(tmp_path / "recipe_masks")
+    os.makedirs(mask_dir, exist_ok=True)
+    # `keep_mask` as the recipe builds it: True = keep, cleared over the
+    # pixels a detected "movable" instance covers.
+    keep_mask = np.ones((HEIGHT, WIDTH), dtype=bool)
+    keep_mask[10:30, 10:40] = False
+    for i in range(4):
+        Image.fromarray((keep_mask * 255).astype(np.uint8)).save(
+            os.path.join(mask_dir, f"img{i:03d}.png")
+        )
+
+    dataset = Dataset(parser, split="train", mask_dir=mask_dir)
+    item = dataset[0]
+
+    assert item["mask"].dtype == torch.bool
+    assert item["mask"].shape == item["image"].shape[:2]
+    # The excluded block lands exactly where the recipe put it, at the same
+    # scale -- not mirrored, transposed or resized.
+    assert not item["mask"][10:30, 10:40].any()
+    assert item["mask"][0:10, :].all()
+    excluded_fraction = float((~item["mask"]).float().mean())
+    assert excluded_fraction == pytest.approx((20 * 30) / (HEIGHT * WIDTH))
+
+
+def test_dataset_squeezes_and_rejects_non_2d_mono_depth(synthetic_dataset, tmp_path):
+    """A depth map with a leading batch axis must load correctly, not silently
+    become garbage; anything genuinely not 2D must raise.
+
+    Depth models commonly emit `(1, H, W)` -- a transformers depth-estimation
+    pipeline's `predicted_depth` among them, which is what
+    `docs/photogrammetry.md`'s recipe produces. Before this was handled, such a
+    map sailed through the resize step: `cv2.resize` reads a `(1, H, W)` array
+    as a one-row image with W channels and returns `(H, W, W)`, so training
+    would have been supervised against reshaped noise with no error raised.
+    """
+    parser = Parser(
+        data_dir=synthetic_dataset, factor=1, normalize=False, test_every=100
+    )
+
+    rng = np.random.default_rng(11)
+    depth_2d = rng.uniform(1.0, 5.0, size=(HEIGHT, WIDTH)).astype(np.float32)
+
+    # (1, H, W): squeezed, and identical to the same map saved as (H, W).
+    batched_dir = str(tmp_path / "mono_depth_batched")
+    plain_dir = str(tmp_path / "mono_depth_plain")
+    os.makedirs(batched_dir, exist_ok=True)
+    os.makedirs(plain_dir, exist_ok=True)
+    for i in range(4):
+        np.save(os.path.join(batched_dir, f"img{i:03d}.npy"), depth_2d[None])
+        np.save(os.path.join(plain_dir, f"img{i:03d}.npy"), depth_2d)
+
+    batched = Dataset(parser, split="train", mono_depth_dir=batched_dir)[0]
+    plain = Dataset(parser, split="train", mono_depth_dir=plain_dir)[0]
+    assert batched["mono_depth"].shape == plain["image"].shape[:2]
+    np.testing.assert_allclose(
+        batched["mono_depth"].numpy(), plain["mono_depth"].numpy()
+    )
+
+    # (H, W, 3) can't be squeezed into a depth map: refuse it, and say which
+    # file is at fault rather than failing somewhere downstream.
+    bad_dir = str(tmp_path / "mono_depth_bad")
+    os.makedirs(bad_dir, exist_ok=True)
+    for i in range(4):
+        np.save(
+            os.path.join(bad_dir, f"img{i:03d}.npy"),
+            rng.uniform(0, 1, size=(HEIGHT, WIDTH, 3)).astype(np.float32),
+        )
+
+    with pytest.raises(ValueError, match=r"img\d+\.npy.*not a single \(H, W\)"):
+        Dataset(parser, split="train", mono_depth_dir=bad_dir)[0]

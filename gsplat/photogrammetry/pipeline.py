@@ -334,7 +334,8 @@ def check_prior_quality(
         max_excluded_fraction: Flag masks excluding more than this fraction of
             the average frame.
         max_degenerate_fraction: Flag a depth directory where more than this
-            fraction of maps are constant or entirely non-finite.
+            fraction of maps are constant or entirely non-finite. (Maps that
+            aren't loadable at all are always flagged, however few.)
         min_finite_fraction: Flag depth maps whose average finite-pixel
             fraction falls below this.
 
@@ -385,6 +386,13 @@ def check_prior_quality(
                     f"{degenerate}/{num_maps} depth maps "
                     f"({degenerate_fraction:.1%}) are constant or entirely "
                     "non-finite, and carry no gradient for the depth loss."
+                )
+            not_2d = int(depth_stats.get("num_not_2d_maps", 0))
+            if not_2d:
+                problems.append(
+                    f"{not_2d}/{num_maps} depth maps are not a single (H, W) "
+                    "array and cannot be loaded (np.squeeze the model's output "
+                    "before saving it)."
                 )
             finite = float(depth_stats.get("mean_finite_fraction", 1.0))
             if finite < min_finite_fraction:

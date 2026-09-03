@@ -711,3 +711,53 @@ def test_format_and_serialize_cross_stage_metrics():
     json.dumps(derived)
 
     assert "none" in format_cross_stage_metrics({})
+
+
+def test_depth_prior_stats_counts_unloadable_maps(tmp_path):
+    """A `(1, H, W)` map is loadable (the loader squeezes it); a genuinely
+    non-2D one is not, and gets counted so the gate can refuse the run."""
+    depth_dir = tmp_path / "depth"
+    depth_dir.mkdir()
+    rng = np.random.default_rng(4)
+    good = rng.uniform(1.0, 5.0, size=(8, 8)).astype(np.float32)
+    np.save(depth_dir / "a.npy", good)
+    np.save(depth_dir / "b.npy", good[None])  # (1, 8, 8) -- squeezes to 2D
+    np.save(depth_dir / "c.npy", np.stack([good] * 3, axis=-1))  # (8, 8, 3)
+
+    stats = depth_prior_stats(str(depth_dir))
+    assert stats["num_maps"] == 3
+    assert stats["num_not_2d_maps"] == 1
+    # None of these are constant or non-finite, so the degenerate count is
+    # separate from the unloadable one.
+    assert stats["num_degenerate_maps"] == 0
+
+    # The empty-directory early return carries the key too.
+    assert depth_prior_stats(str(tmp_path))["num_not_2d_maps"] == 0
+
+
+def test_check_prior_quality_flags_unloadable_depth_maps():
+    """Even one unloadable map is flagged: it isn't a threshold question, the
+    run simply cannot consume it."""
+    problems = check_prior_quality(
+        depth_stats={
+            "num_maps": 50,
+            "num_degenerate_maps": 0,
+            "num_not_2d_maps": 1,
+            "mean_finite_fraction": 1.0,
+        }
+    )
+    assert len(problems) == 1
+    assert "1/50 depth maps are not a single (H, W) array" in problems[0]
+    assert "np.squeeze" in problems[0]
+
+    # Absent key (older stats files) must not trip it.
+    assert (
+        check_prior_quality(
+            depth_stats={
+                "num_maps": 50,
+                "num_degenerate_maps": 0,
+                "mean_finite_fraction": 1.0,
+            }
+        )
+        == []
+    )

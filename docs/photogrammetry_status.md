@@ -21,7 +21,7 @@
        tests/test_neural_sfm.py tests/test_colmap_dataset.py \
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -q
    ```
-   Expect **63 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **67 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Then start from §5.1.** As of the latest session all three §5.1 items
    are still blocked (re-verified, see §4) — Actions is still off, the PR is
@@ -229,10 +229,10 @@ just re-asserting the buggy behavior):
 | `tests/test_bundle_adjustment.py` | 3 | Pure-torch optimization core (no pycolmap needed) |
 | `tests/test_mesh_extraction.py` | 10 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
-| `tests/test_colmap_dataset.py` | 11 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
+| `tests/test_colmap_dataset.py` | 14 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 6 | Geometry metrics against known analytic ground truth |
-| `tests/test_photogrammetry_pipeline.py` | 29 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
-| **Total** | **63** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| `tests/test_photogrammetry_pipeline.py` | 31 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
+| **Total** | **67** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -317,7 +317,36 @@ everything before them: by hand, since CI still cannot run.
   `gsplat.sensors` at module scope and so already fails collection on a CPU
   runner with or without cv2 (pre-existing, unrelated to this PR, untouched).
 
-**Bug found by running the new gate** (bringing §2.7's count to six): without
+- **AI-prior recipes, partially verified** (§5.2's "real-world AI-prior
+  recipes"). Pretrained weights cannot be downloaded here -- the environment's
+  network policy allows package registries but denies other hosts, so both
+  `download.pytorch.org` and HuggingFace return 403 through the proxy -- so
+  neither recipe can be run against real model output. What *was* executed:
+  the Mask R-CNN recipe's entire API path, verbatim except for a
+  randomly-initialized model of the same architecture, confirming
+  `decode_image(path)`, the weights' `transforms()`, the prediction dict's
+  keys, `masks` being `(N, 1, H, W)` so `obj_mask[0]` is `(H, W)`, and the
+  written PNG being single-channel uint8. Its output was then fed through
+  gsplat's real `Dataset(mask_dir=...)`, which loaded it with the excluded
+  block landing exactly where the recipe put it (excluded fraction
+  0.1953125, matching to the bit). `tests/test_colmap_dataset.py` now pins
+  that recipe's exact output format (PIL, single-channel uint8 from a bool
+  array -- a different writer from the `imageio` masks the other tests use).
+
+**Bug found while verifying the depth recipe** (§2.7's seventh): a `(1, H, W)`
+depth map -- the shape a transformers depth-estimation pipeline's
+`predicted_depth` commonly has, and what the documented recipe produced --
+was silently corrupted rather than rejected. `Dataset` compares
+`mono_depth.shape[:2]` to the image's, so a `(1, H, W)` map takes the resize
+path, and `cv2.resize` reads it as a one-row image with W channels and returns
+`(H, W, W)` **without raising**. Training would have been supervised against
+reshaped noise. The loader now squeezes singleton axes and raises a
+`ValueError` naming the file for anything still not 2D; `depth_prior_stats`
+reports `num_not_2d_maps` and the `priors` gate flags even one, so a whole
+directory of them is caught before training starts; and the documented recipe
+squeezes explicitly and asserts the shape.
+
+**Bug found by running the new gate** (§2.7's sixth): without
 `--continue_on_error`, a failing stage re-raised out of `run_pipeline.py`'s
 `main()` *before the report was ever written* — so the `status="failed"`
 record `run_stage` had just built was lost to the traceback, and any
@@ -328,8 +357,9 @@ write. This affected every stage, not just the new gate.
 **What was actually executed for these** (same sandbox: no GPU, no CUDA
 extension, no capture data):
 
-- Full suite 63 passed. Every new guard was mutation-checked rather than just
-  asserted: vertically flipping the baked atlas fails the UV-convention test;
+- Full suite 67 passed. Every new guard was mutation-checked rather than just
+  asserted: removing the depth-map squeeze/ndim guard fails its test;
+  vertically flipping the baked atlas fails the UV-convention test;
   removing the seam-fill edge-blanking fails the wrap test; calling
   `compute_uvatlas` on the non-manifold test mesh without the guard dies with
   SIGSEGV; reverting the `try`/`finally` fails the report-on-failure test;
@@ -455,11 +485,13 @@ work is.
   (e.g. baking at a canonical appearance embedding) is unexplored. Needs a
   GPU and a real `--app_opt` checkpoint to evaluate, so it is effectively
   blocked alongside §5.1.
-- **Real-world AI-prior recipes.** The Depth Anything V2 and Mask R-CNN
-  recipes in the docs are illustrative, tested only for API correctness
-  against their respective libraries' documented interfaces — not run
-  end-to-end against real images in this sandbox (no GPU). Worth a real
-  pass once hardware is available.
+- **Real-world AI-prior recipes — partially done (§2.9).** The Mask R-CNN
+  recipe's full API path has now been executed and its output format pinned by
+  a test, and verifying the depth recipe turned up a real silent-corruption
+  bug. What remains needs weights this environment cannot fetch (the network
+  policy denies non-registry hosts): running either recipe against a real
+  model on real images, and confirming the depth prior actually improves a
+  trained result. Do this together with the §5.1 GPU run.
 - **UV-atlas polish, once a real capture has been through it.** `--texture_size`
   defaults to 2048 and the seam dilation to 4 texels; neither has been tuned
   against a real scene. Multi-material output (one atlas per chart group) and
