@@ -11,6 +11,13 @@ It is the handoff document: what has been built, what was actually executed
 versus verified by code review only, what's blocked, and what to do next. Its
 "START HERE" section says exactly how to pick it up.
 
+There is active in-progress work with an approved plan:
+[`docs/photogrammetry_texturing_plan.md`](docs/photogrammetry_texturing_plan.md)
+— per-face view selection + seam levelling for sharp texturing. Its status
+table says which steps are landed and which to start from. **Read its
+"Premise, measured" section before writing any test for it**: the obvious
+success metric is the wrong one, and the naive test fails.
+
 Feature documentation (how to *use* the pipeline) lives separately in
 [`docs/photogrammetry.md`](docs/photogrammetry.md).
 

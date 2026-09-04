@@ -19,11 +19,17 @@
    ```bash
    python -m pytest tests/test_bundle_adjustment.py tests/test_mesh_extraction.py \
        tests/test_neural_sfm.py tests/test_colmap_dataset.py \
-       tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -q
+       tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
+       tests/test_texturing.py -q
    ```
-   Expect **85 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **98 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
-4. **Then start from §5.1.** As of the latest session all three §5.1 items
+4. **If you are picking up the texturing work**, its approved plan is
+   [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md) —
+   a status table of which steps are landed, the measured premise that dictates
+   the success metric, and the exact remaining design. Start from the step its
+   table marks "next".
+5. **Otherwise start from §5.1.** As of the latest session all three §5.1 items
    are still blocked (re-verified, see §4) — Actions is still off, the PR is
    still an unreviewed draft, and the sandbox still has no GPU/CUDA/`colmap`/
    capture data. Re-check them first anyway, then continue down §5.2.
@@ -237,7 +243,8 @@ just re-asserting the buggy behavior):
 | `tests/test_colmap_dataset.py` | 14 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 9 | Geometry metrics against known analytic ground truth |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
-| **Total** | **85** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| `tests/test_texturing.py` | 13 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, and the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape |
+| **Total** | **98** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -664,6 +671,8 @@ New:
   tests/test_photogrammetry_pipeline.py
   docs/photogrammetry.md
   docs/photogrammetry_status.md    (this file)
+  docs/photogrammetry_texturing_plan.md  (approved plan for the in-progress
+                                      view-selection texturing work)
   docs/source/apis/photogrammetry.rst
   docs/source/examples/photogrammetry.rst
 
@@ -693,7 +702,8 @@ gh pr view 3 --repo Cyruskraad/gsplat   # or open the URL above
 cd gsplat
 python -m pytest tests/test_bundle_adjustment.py tests/test_mesh_extraction.py \
     tests/test_neural_sfm.py tests/test_colmap_dataset.py \
-    tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -v
+    tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
+    tests/test_texturing.py -v
 
 # Try the one-command pipeline against a real capture. --strict now also
 # fails the run if the AI-prior directories look unusable (see 2.9).
