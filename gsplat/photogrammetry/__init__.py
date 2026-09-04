@@ -22,13 +22,15 @@ This package closes the SfM -> dense MVS -> Gaussian Splatting -> mesh loop:
   reprojection error over the SfM point tracks.
 - :mod:`gsplat.photogrammetry.dense_mvs` - densifies the sparse COLMAP point
   cloud via COLMAP's own patch-match stereo + fusion pipeline.
-- :mod:`gsplat.photogrammetry.mesh_extraction` - extracts a cleaned, colored
-  triangle mesh from a trained 2DGS/3DGS scene (TSDF fusion of rendered
-  depth/normal maps, or Poisson reconstruction from a dense point cloud), with
-  texture baking from the training images -- either per-vertex colors or a
-  UV-unwrapped texture atlas -- plus quadric decimation to a triangle
-  budget plus normal-map and ambient-occlusion baking, the standard
-  photogrammetry delivery path (dense scan -> low-poly mesh + maps).
+- :mod:`gsplat.photogrammetry.mesh_extraction` - extracts a cleaned triangle
+  mesh from a trained 2DGS/3DGS scene (TSDF fusion of rendered depth/normal
+  maps, or Poisson reconstruction from a dense point cloud), and decimates it
+  to a triangle budget.
+- :mod:`gsplat.photogrammetry.texturing` - dresses that surface from the
+  training images: per-vertex colors or a UV-unwrapped atlas (with optional
+  robust multi-view fusion), plus normal-map and ambient-occlusion baking on
+  one shared UV layout -- the standard photogrammetry delivery path
+  (dense scan -> low-poly mesh + maps).
 - :mod:`gsplat.photogrammetry.neural_sfm` - imports feed-forward neural-SfM
   output (DUSt3R/MASt3R/VGGT-style, run externally) as a COLMAP model, so it
   becomes a drop-in alternative to COLMAP for the rest of the pipeline.
@@ -52,16 +54,7 @@ requires the ``colmap`` command-line tool (built with CUDA support) on
 
 from .bundle_adjustment import refine_reconstruction
 from .dense_mvs import run_dense_mvs
-from .mesh_extraction import (
-    bake_ambient_occlusion,
-    bake_mesh_texture,
-    bake_normal_map,
-    bake_texture,
-    bake_texture_atlas,
-    extract_mesh_poisson,
-    extract_mesh_tsdf,
-    simplify_mesh,
-)
+from .mesh_extraction import extract_mesh_poisson, extract_mesh_tsdf, simplify_mesh
 from .metrics import (
     depth_prior_stats,
     mask_coverage_stats,
@@ -70,6 +63,13 @@ from .metrics import (
     point_to_mesh_distance,
     reconstruction_stats,
     track_stats,
+)
+from .texturing import (
+    bake_ambient_occlusion,
+    bake_mesh_texture,
+    bake_normal_map,
+    bake_texture,
+    bake_texture_atlas,
 )
 from .neural_sfm import merge_point_maps_to_tracks, write_colmap_reconstruction
 from .pipeline import (

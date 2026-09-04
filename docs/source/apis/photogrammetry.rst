@@ -29,8 +29,13 @@ Mesh Extraction
 ------------------
 
 .. automodule:: gsplat.photogrammetry.mesh_extraction
-   :members: extract_mesh_tsdf, extract_mesh_poisson, bake_texture,
-             bake_texture_atlas, bake_mesh_texture, simplify_mesh,
+   :members: extract_mesh_tsdf, extract_mesh_poisson, simplify_mesh
+
+Texturing
+------------------
+
+.. automodule:: gsplat.photogrammetry.texturing
+   :members: bake_texture, bake_texture_atlas, bake_mesh_texture,
              bake_normal_map, bake_ambient_occlusion
 
 Neural SfM Import

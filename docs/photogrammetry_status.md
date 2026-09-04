@@ -255,6 +255,21 @@ executions, not just `--help`:
 
 ---
 
+### 2.11 Module split: extraction vs. texturing
+
+`mesh_extraction.py` had grown to 1431 lines holding two unrelated jobs.
+Texturing moved to `gsplat/photogrammetry/texturing.py` (view sampling, the UV
+atlas, normal/AO baking); `mesh_extraction.py` keeps surface reconstruction and
+decimation; the shared open3d guard went to a tiny `_open3d.py` so neither
+module has to depend on the other. `mesh_extraction.py` re-exports the moved
+names, because the example CLIs and the test suite import bakers from that
+path.
+
+Verified as a **pure move**, not just by the tests: an AST comparison of every
+top-level definition before and after reported 19 definitions before, 19 after,
+none missing, none added, **none changed**. The suite went 85 passed -> 85
+passed with no test file edited.
+
 ### 2.10 Decimation + normal-map baking (the delivery path)
 
 TSDF/Poisson extraction tessellates to the voxel grid rather than to the
@@ -628,6 +643,8 @@ work is.
 ```
 New:
   gsplat/photogrammetry/__init__.py
+  gsplat/photogrammetry/texturing.py
+  gsplat/photogrammetry/_open3d.py
   gsplat/photogrammetry/bundle_adjustment.py
   gsplat/photogrammetry/dense_mvs.py
   gsplat/photogrammetry/mesh_extraction.py
