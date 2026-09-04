@@ -369,6 +369,211 @@ def simplify_mesh(
     return simplified
 
 
+def _point_spacing(points: np.ndarray, k: int = 4, max_samples: int = 20000) -> float:
+    """Mean distance from a point to its ``k`` nearest neighbours in the cloud.
+
+    The cloud's own sampling scale, which is what makes a cloud-to-mesh
+    distance readable: a fit of 0.01 scene units means nothing on its own, but
+    measured against the spacing of the evidence it becomes a verdict. Same
+    quantity :func:`gsplat.photogrammetry.metrics.point_cloud_stats` reports,
+    computed here through open3d's own neighbour search so decimation does not
+    pull ``scikit-learn`` into the ``mesh`` extra.
+
+    Large clouds are subsampled to ``max_samples`` query points: this is a
+    density estimate, and averaging over twenty thousand neighbourhoods is
+    already far more than it needs.
+
+    Raises:
+        ValueError: If there are fewer than ``k + 1`` points, so no point has
+            ``k`` neighbours to average over.
+    """
+    o3d = _require_open3d()
+
+    points = np.asarray(points, dtype=np.float32)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points must have shape (P, 3), got {points.shape}")
+    if points.shape[0] < k + 1:
+        raise ValueError(
+            f"Need at least {k + 1} points to measure {k}-nearest-neighbour "
+            f"spacing, got {points.shape[0]}."
+        )
+
+    search = o3d.core.nns.NearestNeighborSearch(o3d.core.Tensor(points))
+    search.knn_index()
+    queries = points
+    if points.shape[0] > max_samples:
+        stride = points.shape[0] // max_samples
+        queries = points[::stride][:max_samples]
+    # k + 1 because the nearest neighbour of a query drawn from the cloud is
+    # itself, at distance zero.
+    _indices, squared = search.knn_search(o3d.core.Tensor(queries), k + 1)
+    distances = np.sqrt(np.maximum(squared.numpy(), 0.0))
+    return float(distances[:, 1:].mean())
+
+
+def simplify_mesh_to_error(
+    mesh,
+    points: np.ndarray,
+    max_error: Optional[float] = None,
+    error_over_spacing: Optional[float] = None,
+    min_triangles: int = 4,
+    max_probes: int = 16,
+    boundary_weight: float = 1.0,
+):
+    """Decimate as far as a **fit target** allows, rather than to a triangle count.
+
+    :func:`simplify_mesh` takes a triangle budget, which is the wrong question
+    to have to answer: how many triangles a scene needs depends on the scene,
+    and picking the number is guesswork that is only checked afterwards -- by
+    measuring the cloud-to-mesh fit, which is the thing actually cared about.
+    This inverts that. Give it the fit you are willing to accept and it finds
+    the smallest mesh that still delivers it, by binary search over the
+    triangle count, measuring
+    :func:`gsplat.photogrammetry.metrics.point_to_mesh_distance` at each probe.
+
+    The target is best given as ``error_over_spacing``: cloud-to-mesh distance
+    measured **in units of the cloud's own k-NN spacing**, the same scale-free
+    reading as the pipeline's ``mesh_fit_over_point_spacing``. At or below ~1
+    the mesh tracks the cloud to within its sampling noise, and that means the
+    same thing on a tabletop scan and on a city block.
+
+    **The returned mesh is always one whose error was measured**, not one the
+    search assumed was fine. Quadric decimation is only *roughly* monotone in
+    the triangle count -- collapsing a different edge order can find a slightly
+    better fit with fewer triangles -- so a binary search's final bracket is
+    not itself a guarantee, and the decimator does not always land on the
+    triangle count it was asked for. If no probe met the target, the input
+    comes back unchanged with ``target_met`` False.
+
+    Among the probes that *did* meet it, the one with the fewest triangles is
+    returned. That part is about not handing back a needlessly large mesh
+    rather than about correctness -- every candidate considered is feasible by
+    measurement -- and on well-behaved input it picks the same mesh the last
+    feasible probe would have.
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``.
+        points: ``(P, 3)`` reference cloud -- the dense MVS or sparse SfM cloud
+            the mesh was built from, the same one
+            :func:`~gsplat.photogrammetry.metrics.point_to_mesh_distance` is
+            measured against elsewhere.
+        max_error: Fit target in scene units. Exactly one of this and
+            ``error_over_spacing`` must be given.
+        error_over_spacing: Fit target as a multiple of the cloud's own mean
+            k-NN spacing (see :func:`_point_spacing`).
+        min_triangles: Never decimate below this.
+        max_probes: Cap on decimate-and-measure rounds. 16 resolves a
+            million-triangle mesh to within ~15 triangles.
+        boundary_weight: Passed to :func:`simplify_mesh`.
+
+    Returns:
+        ``(mesh, stats)``. ``stats`` reports ``triangles_before``/
+        ``triangles_after``/``reduction``, ``error_before``/``error_after``,
+        the resolved ``max_error`` (and ``point_spacing``/``error_over_spacing``
+        when that route was used), ``num_probes``, ``target_met``, and
+        ``probes`` -- every (triangles, error) pair measured, so a caller can
+        see the curve rather than just the answer.
+
+    Raises:
+        ValueError: If neither or both targets are given, if the target is not
+            positive, if ``mesh`` has no triangles, or if ``points`` is empty
+            (there is nothing to measure the fit against).
+    """
+    from .metrics import point_to_mesh_distance
+
+    _require_open3d()
+
+    if (max_error is None) == (error_over_spacing is None):
+        raise ValueError(
+            "Give exactly one of max_error (scene units) or error_over_spacing "
+            "(multiples of the cloud's own k-NN spacing)."
+        )
+    points = np.asarray(points)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points must have shape (P, 3), got {points.shape}")
+    if points.shape[0] == 0:
+        raise ValueError(
+            "Cannot decimate to a fit target against an empty point cloud: "
+            "there is nothing to measure the fit against. Pass the dense or "
+            "sparse cloud the mesh was reconstructed from."
+        )
+    if len(mesh.triangles) == 0:
+        raise ValueError("Cannot decimate a mesh with no triangles.")
+
+    spacing = None
+    if error_over_spacing is not None:
+        if error_over_spacing <= 0:
+            raise ValueError(
+                f"error_over_spacing must be positive, got {error_over_spacing}."
+            )
+        spacing = _point_spacing(points)
+        max_error = error_over_spacing * spacing
+    elif max_error <= 0:
+        raise ValueError(f"max_error must be positive, got {max_error}.")
+
+    triangles_before = len(mesh.triangles)
+    error_before = point_to_mesh_distance(points, mesh)["mean"]
+
+    stats = {
+        "triangles_before": int(triangles_before),
+        "triangles_after": int(triangles_before),
+        "reduction": 0.0,
+        "error_before": float(error_before),
+        "error_after": float(error_before),
+        "max_error": float(max_error),
+        "point_spacing": spacing,
+        "error_over_spacing": error_over_spacing,
+        "num_probes": 0,
+        "target_met": bool(error_before <= max_error),
+        "probes": [],
+    }
+    if error_before > max_error:
+        # Decimation can only move the surface further from the cloud, so
+        # there is no mesh below this one that meets the target. Say so
+        # instead of returning a mesh that silently misses it.
+        return mesh, stats
+    if triangles_before <= min_triangles:
+        return mesh, stats
+
+    best_mesh, best_triangles = None, None
+    low, high = min_triangles, triangles_before
+    for _ in range(max_probes):
+        if low > high:
+            break
+        target = (low + high) // 2
+        if target >= triangles_before:
+            break
+        candidate = simplify_mesh(
+            mesh, target_triangles=max(target, 1), boundary_weight=boundary_weight
+        )
+        if len(candidate.triangles) == 0:
+            low = target + 1
+            continue
+        error = point_to_mesh_distance(points, candidate)["mean"]
+        actual = len(candidate.triangles)
+        stats["probes"].append({"triangles": int(actual), "error": float(error)})
+        if error <= max_error:
+            # Feasible. Keep it if it is the smallest that has worked, and
+            # keep looking further down.
+            if best_triangles is None or actual < best_triangles:
+                best_mesh, best_triangles = candidate, actual
+            high = min(target, actual) - 1
+        else:
+            low = target + 1
+    stats["num_probes"] = len(stats["probes"])
+
+    if best_mesh is None:
+        return mesh, stats
+
+    stats["triangles_after"] = int(best_triangles)
+    stats["reduction"] = 1.0 - (best_triangles / triangles_before)
+    stats["error_after"] = float(
+        next(p["error"] for p in stats["probes"] if p["triangles"] == best_triangles)
+    )
+    stats["target_met"] = True
+    return best_mesh, stats
+
+
 # Texturing moved to gsplat.photogrammetry.texturing when this module outgrew
 # holding both. Re-exported here so existing imports keep resolving -- the
 # example CLIs and the test suite both import bakers from this path.

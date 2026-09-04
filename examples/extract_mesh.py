@@ -51,6 +51,7 @@ from gsplat.photogrammetry.mesh_extraction import (
     extract_mesh_poisson,
     extract_mesh_tsdf,
     simplify_mesh,
+    simplify_mesh_to_error,
 )
 from gsplat.photogrammetry.metrics import mesh_quality_stats, point_to_mesh_distance
 
@@ -129,6 +130,15 @@ class Config:
     # the voxel grid rather than to the scene's complexity, so this is usually
     # a large reduction. Combine with --normal_map to keep the detail.
     target_triangles: Optional[int] = None
+    # Decimate to a *fit target* instead of a triangle count: the cloud-to-mesh
+    # distance you are willing to accept, in units of the reference cloud's own
+    # k-NN spacing (the same scale-free reading as the pipeline report's
+    # `mesh_fit_over_point_spacing`). 1.0 means "stay within the cloud's own
+    # sampling noise"; 2-4 gives a much lighter mesh for a viewer. Usually the
+    # better question to answer than a triangle budget, since how many
+    # triangles a scene needs depends on the scene. Mutually exclusive with
+    # --target_triangles.
+    target_fit_ratio: Optional[float] = None
     # Bake the pre-decimation mesh's normals into a normal map on the textured
     # mesh's UV atlas, so the decimated mesh still shades like the dense one.
     # Requires --texture_mode atlas. Writes mesh_normal.png next to mesh.obj.
@@ -199,11 +209,52 @@ def main(cfg: Config) -> None:
             "colors have nothing to select a view for."
         )
 
+    if cfg.target_triangles is not None and cfg.target_fit_ratio is not None:
+        raise ValueError(
+            "--target_triangles and --target_fit_ratio are two ways of asking "
+            "the same question (how small a mesh?) and disagree about the "
+            "answer. Pass one: a triangle budget, or the cloud-to-mesh fit you "
+            "will accept."
+        )
+
     # Decimate before texturing, so the atlas is built on the mesh that ships.
     # Keep the dense mesh: it is what --normal_map bakes detail from.
     dense_mesh = mesh
     decimation_stats = None
-    if cfg.target_triangles is not None:
+    if cfg.target_fit_ratio is not None:
+        if len(mesh.triangles) == 0:
+            print(
+                "[extract_mesh] WARNING: nothing to decimate -- the extracted "
+                "mesh has no triangles."
+            )
+        else:
+            mesh, decimation_stats = simplify_mesh_to_error(
+                mesh, reference_points, error_over_spacing=cfg.target_fit_ratio
+            )
+            print(
+                f"[extract_mesh] decimated {decimation_stats['triangles_before']}"
+                f" -> {decimation_stats['triangles_after']} triangles "
+                f"({decimation_stats['reduction']:.1%} fewer) in "
+                f"{decimation_stats['num_probes']} probes; cloud-to-mesh "
+                f"{decimation_stats['error_before']:.5g} -> "
+                f"{decimation_stats['error_after']:.5g} against a budget of "
+                f"{decimation_stats['max_error']:.5g} "
+                f"({cfg.target_fit_ratio} x the cloud's "
+                f"{decimation_stats['point_spacing']:.5g} spacing)"
+            )
+            if not decimation_stats["target_met"]:
+                warnings.warn(
+                    "The mesh already misses --target_fit_ratio before any "
+                    f"decimation (cloud-to-mesh "
+                    f"{decimation_stats['error_before']:.5g} > "
+                    f"{decimation_stats['max_error']:.5g}), so it was left "
+                    "alone -- decimating can only move it further from the "
+                    "cloud. Either the extraction is a poor fit (check "
+                    "--voxel_size / --poisson_depth) or the target is tighter "
+                    "than this reconstruction can be.",
+                    RuntimeWarning,
+                )
+    elif cfg.target_triangles is not None:
         before = len(mesh.triangles)
         mesh = simplify_mesh(mesh, target_triangles=cfg.target_triangles)
         after = len(mesh.triangles)

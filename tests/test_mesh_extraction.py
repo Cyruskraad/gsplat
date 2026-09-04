@@ -1013,3 +1013,155 @@ def test_outlier_clipping_keeps_sparsely_observed_points():
         mesh, dataset, points, normals, outlier_sigma=0.01
     )
     assert (clipped_weight[plain_weight > 0] > 0).all()
+
+
+# ---------------------------------------------------------------------------
+# Decimation to a fit target, rather than to a triangle count
+# ---------------------------------------------------------------------------
+
+
+def _sphere_cloud(num_points=20000, seed=0):
+    """Points exactly on the unit sphere -- the fit's analytic ground truth."""
+    rng = np.random.default_rng(seed)
+    points = rng.normal(size=(num_points, 3))
+    return points / np.linalg.norm(points, axis=1, keepdims=True)
+
+
+def test_point_spacing_matches_a_grid_of_known_spacing():
+    """A cubic grid's k-NN spacing is known in closed form.
+
+    For k=4 on a grid of pitch `s`, every interior, face and edge point has at
+    least four neighbours at exactly `s`; only the eight corners reach further,
+    to `sqrt(2)*s`. So the mean over the whole grid is pinned between `s` and
+    `(3 + sqrt(2))/4 * s` -- checkable without reference to the implementation.
+    """
+    from gsplat.photogrammetry.mesh_extraction import _point_spacing
+
+    pitch = 0.37
+    axis = np.arange(10) * pitch
+    grid = np.stack(np.meshgrid(axis, axis, axis, indexing="ij"), axis=-1)
+    points = grid.reshape(-1, 3)
+
+    spacing = _point_spacing(points)
+    assert pitch <= spacing <= (3.0 + np.sqrt(2.0)) / 4.0 * pitch, spacing
+    # Corners are 8 of 1000 points, so the mean sits very near the pitch.
+    assert spacing == pytest.approx(pitch, rel=0.01)
+
+    # Exactly linear in scale: a cloud twice as spread out is twice as coarse.
+    assert _point_spacing(points * 3.0) == pytest.approx(3.0 * spacing)
+
+
+def test_point_spacing_rejects_a_cloud_too_small_to_measure():
+    from gsplat.photogrammetry.mesh_extraction import _point_spacing
+
+    with pytest.raises(ValueError, match="at least 5 points"):
+        _point_spacing(np.zeros((3, 3)))
+
+
+def test_simplify_to_error_trades_triangles_for_fit_monotonically():
+    """A looser fit target must buy a smaller mesh, and the target must hold.
+
+    Ground truth is analytic: the reference cloud lies exactly on the unit
+    sphere, so cloud-to-mesh distance is the mesh's true deviation from the
+    sphere, not an artifact of a noisy reference.
+    """
+    from gsplat.photogrammetry.mesh_extraction import simplify_mesh_to_error
+    from gsplat.photogrammetry.metrics import point_to_mesh_distance
+
+    points = _sphere_cloud()
+    dense = _unit_sphere_mesh(resolution=40)
+
+    results = {}
+    for ratio in (0.25, 1.0, 4.0):
+        mesh, stats = simplify_mesh_to_error(dense, points, error_over_spacing=ratio)
+        results[ratio] = stats
+        assert stats["target_met"], stats
+        # The guarantee is about the *returned* mesh, so re-measure it here
+        # rather than trusting the search's own bookkeeping. Quadric
+        # decimation is only roughly monotone in the triangle count, so a
+        # binary search's final bracket is not by itself a promise.
+        measured = point_to_mesh_distance(points, mesh)["mean"]
+        assert measured <= stats["max_error"], (measured, stats["max_error"])
+        assert measured == pytest.approx(stats["error_after"])
+        assert len(mesh.triangles) == stats["triangles_after"]
+
+    counts = [results[r]["triangles_after"] for r in (0.25, 1.0, 4.0)]
+    assert counts == sorted(counts, reverse=True), counts
+    # Premise: the targets must actually separate, or the ordering above is
+    # satisfied trivially by three identical meshes.
+    assert counts[0] > 2 * counts[-1], counts
+    # And the whole point: a loose target is a large reduction.
+    assert results[4.0]["reduction"] > 0.9, results[4.0]["reduction"]
+
+
+def test_simplify_to_error_leaves_a_mesh_that_already_misses_the_target():
+    """Decimating can only move the surface further from the cloud.
+
+    So a target the input mesh already misses has no solution below it, and
+    the honest answer is the input back with `target_met` False -- not a
+    smaller mesh that quietly misses it by more.
+    """
+    from gsplat.photogrammetry.mesh_extraction import simplify_mesh_to_error
+
+    points = _sphere_cloud()
+    dense = _unit_sphere_mesh(resolution=20)
+
+    mesh, stats = simplify_mesh_to_error(dense, points, max_error=1e-9)
+    assert mesh is dense
+    assert stats["target_met"] is False
+    assert stats["triangles_after"] == stats["triangles_before"]
+    assert stats["reduction"] == 0.0
+    assert stats["num_probes"] == 0
+    # Premise: the input really does miss this target, so nothing above is
+    # about an unreachable code path.
+    assert stats["error_before"] > 1e-9
+
+
+def test_simplify_to_error_agrees_whichever_way_the_target_is_given():
+    """`error_over_spacing` is just `max_error` in units of the cloud."""
+    from gsplat.photogrammetry.mesh_extraction import (
+        _point_spacing,
+        simplify_mesh_to_error,
+    )
+
+    points = _sphere_cloud()
+    dense = _unit_sphere_mesh(resolution=30)
+    spacing = _point_spacing(points)
+
+    by_ratio, ratio_stats = simplify_mesh_to_error(
+        dense, points, error_over_spacing=2.0
+    )
+    by_error, error_stats = simplify_mesh_to_error(
+        dense, points, max_error=2.0 * spacing
+    )
+    assert ratio_stats["max_error"] == pytest.approx(error_stats["max_error"])
+    assert ratio_stats["triangles_after"] == error_stats["triangles_after"]
+    np.testing.assert_allclose(
+        np.asarray(by_ratio.vertices), np.asarray(by_error.vertices)
+    )
+    # The ratio route reports the spacing it resolved against; the absolute
+    # route has no cloud scale to report and says so rather than inventing one.
+    assert ratio_stats["point_spacing"] == pytest.approx(spacing)
+    assert error_stats["point_spacing"] is None
+
+
+def test_simplify_to_error_rejects_ambiguous_or_unmeasurable_input():
+    o3d = pytest.importorskip("open3d")
+
+    from gsplat.photogrammetry.mesh_extraction import simplify_mesh_to_error
+
+    mesh = _unit_sphere_mesh(resolution=6)
+    points = _sphere_cloud(num_points=500)
+
+    with pytest.raises(ValueError, match="exactly one"):
+        simplify_mesh_to_error(mesh, points)
+    with pytest.raises(ValueError, match="exactly one"):
+        simplify_mesh_to_error(mesh, points, max_error=0.1, error_over_spacing=1.0)
+    with pytest.raises(ValueError, match="must be positive"):
+        simplify_mesh_to_error(mesh, points, max_error=0.0)
+    with pytest.raises(ValueError, match="must be positive"):
+        simplify_mesh_to_error(mesh, points, error_over_spacing=-1.0)
+    with pytest.raises(ValueError, match="nothing to measure the fit against"):
+        simplify_mesh_to_error(mesh, np.zeros((0, 3)), max_error=0.1)
+    with pytest.raises(ValueError, match="no triangles"):
+        simplify_mesh_to_error(o3d.geometry.TriangleMesh(), points, max_error=0.1)

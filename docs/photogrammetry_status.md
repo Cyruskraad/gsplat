@@ -22,7 +22,7 @@
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
        tests/test_texturing.py -q
    ```
-   Expect **115 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **121 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Before touching the texturing code**, read
    [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md). All
@@ -242,13 +242,13 @@ that surfaced them is (sixth §2.4, seventh §2.2, eighth/ninth §2.3, tenth
 | Test file | Count | Covers |
 |---|---|---|
 | `tests/test_bundle_adjustment.py` | 3 | Pure-torch optimization core (no pycolmap needed) |
-| `tests/test_mesh_extraction.py` | 23 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
+| `tests/test_mesh_extraction.py` | 29 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9); decimation to a fit target, with the k-NN spacing checked against a grid of known pitch (see §2.13) |
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
 | `tests/test_colmap_dataset.py` | 13 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 14 | Geometry metrics against known analytic ground truth, plus `atlas_sharpness` (detail ordering, chart-border exclusion, empty/uint8 handling) |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
 | `tests/test_texturing.py` | 25 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12; and seam levelling — the conjugate-gradient solver against a dense solve, shared-edge recovery, and that levelling closes the exposure steps without introducing a colour cast |
-| **Total** | **115** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| **Total** | **121** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -387,6 +387,49 @@ a test. Seam discontinuity on the shipped asset: 0.262 → 0.090.
 **Reviewed only:** the `--texture_view_selection` /
 `--texture_seam_smoothness` CLI guards and warnings, which need a real
 checkpoint to reach.
+
+### 2.13 Decimation to a fit target (§5.2 follow-on)
+
+`simplify_mesh` takes a triangle budget, which is the wrong question to have to
+answer: how many triangles a scene needs depends on the scene, and the number
+is only checked *afterwards* by measuring the cloud-to-mesh fit — the thing
+actually cared about. `simplify_mesh_to_error` inverts it: give it the fit you
+will accept and it binary-searches the triangle count, decimating and
+re-measuring `point_to_mesh_distance` at each probe.
+
+The target is given scale-free, as a multiple of the reference cloud's own mean
+k-NN spacing — the same reading as the report's `mesh_fit_over_point_spacing`,
+so "1.0" means the same thing on a tabletop scan and a city block. Measured on
+an analytic sphere with a 20k-point reference cloud: ratio 0.25 → 1184
+triangles (81% fewer), 1.0 → 142 (98%), 4.0 → 24 (99.6%), each independently
+re-measured within its budget.
+
+Two decisions worth keeping:
+
+- **The mesh returned is one whose error was measured**, not one the search's
+  final bracket implied was fine — quadric decimation is only *roughly*
+  monotone in the triangle count and does not always land on the count it was
+  asked for. Returning the *smallest* feasible probe rather than the last one
+  is an optimality refinement, not a correctness guard (every candidate is
+  feasible by measurement), and is **not mutation-checked**: on well-behaved
+  input the two coincide, and no synthetic scene here separates them.
+- **A target the input already misses has no solution below it**, since
+  decimating only moves the surface further from the cloud. The input comes
+  back unchanged with `target_met: false` and the CLI warns, rather than
+  handing back a smaller mesh that misses by more.
+
+The k-NN spacing is computed through open3d's own vectorised
+`core.nns.NearestNeighborSearch` rather than `point_cloud_stats`'s
+`scikit-learn`, so this does not pull a new hard dependency into the `mesh`
+extra. Large clouds are subsampled to 20k query points — it is a density
+estimate, and twenty thousand neighbourhoods is already far more than it needs.
+
+**Executed:** the sweep above; four mutations checked (return an unmeasured
+over-decimated mesh, decimate anyway when the input already misses the target,
+include the self-match in the k-NN average, drop the empty-cloud guard) — each
+fails a test. **Reviewed only:** the `--target_fit_ratio` / `--target_triangles`
+mutual-exclusion guard and the miss warning, which need a real checkpoint to
+reach.
 
 ### 2.10 Decimation + normal-map baking (the delivery path)
 
@@ -739,10 +782,8 @@ work is.
   against a real scene. Multi-material output (one atlas per chart group), a
   non-square atlas, and 16-bit normal maps (past the 8-bit ~0.004 floor) are
   unimplemented.
-- **Decimation driven by a quality target rather than a triangle count.**
-  `simplify_mesh` takes a triangle budget; choosing that budget from a target
-  cloud-to-mesh error (decimate until the fit degrades past a threshold) would
-  be a better interface, and all the measurement pieces already exist.
+- ~~**Decimation driven by a quality target rather than a triangle count.**~~
+  Done — `simplify_mesh_to_error` / `--target_fit_ratio`, see §2.13.
 
 ### 5.3 Explicitly out of scope (by design, not oversight)
 - gsplat will **never** bundle code that runs a neural network itself for

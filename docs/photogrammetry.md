@@ -271,7 +271,52 @@ python examples/extract_mesh.py \
 `--target_triangles` decimates via Garland & Heckbert quadric error metrics
 (collapsing the cheapest edges first, so flat regions lose triangles and
 detailed ones keep them), and `--normal_map` bakes the *pre-decimation* mesh's
-normals onto the decimated mesh's UV atlas. The result is
+normals onto the decimated mesh's UV atlas.
+
+##### Decimating to a fit target instead of a triangle count
+
+A triangle budget is the wrong question to have to answer: how many triangles a
+scene needs depends on the scene, and the number is only checked *afterwards*,
+by measuring the cloud-to-mesh fit — which is the thing actually cared about.
+`--target_fit_ratio` inverts that. Give it the fit you are willing to accept
+and it finds the smallest mesh that still delivers it:
+
+```bash
+python examples/extract_mesh.py --ckpt ... --data_dir ... --result_dir ...     --texture_mode atlas --target_fit_ratio 1.0 --normal_map
+```
+
+The target is scale-free — cloud-to-mesh distance measured **in units of the
+reference cloud's own k-NN spacing**, the same reading as the pipeline report's
+`mesh_fit_over_point_spacing`. At or below ~1 the mesh tracks the cloud to
+within its own sampling noise, and that means the same thing on a tabletop scan
+and on a city block. On an analytic sphere with a 20k-point reference cloud:
+
+| `--target_fit_ratio` | triangles | reduction |
+|---|---|---|
+| 0.25 | 1184 | 81% |
+| 1.0 | 142 | 98% |
+| 4.0 | 24 | 99.6% |
+
+It works by binary search over the triangle count, decimating and re-measuring
+at each probe (~12–16 probes resolves a million-triangle mesh). Two details
+matter:
+
+- **The mesh it returns is one whose error was measured**, not one the search
+  assumed was fine. Quadric decimation is only *roughly* monotone in the
+  triangle count and does not always land on the count it was asked for, so a
+  binary search's final bracket is not by itself a guarantee. Among the probes
+  that met the target, the smallest is returned — that part is about not
+  handing back a needlessly large mesh rather than about correctness, since
+  every candidate is feasible by measurement.
+- **A target the input mesh already misses has no solution**, since decimating
+  can only move the surface further from the cloud. The input comes back
+  unchanged with `target_met: false` and the CLI warns, rather than handing
+  back a smaller mesh that misses by more. That reads as either a poor
+  extraction (check `--voxel_size` / `--poisson_depth`) or a target tighter
+  than the reconstruction can be.
+
+`--target_triangles` and `--target_fit_ratio` are two ways of asking the same
+question and are rejected together. The result is
 `mesh.obj` + `mesh.mtl` + `mesh_0.png` (albedo) + `mesh_normal.png`, with the
 `.mtl` referencing both.
 
@@ -706,7 +751,11 @@ something gsplat ships.
   essentially 1.0 means nothing occluded anything — correct for a convex
   shape, and otherwise a sign the occlusion distance is too small.
 - `gsplat.photogrammetry.simplify_mesh(mesh, target_triangles=...)` returns a
-  quadric-decimated copy; `bake_normal_map(high_mesh, low_mesh,
+  quadric-decimated copy, and
+  `simplify_mesh_to_error(mesh, points, error_over_spacing=...)` returns
+  `(mesh, stats)` — the smallest decimation whose *measured* cloud-to-mesh fit
+  still meets the target, with every probe's (triangles, error) pair in
+  `stats["probes"]`; `bake_normal_map(high_mesh, low_mesh,
   texture_size=..., space="tangent"|"object")` returns
   `(low_mesh, normal_map, stats)`, baking the dense mesh's normals onto the
   decimated one's atlas (reusing its existing UVs when it has them).
