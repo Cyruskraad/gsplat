@@ -21,7 +21,7 @@
        tests/test_neural_sfm.py tests/test_colmap_dataset.py \
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -q
    ```
-   Expect **82 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **85 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Then start from §5.1.** As of the latest session all three §5.1 items
    are still blocked (re-verified, see §4) — Actions is still off, the PR is
@@ -232,12 +232,12 @@ just re-asserting the buggy behavior):
 | Test file | Count | Covers |
 |---|---|---|
 | `tests/test_bundle_adjustment.py` | 3 | Pure-torch optimization core (no pycolmap needed) |
-| `tests/test_mesh_extraction.py` | 20 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
+| `tests/test_mesh_extraction.py` | 23 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
 | `tests/test_colmap_dataset.py` | 14 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 9 | Geometry metrics against known analytic ground truth |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
-| **Total** | **82** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| **Total** | **85** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -277,6 +277,26 @@ loses detail) but decimate-and-bake, which this now implements:
   would otherwise ship unreferenced).
 - `_unwrap_and_rasterize` factors the unwrap + texel-frame rasterization out
   of `bake_texture_atlas`, so both bakes share one atlas construction.
+
+**Robust multi-view texture fusion.** Both bakes previously blended every
+view with a plain weighted mean, which on a real capture blurs and ghosts
+wherever views disagree. `outlier_sigma` (CLI `--texture_outlier_sigma`) adds
+iterative sigma clipping: discard observations far from a point's own mean,
+re-estimate from the survivors, repeat. **A single pass is not enough**, and
+this was worth measuring rather than assuming -- the bad samples inflate the
+spread they are measured against, so at 25% contamination they sit right at a
+1.5-sigma threshold and survive; the first implementation improved error by
+only 4%. Iterating fixes it. Measured 3x error reduction (0.045 -> 0.015) in
+the regime it is designed for, up to 9x with more views.
+
+**A test-model trap, again worth recording:** the first version of the test
+corrupted whole frames, which makes some surface points *majority*-wrong
+(contaminated weight fraction up to 0.94, measured). No estimator centred on
+the majority can recover those, so the feature looked broken when the test
+was. The test now uses a partial-frame occluder and asserts its own premise --
+that contamination is a per-point minority -- before measuring. The limitation
+is real and documented: robust fusion complements `--mask_dir`, it does not
+replace it.
 
 **Ambient occlusion** completes the map set: `bake_ambient_occlusion` casts
 `num_samples` cosine-weighted hemisphere rays per texel (Malley's method, so a

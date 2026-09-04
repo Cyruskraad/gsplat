@@ -331,56 +331,14 @@ def extract_mesh_poisson(
     return _clean_mesh(mesh)
 
 
-def _bake_points_from_views(
-    mesh,
-    dataset,
-    points: np.ndarray,
-    normals: np.ndarray,
-    max_views: Optional[int] = None,
-    chunk_size: int = 1 << 20,
-):
-    """Accumulate occlusion-aware, view-weighted colors for surface points.
+def _view_samples(scene, o3d, dataset, points, normals, max_views, chunk_size):
+    """Yield ``(indices, colors, weights)`` for every visible (point, view) pair.
 
-    Shared by :func:`bake_texture` (which bakes at mesh vertices) and
-    :func:`bake_texture_atlas` (which bakes at texel positions), so both
-    produce the same color signal and only differ in where they sample it.
-
-    For each point, projects into every (or up to ``max_views``) training
-    camera, discards out-of-frame projections and -- via ray casting against
-    ``mesh`` itself -- occluded ones, and accumulates the remaining observed
-    pixel colors weighted by view-direction/surface-normal alignment and
-    inverse distance.
-
-    Args:
-        mesh: The ``open3d.geometry.TriangleMesh`` to ray-cast against for
-            occlusion. ``points`` are expected to lie on its surface.
-        dataset: An ``examples.datasets.colmap.Dataset``-like object yielding
-            dicts with ``"camtoworld"`` (4, 4), ``"K"`` (3, 3), and ``"image"``
-            ((H, W, 3), values in [0, 255]).
-        points: (P, 3) surface points to bake.
-        normals: (P, 3) unit-length outward normals, one per point.
-        max_views: If given, only the first ``max_views`` dataset images are
-            used (for speed on large datasets).
-        chunk_size: Max points ray-cast at once, bounding peak memory when
-            baking the millions of texels a large atlas can contain.
-
-    Returns:
-        ``(color_accum, weight_accum)``: a (P, 3) sum of weighted colors and
-        the (P,) sum of weights. Points with ``weight_accum == 0`` were never
-        observed.
+    One pass over the dataset: project every point into each camera, drop the
+    out-of-frame ones, ray-cast away the occluded ones, and weight what is left
+    by view-direction/normal alignment and inverse distance. Factored out so a
+    robust estimator can run the same sampling twice without duplicating it.
     """
-    o3d = _require_open3d()
-
-    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(t_mesh)
-
-    num_points = points.shape[0]
-    color_accum = np.zeros((num_points, 3), dtype=np.float64)
-    weight_accum = np.zeros((num_points,), dtype=np.float64)
-    if num_points == 0:
-        return color_accum, weight_accum
-
     num_views = len(dataset) if max_views is None else min(max_views, len(dataset))
     for i in range(num_views):
         data = dataset[i]
@@ -427,16 +385,162 @@ def _bake_points_from_views(
             cos_weight = np.clip((normals[chunk] * -dirs_n).sum(-1), 0.0, 1.0)
             dist_weight = 1.0 / np.clip(dists, 1e-3, None)
             weight = cos_weight * dist_weight + 1e-6
-
-            # `chunk` indexes each point at most once per view, so a plain
-            # in-place add is correct (and much faster than np.add.at).
-            color_accum[chunk] += sampled * weight[:, None]
-            weight_accum[chunk] += weight
-
-    return color_accum, weight_accum
+            # `chunk` indexes each point at most once per view, so callers can
+            # use plain in-place adds rather than the much slower np.add.at.
+            yield chunk, sampled, weight
 
 
-def bake_texture(mesh, dataset, max_views: Optional[int] = None):
+def _bake_points_from_views(
+    mesh,
+    dataset,
+    points: np.ndarray,
+    normals: np.ndarray,
+    max_views: Optional[int] = None,
+    chunk_size: int = 1 << 20,
+    outlier_sigma: Optional[float] = None,
+    outlier_iterations: int = 3,
+    min_views_for_clipping: int = 3,
+):
+    """Accumulate occlusion-aware, view-weighted colors for surface points.
+
+    Shared by :func:`bake_texture` (which bakes at mesh vertices) and
+    :func:`bake_texture_atlas` (which bakes at texel positions), so both
+    produce the same color signal and only differ in where they sample it.
+
+    For each point, projects into every (or up to ``max_views``) training
+    camera, discards out-of-frame projections and -- via ray casting against
+    ``mesh`` itself -- occluded ones, and accumulates the remaining observed
+    pixel colors weighted by view-direction/surface-normal alignment and
+    inverse distance.
+
+    Args:
+        mesh: The ``open3d.geometry.TriangleMesh`` to ray-cast against for
+            occlusion. ``points`` are expected to lie on its surface.
+        dataset: An ``examples.datasets.colmap.Dataset``-like object yielding
+            dicts with ``"camtoworld"`` (4, 4), ``"K"`` (3, 3), and ``"image"``
+            ((H, W, 3), values in [0, 255]).
+        points: (P, 3) surface points to bake.
+        normals: (P, 3) unit-length outward normals, one per point.
+        max_views: If given, only the first ``max_views`` dataset images are
+            used (for speed on large datasets).
+        chunk_size: Max points ray-cast at once, bounding peak memory when
+            baking the millions of texels a large atlas can contain.
+        outlier_sigma: If set, discard observations further than this many
+            standard deviations from the point's own weighted mean color, then
+            re-average what survives. A plain mean is dragged by *any*
+            disagreement between views -- a pedestrian, a specular highlight, a
+            slightly misregistered camera -- and blends it into the texture as
+            ghosting.
+        outlier_iterations: How many times to re-estimate and re-clip. One pass
+            is weak, because the contaminated samples inflate the very spread
+            they are measured against: with a quarter of views wrong, the
+            outliers sit right at a 1.5-sigma threshold and mostly survive.
+            Each further round re-centres on the survivors, so the spread
+            shrinks and the outliers separate cleanly. Each round costs one
+            more sampling pass over the dataset.
+
+            **What this cannot do:** it only recovers points whose bad
+            observations are a *minority*. A surface hidden behind a
+            pedestrian in most of the views that see it has no majority to
+            fall back on, and clipping will happily converge on the
+            pedestrian. That case is what ``--mask_dir`` transient masking is
+            for; robust fusion is the complement, cleaning up the residual
+            disagreement -- specular highlights, slight misregistration, mask
+            leakage -- that masking does not catch.
+        min_views_for_clipping: Points observed by fewer views than this keep
+            their plain mean. With two or three samples a "spread" is noise,
+            and clipping against it would reject good data.
+
+    Returns:
+        ``(color_accum, weight_accum)``: a (P, 3) sum of weighted colors and
+        the (P,) sum of weights. Points with ``weight_accum == 0`` were never
+        observed.
+    """
+    o3d = _require_open3d()
+
+    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(t_mesh)
+
+    num_points = points.shape[0]
+    color_accum = np.zeros((num_points, 3), dtype=np.float64)
+    weight_accum = np.zeros((num_points,), dtype=np.float64)
+    if num_points == 0:
+        return color_accum, weight_accum
+
+    def stream():
+        return _view_samples(
+            scene, o3d, dataset, points, normals, max_views, chunk_size
+        )
+
+    square_accum = np.zeros((num_points, 3), dtype=np.float64)
+    view_counts = np.zeros((num_points,), dtype=np.int64)
+    for chunk, sampled, weight in stream():
+        color_accum[chunk] += sampled * weight[:, None]
+        weight_accum[chunk] += weight
+        if outlier_sigma is not None:
+            square_accum[chunk] += (sampled**2) * weight[:, None]
+            view_counts[chunk] += 1
+
+    if outlier_sigma is None:
+        return color_accum, weight_accum
+
+    seen = weight_accum > 0
+    sparse = view_counts < min_views_for_clipping
+
+    def estimate(sum_color, sum_weight, sum_square):
+        """Weighted mean and RGB-distance spread from running sums."""
+        ok = sum_weight > 0
+        mean = np.zeros_like(sum_color)
+        mean[ok] = sum_color[ok] / sum_weight[ok, None]
+        variance = np.zeros_like(sum_color)
+        variance[ok] = np.clip(
+            sum_square[ok] / sum_weight[ok, None] - mean[ok] ** 2, 0.0, None
+        )
+        # Scale the threshold the way the residual is measured (an RGB
+        # distance), floored at one 8-bit step so a uniformly-colored surface
+        # doesn't reject its own faultless samples as "outliers".
+        return mean, np.maximum(np.sqrt(variance.sum(axis=1)), 1.0 / 255.0)
+
+    mean, spread = estimate(color_accum, weight_accum, square_accum)
+    clipped_color, clipped_weight = color_accum, weight_accum
+
+    for _ in range(max(outlier_iterations, 1)):
+        round_color = np.zeros_like(color_accum)
+        round_weight = np.zeros_like(weight_accum)
+        round_square = np.zeros_like(square_accum)
+        for chunk, sampled, weight in stream():
+            residual = np.linalg.norm(sampled - mean[chunk], axis=1)
+            keep = sparse[chunk] | (residual <= outlier_sigma * spread[chunk])
+            if not keep.any():
+                continue
+            kept = chunk[keep]
+            kept_color = sampled[keep]
+            kept_weight = weight[keep]
+            round_color[kept] += kept_color * kept_weight[:, None]
+            round_weight[kept] += kept_weight
+            round_square[kept] += (kept_color**2) * kept_weight[:, None]
+
+        # A point whose every observation was rejected keeps what it had: an
+        # unshaded hole would be worse than a possibly-contaminated color.
+        emptied = (round_weight <= 0) & seen
+        round_color[emptied] = clipped_color[emptied]
+        round_weight[emptied] = clipped_weight[emptied]
+        round_square[emptied] = square_accum[emptied]
+
+        clipped_color, clipped_weight = round_color, round_weight
+        mean, spread = estimate(round_color, round_weight, round_square)
+
+    return clipped_color, clipped_weight
+
+
+def bake_texture(
+    mesh,
+    dataset,
+    max_views: Optional[int] = None,
+    outlier_sigma: Optional[float] = None,
+    outlier_iterations: int = 3,
+):
     """Bake per-vertex colors onto ``mesh`` from ``dataset``'s training images.
 
     Colors each mesh vertex by the occlusion-aware, view-weighted blend
@@ -455,6 +559,7 @@ def bake_texture(mesh, dataset, max_views: Optional[int] = None):
             ((H, W, 3), values in [0, 255]).
         max_views: If given, only the first ``max_views`` dataset images are
             used (for speed on large datasets).
+        outlier_sigma: Robust fusion -- see :func:`_bake_points_from_views`.
 
     Returns:
         ``mesh``, with ``vertex_colors`` set in place (and returned for
@@ -468,7 +573,13 @@ def bake_texture(mesh, dataset, max_views: Optional[int] = None):
     vertices = np.asarray(mesh.vertices)
     vertex_normals = np.asarray(mesh.vertex_normals)
     color_accum, weight_accum = _bake_points_from_views(
-        mesh, dataset, vertices, vertex_normals, max_views=max_views
+        mesh,
+        dataset,
+        vertices,
+        vertex_normals,
+        max_views=max_views,
+        outlier_sigma=outlier_sigma,
+        outlier_iterations=outlier_iterations,
     )
 
     has_color = weight_accum > 0
@@ -718,6 +829,8 @@ def bake_texture_atlas(
     dataset,
     texture_size: int = 2048,
     max_views: Optional[int] = None,
+    outlier_sigma: Optional[float] = None,
+    outlier_iterations: int = 3,
     unwrap_size: Optional[int] = None,
     gutter: float = 1.0,
     margin: float = 2.0,
@@ -753,6 +866,8 @@ def bake_texture_atlas(
         texture_size: Width/height of the (square) texture, in texels.
         max_views: If given, only the first ``max_views`` dataset images are
             used (for speed on large datasets).
+        outlier_sigma: Robust fusion -- see :func:`_bake_points_from_views`.
+            Worth enabling on any real capture, where views disagree.
         unwrap_size: Texture size assumed while unwrapping, which sets the
             scale ``gutter`` is measured against. Defaults to ``texture_size``.
         gutter: Space around each UV island, in texels, passed to
@@ -795,7 +910,13 @@ def bake_texture_atlas(
     filled = np.zeros((texture_size, texture_size), dtype=bool)
     if rows.size > 0:
         color_accum, weight_accum = _bake_points_from_views(
-            mesh, dataset, atlas.positions, atlas.normals, max_views=max_views
+            mesh,
+            dataset,
+            atlas.positions,
+            atlas.normals,
+            max_views=max_views,
+            outlier_sigma=outlier_sigma,
+            outlier_iterations=outlier_iterations,
         )
         observed = weight_accum > 0
         texture[rows[observed], cols[observed]] = (
@@ -820,6 +941,8 @@ def bake_mesh_texture(
     mode: str = "vertex",
     texture_size: int = 2048,
     max_views: Optional[int] = None,
+    outlier_sigma: Optional[float] = None,
+    outlier_iterations: int = 3,
     allow_atlas_fallback: bool = True,
 ):
     """Bake texture onto ``mesh`` in either supported form.
@@ -837,6 +960,7 @@ def bake_mesh_texture(
         texture_size: Atlas width/height in texels (``"atlas"`` mode only).
         max_views: If given, only the first ``max_views`` dataset images are
             used.
+        outlier_sigma: Robust fusion -- see :func:`_bake_points_from_views`.
         allow_atlas_fallback: In ``"atlas"`` mode, whether a mesh that can't be
             UV-unwrapped falls back to per-vertex colors (with a warning)
             instead of raising. Defaults to ``True``: this runs at the end of a
@@ -850,7 +974,16 @@ def bake_mesh_texture(
         ``.obj`` (a UV atlas needs one) or ``.ply``.
     """
     if mode == "vertex":
-        return bake_texture(mesh, dataset, max_views=max_views), None
+        return (
+            bake_texture(
+                mesh,
+                dataset,
+                max_views=max_views,
+                outlier_sigma=outlier_sigma,
+                outlier_iterations=outlier_iterations,
+            ),
+            None,
+        )
     if mode != "atlas":
         raise ValueError(
             f"Unknown texture mode {mode!r}, expected 'vertex' or 'atlas'."
@@ -858,7 +991,12 @@ def bake_mesh_texture(
 
     try:
         return bake_texture_atlas(
-            mesh, dataset, texture_size=texture_size, max_views=max_views
+            mesh,
+            dataset,
+            texture_size=texture_size,
+            max_views=max_views,
+            outlier_sigma=outlier_sigma,
+            outlier_iterations=outlier_iterations,
         )
     except ValueError as e:
         if not allow_atlas_fallback:
@@ -869,7 +1007,16 @@ def bake_mesh_texture(
             RuntimeWarning,
             stacklevel=2,
         )
-        return bake_texture(mesh, dataset, max_views=max_views), None
+        return (
+            bake_texture(
+                mesh,
+                dataset,
+                max_views=max_views,
+                outlier_sigma=outlier_sigma,
+                outlier_iterations=outlier_iterations,
+            ),
+            None,
+        )
 
 
 def simplify_mesh(

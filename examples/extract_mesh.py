@@ -97,6 +97,13 @@ class Config:
     texture_mode: Literal["vertex", "atlas"] = "vertex"
     # Atlas width/height in texels (--texture_mode atlas only).
     texture_size: int = 2048
+    # Robust multi-view fusion: discard observations more than this many
+    # standard deviations from a point's own mean colour before averaging, so
+    # a specular highlight or a slightly misregistered camera doesn't get
+    # blended into the texture as ghosting. 0 disables it (plain weighted
+    # mean). Only helps where the bad views are a per-point minority -- use
+    # --mask_dir for content that occludes a surface in most views.
+    texture_outlier_sigma: float = 0.0
     # Decimate the extracted mesh to roughly this many triangles before
     # texturing (quadric error metrics). TSDF/Poisson output is tessellated to
     # the voxel grid rather than to the scene's complexity, so this is usually
@@ -192,6 +199,9 @@ def main(cfg: Config) -> None:
             dataset,
             mode=cfg.texture_mode,
             texture_size=cfg.texture_size,
+            outlier_sigma=(
+                cfg.texture_outlier_sigma if cfg.texture_outlier_sigma > 0 else None
+            ),
         )
         if texture is not None:
             print(

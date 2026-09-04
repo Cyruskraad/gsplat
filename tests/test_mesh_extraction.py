@@ -822,3 +822,136 @@ def test_bake_ambient_occlusion_cages_rays_against_a_separate_occluder():
         cage=1e-4 * 2.0,
     )
     assert uncaged["mean_ao"] < 0.5, uncaged
+
+
+class _ContaminatedSphereDataset(_SphereDataset):
+    """`_SphereDataset` with a transient occluder over part of some frames.
+
+    Stands in for what a real capture does to a texture bake: something walks
+    through the scene, a surface goes specular, one camera is slightly
+    misregistered. Those views disagree with the rest, and a plain weighted
+    mean has no way to prefer the majority.
+
+    The occluder covers only *part* of each affected frame, which matters: a
+    whole-frame corruption makes some surface points majority-wrong, and no
+    estimator centred on the majority can recover those. That regime is what
+    `--mask_dir` exists for; this one is what robust fusion is for.
+    """
+
+    def __init__(self, num_views=36, num_corrupted=6, blob_fraction=0.35, **kwargs):
+        super().__init__(num_views=num_views, **kwargs)
+        torch = pytest.importorskip("torch")
+        for index in range(num_corrupted):
+            item = dict(self._items[index])
+            image = item["image"].numpy().copy()
+            width = int(image.shape[1] * blob_fraction)
+            # Slide the blob across frames, so no surface point is hidden
+            # behind it in a majority of the views that see it.
+            offset = (index * 11) % max(1, image.shape[1] - width)
+            image[:, offset : offset + width] = np.array(
+                [255.0, 0.0, 255.0], dtype=np.float32
+            )
+            item["image"] = torch.from_numpy(image)
+            self._items[index] = item
+
+
+def _contamination_weight_fraction(mesh, dataset, points, normals):
+    """Per point, the share of observation *weight* that is the occluder.
+
+    Used to establish a test's premise rather than assume it: robust fusion
+    can only recover points whose bad observations are a minority.
+    """
+    o3d = pytest.importorskip("open3d")
+    from gsplat.photogrammetry.mesh_extraction import _view_samples
+
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    bad = np.zeros(len(points))
+    total = np.zeros(len(points))
+    magenta = np.array([1.0, 0.0, 1.0])
+    for chunk, sampled, weight in _view_samples(
+        scene, o3d, dataset, points, normals, None, 1 << 20
+    ):
+        is_bad = np.all(np.abs(sampled - magenta) < 0.02, axis=1)
+        np.add.at(total, chunk, weight)
+        np.add.at(bad, chunk, weight * is_bad)
+    seen = total > 0
+    return bad[seen] / total[seen]
+
+
+def test_outlier_clipping_rejects_views_that_disagree():
+    """Sigma-clipped fusion must recover the true colour where the mean can't.
+
+    Ground truth is the analytic pattern the clean views were rendered from,
+    so this measures both estimators against the same known answer rather than
+    against each other.
+    """
+    from gsplat.photogrammetry.mesh_extraction import bake_texture
+
+    dataset = _ContaminatedSphereDataset()
+    mesh = _unit_sphere_mesh(resolution=10)
+    vertices = np.asarray(mesh.vertices)
+    normals = np.asarray(mesh.vertex_normals)
+
+    # Premise: the occluder must be a per-point minority, or nothing centred
+    # on the majority could possibly fix it.
+    contamination = _contamination_weight_fraction(mesh, dataset, vertices, normals)
+    assert contamination.max() < 0.5, contamination.max()
+    assert contamination.mean() > 0.05, "the occluder should actually be present"
+
+    plain = _unit_sphere_mesh(resolution=10)
+    bake_texture(plain, dataset)
+    robust = _unit_sphere_mesh(resolution=10)
+    bake_texture(robust, dataset, outlier_sigma=1.5)
+
+    expected = _surface_pattern(vertices / np.linalg.norm(vertices, axis=1)[:, None])
+    plain_err = np.abs(np.asarray(plain.vertex_colors) - expected).mean()
+    robust_err = np.abs(np.asarray(robust.vertex_colors) - expected).mean()
+
+    # The contamination must actually have hurt, or the test proves nothing.
+    assert plain_err > 0.02, plain_err
+    assert robust_err < plain_err / 2.0, (plain_err, robust_err)
+
+
+def test_outlier_clipping_leaves_clean_data_alone():
+    """With no disagreement there is nothing to reject, so the robust bake
+    must match the plain one closely -- clipping must not eat good samples."""
+    from gsplat.photogrammetry.mesh_extraction import bake_texture
+
+    dataset = _SphereDataset(num_views=24)
+    plain = _unit_sphere_mesh(resolution=10)
+    bake_texture(plain, dataset)
+    robust = _unit_sphere_mesh(resolution=10)
+    bake_texture(robust, dataset, outlier_sigma=1.5)
+
+    difference = np.abs(
+        np.asarray(plain.vertex_colors) - np.asarray(robust.vertex_colors)
+    ).mean()
+    assert difference < 0.02, difference
+
+
+def test_outlier_clipping_keeps_sparsely_observed_points():
+    """A point seen by only a couple of views keeps its mean.
+
+    With two or three samples the "spread" is noise, and clipping against it
+    would throw away good data and leave the point unshaded.
+    """
+    from gsplat.photogrammetry.mesh_extraction import _bake_points_from_views
+
+    mesh = _unit_sphere_mesh(resolution=10)
+    dataset = _ContaminatedSphereDataset(num_views=24, num_corrupted=6)
+    points = np.asarray(mesh.vertices)
+    normals = np.asarray(mesh.vertex_normals)
+
+    _, plain_weight = _bake_points_from_views(mesh, dataset, points, normals)
+    _, robust_weight = _bake_points_from_views(
+        mesh, dataset, points, normals, outlier_sigma=1.5, min_views_for_clipping=100
+    )
+    # Every point falls under the threshold, so nothing may be clipped at all.
+    np.testing.assert_allclose(robust_weight, plain_weight)
+
+    # And no point that was observed ends up with no colour at all.
+    _, clipped_weight = _bake_points_from_views(
+        mesh, dataset, points, normals, outlier_sigma=0.01
+    )
+    assert (clipped_weight[plain_weight > 0] > 0).all()

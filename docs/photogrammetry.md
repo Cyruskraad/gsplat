@@ -131,6 +131,31 @@ Baked colors are grown a few texels outward across UV seams and into patches
 no camera observed, so bilinear sampling and mipmapping don't bleed
 background into the surface.
 
+#### Robust multi-view fusion
+
+Both texture paths blend every view that sees a point, weighted by
+view-direction alignment and distance. On a real capture the views *disagree*:
+something walks through the scene, a surface goes specular, one camera is
+slightly misregistered. A plain mean has no way to prefer the majority, so it
+blends the disagreement in as ghosting and blur.
+
+`--texture_outlier_sigma 1.5` discards observations more than that many
+standard deviations from a point's own mean colour, re-estimates from the
+survivors, and repeats. One pass is deliberately not enough: the bad samples
+inflate the very spread they are measured against, so they sit right at the
+threshold and mostly survive. Re-centring on the survivors shrinks the spread
+until they separate cleanly. On a synthetic capture with an occluder covering
+part of a sixth of the frames, this cut mean colour error against ground truth
+by **3x** (0.045 to 0.015); with more views the gap widens.
+
+It only recovers points whose bad observations are a **minority**. A surface
+hidden behind something in most of the views that see it has no majority to
+fall back on, and clipping will happily converge on the occluder instead --
+that case is what `--mask_dir` transient masking is for. The two are
+complements: masking removes the wholesale occlusions, robust fusion cleans up
+the residual disagreement masking doesn't catch. Each extra round costs one
+more pass over the dataset.
+
 #### Decimation + normal maps (the delivery path)
 
 TSDF and Poisson extraction tessellate to the voxel grid, not to the scene's
