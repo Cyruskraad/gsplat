@@ -37,7 +37,7 @@ Texturing
 .. automodule:: gsplat.photogrammetry.texturing
    :members: bake_texture, bake_texture_atlas,
              bake_texture_atlas_view_selected, bake_mesh_texture,
-             face_view_quality, select_views_mrf,
+             face_view_quality, select_views_mrf, level_seams,
              bake_normal_map, bake_ambient_occlusion
 
 Neural SfM Import
@@ -52,7 +52,7 @@ Automatic Metrics
 .. automodule:: gsplat.photogrammetry.metrics
    :members: point_to_mesh_distance, mesh_quality_stats, point_cloud_stats,
              reconstruction_stats, track_stats, mask_coverage_stats,
-             depth_prior_stats, atlas_sharpness
+             depth_prior_stats, atlas_sharpness, seam_discontinuity
 
 Pipeline Orchestration
 -----------------------

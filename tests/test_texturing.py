@@ -316,6 +316,17 @@ def _sphere_fixtures():
     return _SphereDataset, _unit_sphere_mesh
 
 
+def _default_pattern():
+    """tests/test_mesh_extraction.py's analytic sphere colour."""
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_mesh_extraction import _surface_pattern
+
+    return _surface_pattern
+
+
 def _ground_truth_atlas(mesh, texture_size, pattern):
     """The pattern evaluated at each texel's own surface point.
 
@@ -452,7 +463,7 @@ def test_view_selected_bake_falls_back_to_the_blend_it_cannot_improve():
     # composes -- the labelling and the per-texel face id -- rather than
     # re-deriving the bake's output, so this pins the *composition*: a face no
     # view can texture must keep the blend, byte for byte.
-    face_ids, has_face = _texel_face_ids(o3d_, mesh, atlas.positions, atlas.normals)
+    face_ids, has_face, _ = _texel_face_ids(o3d_, mesh, atlas.positions, atlas.normals)
     labels, _ = select_views_mrf(
         face_view_quality(mesh, dataset, max_views=3),
         _face_adjacency(np.asarray(mesh.triangles)),
@@ -616,3 +627,187 @@ def test_bake_mesh_texture_dispatches_to_view_selection_and_reports_it():
         stats_out=blended_stats,
     )
     assert blended_stats == {}
+
+
+# ---------------------------------------------------------------------------
+# Seam levelling
+# ---------------------------------------------------------------------------
+
+
+def test_conjugate_gradient_matches_a_dense_solve():
+    """The hand-rolled solver against `np.linalg.solve` on a small system.
+
+    Written by hand because `gsplat[mesh]` is deliberately just open3d and
+    imageio, so scipy's `cg` is not available as a hard dependency. That makes
+    an independent check of it non-optional.
+    """
+    from gsplat.photogrammetry.texturing import _conjugate_gradient
+
+    rng = np.random.default_rng(5)
+    root = rng.random((12, 12))
+    matrix = root @ root.T + 0.5 * np.eye(12)  # symmetric positive definite
+    rhs = rng.random((12, 3))
+
+    solved, stats = _conjugate_gradient(
+        lambda x: matrix @ x, rhs, max_iterations=200, tol=1e-12
+    )
+    np.testing.assert_allclose(solved, np.linalg.solve(matrix, rhs), atol=1e-8)
+    assert stats["converged"]
+    # CG on an n x n system is exact in at most n steps in exact arithmetic;
+    # the extra iteration is the one that *observes* the residual collapsed,
+    # since the tolerance is checked after each update rather than before.
+    assert stats["iterations"] <= 13
+
+
+def test_conjugate_gradient_anchors_a_singular_system():
+    """The seam system is singular along the constants, and must be anchored.
+
+    Its energy only sees *differences* of corrections, so adding a constant to
+    every unknown changes nothing and the solution is a whole line. Without an
+    anchor the solve drifts somewhere along it; `project_mean` picks the
+    zero-mean point, which is the one that shifts the atlas least.
+    """
+    from gsplat.photogrammetry.texturing import _conjugate_gradient
+
+    # A path graph's Laplacian: exactly the structure of the smoothness term,
+    # singular along the constant vector.
+    laplacian = np.array(
+        [[1.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0]],
+    )
+    rhs = np.array([[1.0], [0.0], [-1.0]])  # consistent: sums to zero
+
+    solved, stats = _conjugate_gradient(
+        lambda x: laplacian @ x, rhs, project_mean=True, tol=1e-12
+    )
+    assert abs(float(solved.mean())) < 1e-9, solved
+    # It still solves the system, up to that constant.
+    np.testing.assert_allclose(laplacian @ solved, rhs, atol=1e-8)
+
+
+def test_shared_edge_vertices_finds_the_two_vertices_of_each_shared_edge():
+    from gsplat.photogrammetry.texturing import (
+        _face_adjacency,
+        _shared_edge_vertices,
+    )
+
+    triangles = np.array([[0, 1, 2], [1, 2, 3]], dtype=np.int64)
+    pairs, shared = _shared_edge_vertices(triangles, _face_adjacency(triangles))
+    assert len(pairs) == 1
+    assert set(shared[0]) == {1, 2}
+
+    # Every interior edge of a closed mesh yields exactly two vertices.
+    sphere = o3d.geometry.TriangleMesh.create_sphere(radius=1.0, resolution=6)
+    triangles = np.asarray(sphere.triangles)
+    pairs, shared = _shared_edge_vertices(triangles, _face_adjacency(triangles))
+    assert shared.shape == (len(pairs), 2)
+    assert (shared[:, 0] != shared[:, 1]).all()
+    # And each shared vertex really is a corner of both faces.
+    for (face_a, face_b), (v0, v1) in zip(pairs, shared):
+        assert {v0, v1} <= set(triangles[face_a]) & set(triangles[face_b])
+
+
+def test_seam_levelling_closes_the_steps_between_views():
+    """Per-view exposure offsets make real seams; levelling must remove them.
+
+    Each view reports the (unambiguous) surface colour shifted by its own
+    constant, so best-view labelling produces genuine steps wherever
+    neighbouring faces chose different photographs.
+    """
+    from gsplat.photogrammetry.texturing import bake_texture_atlas_view_selected
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    size = 256
+    dataset = _SphereDataset(num_views=16, exposure=0.15)
+    mesh = _unit_sphere_mesh(resolution=10)
+    _, levelled, stats = bake_texture_atlas_view_selected(
+        mesh, dataset, texture_size=size
+    )
+
+    before = stats["seam_discontinuity_before"]["mean"]
+    after = stats["seam_discontinuity"]["mean"]
+
+    # Premise 1: there are seams to level at all.
+    assert stats["mrf"]["num_seams"] > 10, stats["mrf"]
+    assert stats["seam_levelling"]["num_seam_edges"] > 10, stats["seam_levelling"]
+    # Premise 2: the exposure offsets really do show up as steps. The metric
+    # has a floor -- two samples either side of a border are different surface
+    # points -- so this is measured against the *same scene without exposure
+    # differences* rather than against zero.
+    clean_mesh = _unit_sphere_mesh(resolution=10)
+    _, _, clean = bake_texture_atlas_view_selected(
+        clean_mesh, _SphereDataset(num_views=16), texture_size=size
+    )
+    floor = clean["seam_discontinuity_before"]["mean"]
+    assert before > 1.3 * floor, (before, floor)
+
+    # The steps are largely gone: measured ~2.1x on this scene.
+    assert before / after > 1.5, (before, after)
+    assert stats["seam_levelling"]["converged"], stats["seam_levelling"]
+
+    # The correction is gauge-anchored: its mean is zero, so levelling closes
+    # the seams without also shifting the whole atlas -- the energy only sees
+    # differences of corrections, so the solution is a whole line and which
+    # point on it is returned decides whether the atlas gains a colour cast.
+    # (Measured: the projection is not what achieves this here, since the seam
+    # system's right-hand side is already orthogonal to the constants. This
+    # asserts the property, not the mechanism.)
+    from gsplat.photogrammetry.texturing import (
+        _face_adjacency,
+        face_view_quality,
+        level_seams,
+        select_views_mrf,
+    )
+
+    quality = face_view_quality(mesh, dataset)
+    mrf_labels, _ = select_views_mrf(
+        quality, _face_adjacency(np.asarray(mesh.triangles))
+    )
+    correction = level_seams(mesh, dataset, mrf_labels)
+    assert np.abs(correction.values.mean(axis=0)).max() < 1e-9, correction.values.mean(
+        axis=0
+    )
+    # Premise: there is something to anchor -- the corrections are not all zero.
+    assert correction.stats["mean_correction"] > 0.01, correction.stats
+
+    # And levelling did not buy that by shifting everything: the atlas must be
+    # no further from the mean-exposure ground truth than it was. (It is in
+    # fact much closer -- ~0.078 to ~0.052 -- because removing the per-view
+    # offsets is removing real error, not just hiding a boundary.)
+    unlevelled_mesh = _unit_sphere_mesh(resolution=10)
+    _, unlevelled, _ = bake_texture_atlas_view_selected(
+        unlevelled_mesh, dataset, texture_size=size, seam_smoothness=None
+    )
+    truth, covered = _ground_truth_atlas(mesh, size, _default_pattern())
+    truth_f = truth[covered] / 255.0
+    unlevelled_truth, unlevelled_covered = _ground_truth_atlas(
+        unlevelled_mesh, size, _default_pattern()
+    )
+    l1_levelled = np.abs(levelled[covered] / 255.0 - truth_f).mean()
+    l1_unlevelled = np.abs(
+        unlevelled[unlevelled_covered] / 255.0
+        - unlevelled_truth[unlevelled_covered] / 255.0
+    ).mean()
+    assert l1_levelled < l1_unlevelled, (l1_levelled, l1_unlevelled)
+
+
+def test_seam_discontinuity_reports_nothing_to_level_for_one_view():
+    """A single-view labelling has no seams, which is not a levelled seam."""
+    from gsplat.photogrammetry.metrics import seam_discontinuity
+    from gsplat.photogrammetry.texturing import _unwrap_and_rasterize
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    mesh = _unit_sphere_mesh(resolution=6)
+    atlas = _unwrap_and_rasterize(mesh, 64)
+    texture = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    single = np.zeros(len(mesh.triangles), dtype=np.int64)
+    stats = seam_discontinuity(mesh, texture, single, atlas.triangle_uvs)
+    assert stats["num_seam_edges"] == 0
+    assert stats["mean"] == 0.0
+
+    # And an alternating labelling does find seams, so the zero above is not
+    # the function simply never finding anything.
+    alternating = np.arange(len(mesh.triangles)) % 3
+    found = seam_discontinuity(mesh, texture, alternating, atlas.triangle_uvs)
+    assert found["num_seam_edges"] > 0
+    assert set(found) == set(stats)

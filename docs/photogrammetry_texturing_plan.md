@@ -1,6 +1,9 @@
 # Plan: sharp texturing via per-face view selection + seam levelling
 
-**Status:** in progress — steps 0, 1 and 2 are landed, **start at step 3**.
+**Status:** **complete** — all four steps are landed. Kept as the record of
+what was measured and why the tests are shaped the way they are; §"Premise,
+measured" and the step 2/3 findings are the parts worth reading before
+touching this code.
 **Branch:** `claude/photogrammetry-techniques-plan-jb0pod` (PR #3).
 **Read first:** [`photogrammetry_status.md`](photogrammetry_status.md) for the
 pipeline's overall state, ground rules, and blockers.
@@ -10,7 +13,7 @@ pipeline's overall state, ground rules, and blockers.
 | 0 | Module split: `texturing.py` / `mesh_extraction.py` / `_open3d.py` | **done** (`f2c1011`) |
 | 1 | `face_view_quality`, `_face_adjacency`, `select_views_mrf` | **done** (`385099c`) |
 | 2 | View-selected atlas bake + `atlas_sharpness` metric | **done** |
-| 3 | Global seam levelling + `seam_discontinuity` metric | **next** |
+| 3 | Global seam levelling + `seam_discontinuity` metric | **done** |
 
 ---
 
@@ -250,7 +253,46 @@ otherwise, matching the existing `--normal_map` guard) and
 
 </details>
 
-## Step 3 — seam levelling + `seam_discontinuity` — **START HERE**
+## Step 3 — seam levelling + `seam_discontinuity` — **DONE**
+
+`level_seams` solves for a per-(vertex, label) additive correction with a
+hand-rolled conjugate gradient (`_conjugate_gradient`); the view-selected bake
+applies it by barycentric interpolation across each face.
+`seam_discontinuity` is in `metrics.py`; `--texture_seam_smoothness` is on
+`extract_mesh.py`, defaulting to 0.1.
+
+**The design below said to compare the two views' colours at the seam vertex.
+That does not work, and the failure is instructive:** measured on the synthetic
+sphere, two views of one vertex disagree by **0.288** (L2 over RGB) from pixel
+quantisation and silhouette bleed alone, where the exposure difference being
+corrected is 0.26. The solve fitted noise larger than the signal and made the
+atlas *worse* — seam discontinuity 0.184 → 0.221 on a scene with no exposure
+differences at all, and only 1.1x better on one with them. Switching the target
+to each view's **mean colour along the shared edge**, over the same sample
+points (which is what Waechter et al. actually specify), fixed it: 2.1x
+reduction with exposure offsets, 1.5x without, and the atlas also moves *closer*
+to the mean-exposure ground truth (L1 0.078 → 0.052). Robust across λ_s from
+0.003 to 1.
+
+**A second measurement error, in the metric itself:** the first
+`seam_discontinuity` stepped a *fraction of the face* inward from the shared
+edge before sampling either side. On a seam-free ground-truth atlas that reads
+0.087 — it was measuring the texture's own spatial variation as a seam. The
+inset is now in **texels**. It still has a floor (two samples either side of a
+border are different surface points), so the metric is a before/after ratio,
+not an absolute, and the test measures the floor on the same scene rather than
+assuming it.
+
+**Not mutation-checked, and said so:** the conjugate gradient's `project_mean`
+gauge anchor. Removing it changes the solve by less than 1e-9, because every
+row of the seam system is a difference of two unknowns, so the right-hand side
+is already orthogonal to the constants and CG from zero never leaves the range
+space. It is kept as a safeguard against rounding on a larger system and
+against an inconsistent right-hand side, and the docstring now says which of
+those it is. The test asserts the zero-mean *property*, not the mechanism.
+
+<details>
+<summary>Original step 3 design (for reference)</summary>
 
 After labelling, a vertex on a seam has two colours depending on which side you
 sample. Solve for an additive correction `g` per **(vertex, label)** pair — not
@@ -288,6 +330,8 @@ levelling. CLI: `--texture_seam_smoothness` (λ_s), reporting `num_seams` and
    levelling removed the steps without introducing a global colour cast).
 5. **CG solver** tested directly against a small dense system solved with
    `np.linalg.solve`.
+
+</details>
 
 ---
 

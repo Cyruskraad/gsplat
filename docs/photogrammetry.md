@@ -205,6 +205,43 @@ answer where one view is unavailable. So `--texture_outlier_sigma` and
 `--texture_view_selection` are complements, not alternatives -- robust
 blending still governs the fallback regions.
 
+#### Seam levelling
+
+One view per face means neighbouring faces textured from different photographs
+meet at a visible step, because the two cameras disagree about exposure and
+white balance. `--texture_seam_smoothness` controls the correction that removes
+it: an additive colour offset solved per **(vertex, label)** pair — not per
+vertex, since a single per-vertex offset provably cannot close a discontinuity
+*at* that vertex (both sides would receive it and the step would survive).
+
+```
+E(g) = Σ_seam edges, at each endpoint v  ‖(g[v,l1] − g[v,l2]) + (mean_l1 − mean_l2)‖²
+     + λ_s Σ_edges of a face labelled l  ‖g[v,l] − g[w,l]‖²
+```
+
+`mean_l1` and `mean_l2` are each view's **mean colour along the shared edge**,
+over the same sample points. That detail is load-bearing, not incidental:
+comparing the two views *at the shared vertex* instead gives a target dominated
+by noise. Measured on the synthetic sphere, two views of one vertex disagree by
+0.288 (L2 over RGB) from pixel quantisation and silhouette bleed alone, where
+the exposure difference being corrected is 0.26 — the solve then fits noise
+larger than the signal and makes the atlas *worse*. Averaging along the edge is
+what separates them.
+
+The result is a linear least squares, solved through its normal equations with
+a hand-rolled conjugate gradient (~50 lines) that applies `AᵀA` as a matvec and
+never materialises the matrix — scipy's `cg` would do, but is not a hard
+dependency here. On the synthetic sphere with ±0.15 per-view exposure this
+halves the measured `seam_discontinuity` (0.26 → 0.12) *and* brings the atlas
+closer to the mean-exposure ground truth (L1 0.078 → 0.052), so it is removing
+real error rather than hiding a boundary. The result is robust across λ_s from
+0.003 to 1; the default is 0.1.
+
+`seam_discontinuity` never reaches zero — two samples either side of a border
+are different surface points, so the texture's own detail sets a floor. Read
+the before/after pair, which `mesh_metrics.json` reports, rather than the
+absolute number.
+
 The labelling uses ICM (iterated conditional modes) rather than the
 alpha-expansion graph cut the paper uses, because alpha-expansion needs a
 max-flow solver and `gsplat[mesh]` is deliberately just `open3d` + `imageio`.
@@ -658,6 +695,11 @@ something gsplat ships.
   how much high-frequency detail a baked atlas carries. This is the metric that
   distinguishes view selection from blending -- pointwise error does not, and
   goes the other way.
+- `gsplat.photogrammetry.level_seams(mesh, dataset, labels, smoothness=...)`
+  returns the per-(vertex, label) colour corrections that close the seams,
+  ready to interpolate across each face;
+  `seam_discontinuity(mesh, texture, labels, triangle_uvs)` measures how
+  visible those seams are in the atlas as shipped.
 - `gsplat.photogrammetry.bake_ambient_occlusion(mesh, occluder_mesh=None,
   num_samples=..., cage=...)` returns `(mesh, ao_map, stats)`; `stats` reports
   `mean_ao`/`min_ao` and the `cage`/`max_distance` used. A `mean_ao` of

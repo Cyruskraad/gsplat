@@ -118,6 +118,12 @@ class Config:
     # labelling will accept to avoid a colour discontinuity between two
     # neighbouring faces. Higher means fewer, larger single-view regions.
     texture_mrf_lambda: float = 1.0
+    # Seam levelling for --texture_view_selection: how smoothly the per-view
+    # colour correction is spread over each single-view region. Too small and
+    # the correction is a sharp patch around each seam; too large and it cannot
+    # close the seam at all. 0 disables levelling, which is only useful for
+    # measuring what it was doing.
+    texture_seam_smoothness: float = 0.1
     # Decimate the extracted mesh to roughly this many triangles before
     # texturing (quadric error metrics). TSDF/Poisson output is tessellated to
     # the voxel grid rather than to the scene's complexity, so this is usually
@@ -225,6 +231,9 @@ def main(cfg: Config) -> None:
             ),
             view_selection=cfg.texture_view_selection,
             mrf_smoothness=cfg.texture_mrf_lambda,
+            seam_smoothness=(
+                cfg.texture_seam_smoothness if cfg.texture_seam_smoothness > 0 else None
+            ),
             stats_out=view_selection_stats,
         )
         if texture is not None:
@@ -266,6 +275,34 @@ def main(cfg: Config) -> None:
                     f"[extract_mesh] {mrf['num_unlabelled']} faces could not be "
                     "textured from any single view and kept the blended color"
                 )
+            if "seam_discontinuity" in view_selection_stats:
+                before = view_selection_stats["seam_discontinuity_before"]["mean"]
+                after = view_selection_stats["seam_discontinuity"]["mean"]
+                levelling = view_selection_stats["seam_levelling"]
+                print(
+                    f"[extract_mesh] seam levelling: discontinuity {before:.4f} "
+                    f"-> {after:.4f} over {levelling['num_seam_edges']} seam "
+                    f"edges ({levelling['iterations']} CG iterations)"
+                )
+                if after >= before:
+                    warnings.warn(
+                        f"Seam levelling did not reduce the seam discontinuity "
+                        f"({before:.4f} -> {after:.4f}). "
+                        "--texture_seam_smoothness is probably wrong for this "
+                        "scene: too large and the correction cannot bend enough "
+                        "to close a seam, too small and it fits sampling noise "
+                        "instead of the exposure difference.",
+                        RuntimeWarning,
+                    )
+                if not levelling["converged"]:
+                    warnings.warn(
+                        "Seam levelling's conjugate-gradient solve hit its "
+                        f"iteration cap with relative residual "
+                        f"{levelling['residual']:.2e}; the correction applied is "
+                        "the partial solution. A very small "
+                        "--texture_seam_smoothness conditions this badly.",
+                        RuntimeWarning,
+                    )
 
     normal_map_stats = None
     if cfg.normal_map:

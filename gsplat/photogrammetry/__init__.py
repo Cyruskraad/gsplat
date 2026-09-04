@@ -58,6 +58,7 @@ from .mesh_extraction import extract_mesh_poisson, extract_mesh_tsdf, simplify_m
 from .metrics import (
     atlas_sharpness,
     depth_prior_stats,
+    seam_discontinuity,
     mask_coverage_stats,
     mesh_quality_stats,
     point_cloud_stats,
@@ -74,6 +75,7 @@ from .texturing import (
     bake_texture_atlas,
     bake_texture_atlas_view_selected,
     face_view_quality,
+    level_seams,
     select_views_mrf,
 )
 from .neural_sfm import merge_point_maps_to_tracks, write_colmap_reconstruction
@@ -99,6 +101,7 @@ __all__ = [
     "bake_mesh_texture",
     "face_view_quality",
     "select_views_mrf",
+    "level_seams",
     "NO_VIEW",
     "bake_normal_map",
     "bake_ambient_occlusion",
@@ -113,6 +116,7 @@ __all__ = [
     "mask_coverage_stats",
     "depth_prior_stats",
     "atlas_sharpness",
+    "seam_discontinuity",
     "PipelineReport",
     "StageResult",
     "run_stage",

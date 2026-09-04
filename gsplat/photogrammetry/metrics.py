@@ -546,3 +546,124 @@ def atlas_sharpness(
         "color_std": float(values[covered].std()),
         "mean_value": float(values[covered].mean()),
     }
+
+
+def seam_discontinuity(
+    mesh,
+    texture: np.ndarray,
+    labels: np.ndarray,
+    triangle_uvs: Optional[np.ndarray] = None,
+    inset_texels: float = 1.0,
+) -> Dict[str, object]:
+    """How visible the seams are in a view-selected texture atlas.
+
+    Per-face view selection buys sharpness at the cost of colour steps wherever
+    two neighbouring faces chose different photographs, because the two cameras
+    disagree about exposure and white balance. This measures those steps
+    directly on the atlas as shipped: for each pair of adjacent faces with
+    different labels, it samples the texture just inside each face near the
+    midpoint of their shared edge and takes the difference. It is the number
+    :func:`gsplat.photogrammetry.texturing.level_seams` exists to reduce.
+
+    Sampling the shared *vertices* instead would report zero by construction:
+    both faces address the same texel through the same UV, so the step lives in
+    the texels either side of the border, not at it. Hence ``inset``.
+
+    Args:
+        mesh: The labelled ``open3d.geometry.TriangleMesh``.
+        texture: ``(H, W, 3)`` atlas, ``uint8`` or float in [0, 1].
+        labels: ``(F,)`` view index per face, ``NO_VIEW`` (-1) where unlabelled.
+        triangle_uvs: ``(3F, 2)`` UVs. Defaults to the mesh's own.
+        inset_texels: How far to step from the shared edge toward each face's
+            centroid before sampling, **in texels**. Large enough to land in a
+            texel that face owns; small enough that the two samples are nearly
+            the same surface point. Measured in texels rather than as a
+            fraction of the face because the second requirement is what
+            matters and it is a texel-scale property: at a fraction of the
+            face, a large triangle's two samples sit far apart on the surface
+            and the metric reports the *texture's own variation* as a seam. On
+            a seam-free ground-truth atlas that mistake reads 0.087; at 1.5
+            texels the floor is 0.025.
+
+    Returns:
+        A dict with ``num_seam_edges``, ``mean``, ``median``, ``p95`` and
+        ``max`` of the per-seam colour difference (L2 over RGB, in [0, 1]
+        units). Zero-filled when there are no seams -- a single-view mesh has
+        nothing to level, which is not the same as a badly levelled one, so
+        ``num_seam_edges`` is what distinguishes them.
+
+    Note that this never reaches zero: two samples either side of a border are
+    different surface points, so the texture's own detail sets a floor. Read it
+    as a before/after ratio, not an absolute.
+    """
+    from .texturing import NO_VIEW, _face_adjacency, _shared_edge_vertices
+
+    texture = np.asarray(texture)
+    if texture.ndim != 3 or texture.shape[2] != 3:
+        raise ValueError(f"texture must be (H, W, 3), got shape {texture.shape}.")
+    values = texture.astype(np.float64)
+    if texture.dtype == np.uint8:
+        values /= 255.0
+    height, width = values.shape[:2]
+
+    triangles = np.asarray(mesh.triangles)
+    labels = np.asarray(labels, dtype=np.int64)
+    if triangle_uvs is None:
+        triangle_uvs = np.asarray(mesh.triangle_uvs)
+    corner_uvs = np.asarray(triangle_uvs, dtype=np.float64).reshape(-1, 3, 2)
+
+    empty = {
+        "num_seam_edges": 0,
+        "mean": 0.0,
+        "median": 0.0,
+        "p95": 0.0,
+        "max": 0.0,
+    }
+    if len(triangles) == 0:
+        return empty
+
+    pairs, shared = _shared_edge_vertices(triangles, _face_adjacency(triangles))
+    if len(pairs) == 0:
+        return empty
+    face_a, face_b = pairs[:, 0], pairs[:, 1]
+    is_seam = (
+        (labels[face_a] != labels[face_b])
+        & (labels[face_a] != NO_VIEW)
+        & (labels[face_b] != NO_VIEW)
+    )
+    if not is_seam.any():
+        return empty
+
+    def sample(face, vertices_on_edge):
+        """The atlas colour just inside `face`, near its shared edge."""
+        weights = np.zeros((len(face), 3))
+        for end in range(2):
+            corner = (triangles[face] == vertices_on_edge[:, end : end + 1]).argmax(
+                axis=1
+            )
+            weights[np.arange(len(face)), corner] += 0.5
+        edge_uv = (corner_uvs[face] * weights[:, :, None]).sum(axis=1)
+        centroid_uv = corner_uvs[face].mean(axis=1)
+        # Step a fixed number of texels toward the centroid, never past it.
+        toward = centroid_uv - edge_uv
+        scale = np.array([width, height], dtype=np.float64)
+        length = np.linalg.norm(toward * scale, axis=1)
+        step = np.minimum(inset_texels / np.clip(length, 1e-12, None), 1.0)
+        uv = edge_uv + toward * step[:, None]
+        # OBJ/`compute_uvatlas` convention: u -> column, v -> row from the
+        # bottom, the same mapping the atlas was rasterized with.
+        cols = np.clip((uv[:, 0] * width).astype(np.int64), 0, width - 1)
+        rows = np.clip(((1.0 - uv[:, 1]) * height).astype(np.int64), 0, height - 1)
+        return values[rows, cols]
+
+    on_edge = shared[is_seam]
+    difference = np.linalg.norm(
+        sample(face_a[is_seam], on_edge) - sample(face_b[is_seam], on_edge), axis=1
+    )
+    return {
+        "num_seam_edges": int(len(difference)),
+        "mean": float(difference.mean()),
+        "median": float(np.median(difference)),
+        "p95": float(np.percentile(difference, 95)),
+        "max": float(difference.max()),
+    }

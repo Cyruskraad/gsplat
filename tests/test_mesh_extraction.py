@@ -155,6 +155,7 @@ class _SphereDataset:
         height=192,
         pattern=None,
         pose_error_arcmin=0.0,
+        exposure=0.0,
         seed=0,
     ):
         """
@@ -169,8 +170,13 @@ class _SphereDataset:
                 image alone. That is exactly residual SfM error: the pose you
                 have does not quite match the photograph it belongs to, so
                 views disagree about where a surface point lands.
-            seed: For the pose-error directions, so a perturbed dataset is
-                reproducible.
+            exposure: Give each view its own constant brightness offset,
+                drawn uniformly from [-exposure, exposure], applied only where
+                the view actually sees the sphere. Simulates the auto-exposure
+                and white-balance drift that makes neighbouring faces textured
+                from different photographs meet at a visible step.
+            seed: For the pose-error directions and exposure offsets, so a
+                perturbed dataset is reproducible.
         """
         torch = pytest.importorskip("torch")
         if pattern is None:
@@ -223,6 +229,10 @@ class _SphereDataset:
 
             image = np.zeros((height, width, 3), dtype=np.float64)
             image[hit] = pattern(hit_points[hit])
+            if exposure:
+                # Only where the sphere is: shifting the background too would
+                # make the offset recoverable from the empty frame.
+                image[hit] += rng.uniform(-exposure, exposure)
             image = (np.clip(image, 0, 1) * 255.0).round().astype(np.uint8)
 
             # The image was rendered from the true pose; only the pose we

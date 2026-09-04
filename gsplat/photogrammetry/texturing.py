@@ -1466,13 +1466,16 @@ def _texel_face_ids(o3d, mesh, positions, normals):
     caller can fall back rather than texture them from a wrong face's view.
 
     Returns:
-        ``(F_ids, hit)``: the ``(N,)`` face index per texel (-1 where none) and
-        the ``(N,)`` bool mask of texels that hit.
+        ``(face_ids, hit, barycentric)``: the ``(N,)`` face index per texel (-1
+        where none), the ``(N,)`` bool mask of texels that hit, and the
+        ``(N, 3)`` barycentric weights of the hit within that face, ordered to
+        match the face's corners.
     """
     if positions.shape[0] == 0:
         return (
             np.full(0, -1, dtype=np.int64),
             np.zeros(0, dtype=bool),
+            np.zeros((0, 3)),
         )
 
     extent = np.asarray(mesh.get_max_bound()) - np.asarray(mesh.get_min_bound())
@@ -1489,7 +1492,12 @@ def _texel_face_ids(o3d, mesh, positions, normals):
     # means the ray started off-surface and landed on unrelated geometry.
     hit = np.isfinite(hit_t) & (hit_t <= 4.0 * eps)
     face_ids = np.where(hit, primitives.astype(np.int64), -1)
-    return face_ids, hit
+    # open3d's primitive_uvs weight the corners (1-u-v, u, v) -- pinned
+    # empirically elsewhere in this module by reconstructing hit positions.
+    uv = result["primitive_uvs"].numpy()
+    barycentric = np.stack([1.0 - uv[:, 0] - uv[:, 1], uv[:, 0], uv[:, 1]], axis=1)
+    barycentric[~hit] = 0.0
+    return face_ids, hit, barycentric
 
 
 def bake_texture_atlas_view_selected(
@@ -1505,6 +1513,7 @@ def bake_texture_atlas_view_selected(
     margin: float = 2.0,
     max_stretch: float = 1.0 / 6.0,
     dilation: int = 4,
+    seam_smoothness: Optional[float] = 0.1,
 ):
     """Bake a UV atlas that samples **one** view per face instead of blending.
 
@@ -1548,6 +1557,10 @@ def bake_texture_atlas_view_selected(
         margin: See :func:`bake_texture_atlas`.
         max_stretch: See :func:`bake_texture_atlas`.
         dilation: See :func:`bake_texture_atlas`.
+        seam_smoothness: Levelling strength -- see :func:`level_seams`, which
+            removes the exposure/white-balance steps where neighbouring faces
+            chose different photographs. ``None`` skips levelling, which is
+            useful only for measuring what it did.
 
     Returns:
         ``(mesh, texture, stats)``. ``mesh`` carries ``triangle_uvs``/
@@ -1555,15 +1568,17 @@ def bake_texture_atlas_view_selected(
         ``uint8`` atlas. ``stats`` reports the labelling under ``"mrf"``, the
         texel accounting (``num_texels``, ``num_texels_view_selected``,
         ``num_texels_blended``, ``fallback_fraction``, ``num_texels_no_face``),
-        and ``atlas_sharpness`` for both this atlas and the blended one it
-        replaced, measured over the same covered texels so they are comparable.
+        ``atlas_sharpness`` for both this atlas and the blended one it replaced
+        (measured over the same covered texels so they are comparable), and,
+        when levelling ran, ``seam_levelling`` plus ``seam_discontinuity``
+        before and after it.
 
     Raises:
         ValueError: If ``mesh`` has no triangles, ``texture_size`` is not
             positive, or ``mesh`` is non-manifold (see
             :func:`_unwrap_and_rasterize`).
     """
-    from .metrics import atlas_sharpness
+    from .metrics import atlas_sharpness, seam_discontinuity
 
     o3d = _require_open3d()
 
@@ -1591,6 +1606,7 @@ def bake_texture_atlas_view_selected(
         "atlas_sharpness": {},
         "blended_atlas_sharpness": {},
     }
+    labels = np.full(len(mesh.triangles), NO_VIEW, dtype=np.int64)
 
     if rows.size > 0:
         # 1. The blended bake, unchanged -- the fallback everywhere a single
@@ -1609,12 +1625,13 @@ def bake_texture_atlas_view_selected(
         blended[observed] = color_accum[observed] / weight_accum[observed, None]
 
         # 2. One view per face.
-        face_ids, has_face = _texel_face_ids(o3d, mesh, positions, normals)
+        face_ids, has_face, barycentric = _texel_face_ids(o3d, mesh, positions, normals)
         quality = face_view_quality(mesh, dataset, max_views=max_views)
         adjacency = _face_adjacency(np.asarray(mesh.triangles))
-        labels, mrf_stats = select_views_mrf(
+        mrf_labels, mrf_stats = select_views_mrf(
             quality, adjacency, smoothness=mrf_smoothness
         )
+        labels = mrf_labels
         texel_label = np.full(positions.shape[0], NO_VIEW, dtype=np.int64)
         texel_label[has_face] = labels[face_ids[has_face]]
 
@@ -1634,7 +1651,34 @@ def bake_texture_atlas_view_selected(
                 selected[chunk[take]] = colors[take]
                 picked[chunk[take]] = True
 
-        final = np.where(picked[:, None], selected, blended)
+        # 4. Level the seams: neighbouring faces that chose different
+        #    photographs disagree about exposure and white balance, and that
+        #    step is the price of not blending. Corrections are solved per
+        #    (vertex, label) and interpolated across each face, so they close
+        #    the seam without introducing a new edge anywhere else.
+        levelled = selected
+        if seam_smoothness is not None:
+            correction = level_seams(
+                mesh,
+                dataset,
+                labels,
+                max_views=max_views,
+                smoothness=seam_smoothness,
+            )
+            stats["seam_levelling"] = correction.stats
+            if len(correction.values):
+                corner_pairs = correction.corner_pairs[face_ids[has_face]]
+                usable = (corner_pairs >= 0).all(axis=1)
+                rows_of = np.nonzero(has_face)[0][usable]
+                delta = (
+                    correction.values[corner_pairs[usable]]
+                    * barycentric[rows_of][:, :, None]
+                ).sum(axis=1)
+                levelled = selected.copy()
+                take = picked[rows_of]
+                levelled[rows_of[take]] += delta[take]
+
+        final = np.where(picked[:, None], levelled, blended)
         covered = observed | picked
         texture[rows[covered], cols[covered]] = final[covered]
         blended_texture[rows[covered], cols[covered]] = blended[covered]
@@ -1651,6 +1695,21 @@ def bake_texture_atlas_view_selected(
         stats["atlas_sharpness"] = atlas_sharpness(texture, filled)
         stats["blended_atlas_sharpness"] = atlas_sharpness(blended_texture, filled)
 
+        if seam_smoothness is not None:
+            # Measured on the atlas as shipped, before and after the same
+            # correction, so the number says what levelling did rather than
+            # what it was asked to do.
+            unlevelled = np.zeros_like(texture)
+            unlevelled[rows[covered], cols[covered]] = np.where(
+                picked[covered, None], selected[covered], blended[covered]
+            )
+            stats["seam_discontinuity"] = seam_discontinuity(
+                mesh, texture, labels, atlas.triangle_uvs
+            )
+            stats["seam_discontinuity_before"] = seam_discontinuity(
+                mesh, unlevelled, labels, atlas.triangle_uvs
+            )
+
     texture = _fill_texture_holes(texture, filled, dilation)
     texture = (np.clip(texture, 0.0, 1.0) * 255.0).round().astype(np.uint8)
 
@@ -1660,3 +1719,336 @@ def bake_texture_atlas_view_selected(
         np.zeros(len(mesh.triangles), dtype=np.int32)
     )
     return mesh, texture, stats
+
+
+def _conjugate_gradient(matvec, rhs, max_iterations=200, tol=1e-8, project_mean=False):
+    """Solve ``A x = rhs`` for symmetric positive semi-definite ``A``.
+
+    ``A`` is given only as ``matvec``, so the matrix is never materialised --
+    the seam system has one row per seam vertex and per mesh edge, which is
+    dense in neither shape nor storage but is large. Hand-rolled because
+    ``gsplat[mesh]`` is deliberately just open3d and imageio; scipy's ``cg``
+    would do, and is not available as a hard dependency here.
+
+    Args:
+        matvec: Callable applying ``A`` to an ``(N, C)`` array.
+        rhs: ``(N, C)`` right-hand side.
+        max_iterations: Cap on iterations.
+        tol: Stop when the residual norm falls below ``tol`` times the initial.
+        project_mean: Subtract the mean of ``x`` (over N) each iteration, to
+            anchor the gauge of a system that is singular along the constants
+            -- which the seam system is, since its energy only sees
+            *differences* of corrections. Cheaper and better conditioned than
+            pinning one unknown, which would bias the correction toward
+            whichever vertex was pinned.
+
+            For a *consistent* right-hand side this is belt and braces rather
+            than load-bearing: every row of the seam system is a difference of
+            two unknowns, so its ``rhs`` is already orthogonal to the constants
+            and CG started from zero stays in the range space by itself
+            (removing this projection changes that solve by less than 1e-9).
+            It earns its keep against accumulated rounding on a large system,
+            and against a caller whose ``rhs`` is not exactly consistent.
+
+    Returns:
+        ``(x, stats)`` with ``iterations``, ``residual`` (relative) and
+        ``converged``.
+    """
+    x = np.zeros_like(rhs)
+    residual = rhs.copy()
+    if project_mean and residual.shape[0]:
+        residual -= residual.mean(axis=0, keepdims=True)
+    direction = residual.copy()
+    rs_old = float((residual * residual).sum())
+    rs_initial = rs_old
+    if rs_initial == 0.0:
+        return x, {"iterations": 0, "residual": 0.0, "converged": True}
+
+    iterations = 0
+    for iterations in range(1, max_iterations + 1):
+        a_dir = matvec(direction)
+        denominator = float((direction * a_dir).sum())
+        if denominator <= 0.0:
+            # A is only positive *semi*-definite: a direction in its null space
+            # gives no descent, and dividing by it would produce inf.
+            break
+        alpha = rs_old / denominator
+        x += alpha * direction
+        residual -= alpha * a_dir
+        if project_mean:
+            x -= x.mean(axis=0, keepdims=True)
+            residual -= residual.mean(axis=0, keepdims=True)
+        rs_new = float((residual * residual).sum())
+        if rs_new <= tol * tol * rs_initial:
+            rs_old = rs_new
+            break
+        direction = residual + (rs_new / rs_old) * direction
+        rs_old = rs_new
+
+    relative = float(np.sqrt(rs_old / rs_initial))
+    return x, {
+        "iterations": int(iterations),
+        "residual": relative,
+        "converged": bool(relative <= tol),
+    }
+
+
+def _shared_edge_vertices(triangles: np.ndarray, adjacency: np.ndarray):
+    """The two vertices each adjacent face pair shares, as ``(E, 2)``.
+
+    Returns ``(pairs, shared)`` -- the subset of ``adjacency`` that shares
+    exactly two vertices, and those vertices. A pair sharing three (a duplicate
+    face) is dropped rather than silently contributing a malformed edge.
+    """
+    if len(adjacency) == 0:
+        return adjacency, np.zeros((0, 2), dtype=np.int64)
+    first = triangles[adjacency[:, 0]]
+    second = triangles[adjacency[:, 1]]
+    is_shared = (first[:, :, None] == second[:, None, :]).any(axis=2)  # (E, 3)
+    usable = is_shared.sum(axis=1) == 2
+    return adjacency[usable], first[usable][is_shared[usable]].reshape(-1, 2)
+
+
+@dataclass
+class _SeamCorrection:
+    """Per-(vertex, label) additive colour corrections, ready to interpolate.
+
+    ``corner_pairs[f, c]`` indexes ``values`` for corner ``c`` of face ``f``, or
+    -1 where the face carries no label. A texel's correction is the barycentric
+    blend of its face's three corner corrections, which is what makes the
+    result continuous *inside* each single-view region while still stepping
+    across the seams it was solved to close.
+    """
+
+    corner_pairs: np.ndarray
+    values: np.ndarray
+    stats: dict
+
+
+def level_seams(
+    mesh,
+    dataset,
+    labels: np.ndarray,
+    max_views: Optional[int] = None,
+    smoothness: float = 0.1,
+    samples_per_edge: int = 4,
+    max_iterations: int = 200,
+) -> "_SeamCorrection":
+    """Solve for the additive colour correction that closes view-selection seams.
+
+    Neighbouring faces textured from different photographs meet at a visible
+    step: the two cameras disagree about exposure, white balance and shading.
+    Following Waechter et al., the fix is not to re-choose views but to add a
+    correction that makes them agree along their shared border, spread smoothly
+    over each single-view region so nothing else shifts abruptly.
+
+    The unknown is one correction per **(vertex, label)** pair, not per vertex.
+    A single per-vertex offset provably cannot close a discontinuity *at* that
+    vertex: both sides would receive it and the step would survive unchanged.
+
+    .. code-block:: text
+
+        E(g) = sum over seam edges, at each endpoint v of edge (l1 | l2):
+                   || (g[v,l1] - g[v,l2]) + (mean_l1 - mean_l2) ||^2
+             + smoothness * sum over edges of a face labelled l:
+                   || g[v,l] - g[w,l] ||^2
+
+    ``mean_l1`` and ``mean_l2`` are each view's **mean colour along the shared
+    edge**, over the same set of sample points. Comparing the two views *at the
+    vertex* instead does not work, and not marginally: measured on the
+    synthetic sphere, two views of one vertex disagree by 0.288 (L2 over RGB)
+    from pixel quantisation and silhouette bleed alone, where the exposure
+    difference this is meant to remove is 0.26. The solve then fits noise
+    larger than the signal and makes the atlas *worse*. Averaging along the
+    edge is what separates them -- it is the reason the reference method is
+    written that way, and it is worth not undoing.
+
+    This is a linear least squares, solved through its normal equations with
+    :func:`_conjugate_gradient`; the three colour channels are independent and
+    ride along as columns.
+
+    Args:
+        mesh: The ``open3d.geometry.TriangleMesh`` that was labelled.
+        dataset: The dataset the labels index into.
+        labels: ``(F,)`` from :func:`select_views_mrf`, with :data:`NO_VIEW`
+            for faces no view can texture.
+        max_views: Must match what the labelling used.
+        smoothness: Weight on the smoothness term. Too small and the correction
+            is a sharp local patch around each seam; too large and it cannot
+            close the seam at all.
+        samples_per_edge: Points along each seam edge whose colours are
+            averaged. More is steadier and costs only arithmetic -- the
+            dataset pass is over all of them at once.
+        max_iterations: Cap on conjugate-gradient iterations.
+
+    Returns:
+        A :class:`_SeamCorrection`. Its ``stats`` reports ``num_pairs``,
+        ``num_seam_terms``, ``num_seam_edges``, ``num_unmeasured_edges``, the
+        solver's ``iterations``/``residual``/``converged``, and
+        ``mean_correction``/``max_correction``.
+    """
+    o3d = _require_open3d()
+
+    triangles = np.asarray(mesh.triangles)
+    vertices = np.asarray(mesh.vertices)
+    if not mesh.has_vertex_normals():
+        mesh.compute_vertex_normals()
+    vertex_normals = np.asarray(mesh.vertex_normals)
+    labels = np.asarray(labels, dtype=np.int64)
+
+    # 1. The unknowns: every (vertex, label) a labelled face actually uses.
+    labelled = labels != NO_VIEW
+    corner_pairs = np.full((len(triangles), 3), -1, dtype=np.int64)
+    if labelled.any():
+        keys = np.stack(
+            [triangles[labelled].reshape(-1), np.repeat(labels[labelled], 3)], axis=1
+        )
+        unique_keys, inverse = np.unique(keys, axis=0, return_inverse=True)
+        corner_pairs[labelled] = inverse.reshape(-1, 3)
+    else:
+        unique_keys = np.zeros((0, 2), dtype=np.int64)
+    num_pairs = len(unique_keys)
+
+    stats = {
+        "num_pairs": int(num_pairs),
+        "num_seam_edges": 0,
+        "num_seam_terms": 0,
+        "num_unmeasured_edges": 0,
+        "iterations": 0,
+        "residual": 0.0,
+        "converged": True,
+        "mean_correction": 0.0,
+        "max_correction": 0.0,
+    }
+    empty = _SeamCorrection(corner_pairs, np.zeros((num_pairs, 3)), stats)
+    if num_pairs == 0:
+        return empty
+
+    # 2. The seam edges: adjacent faces that chose different views.
+    pairs, shared = _shared_edge_vertices(triangles, _face_adjacency(triangles))
+    if len(pairs) == 0:
+        return empty
+    face_a, face_b = pairs[:, 0], pairs[:, 1]
+    is_seam = (
+        (labels[face_a] != labels[face_b])
+        & (labels[face_a] != NO_VIEW)
+        & (labels[face_b] != NO_VIEW)
+    )
+    if not is_seam.any():
+        return empty
+    face_a, face_b, shared = face_a[is_seam], face_b[is_seam], shared[is_seam]
+    label_a, label_b = labels[face_a], labels[face_b]
+    num_edges = len(face_a)
+    stats["num_seam_edges"] = int(num_edges)
+
+    # 3. Sample each seam edge at interior points, in both of its views.
+    fractions = (np.arange(samples_per_edge) + 1.0) / (samples_per_edge + 1.0)
+    start = vertices[shared[:, 0]]
+    end = vertices[shared[:, 1]]
+    points = (
+        start[:, None, :] * (1.0 - fractions[None, :, None])
+        + end[:, None, :] * fractions[None, :, None]
+    ).reshape(-1, 3)
+    normals = (
+        vertex_normals[shared[:, 0]][:, None, :] * (1.0 - fractions[None, :, None])
+        + vertex_normals[shared[:, 1]][:, None, :] * fractions[None, :, None]
+    ).reshape(-1, 3)
+    normals /= np.clip(np.linalg.norm(normals, axis=1, keepdims=True), 1e-12, None)
+
+    # Which of the two sides each view is responsible for, per sample point.
+    edge_of_point = np.repeat(np.arange(num_edges), samples_per_edge)
+    wanted = {}
+    for side, label in ((0, label_a), (1, label_b)):
+        for view_index in np.unique(label):
+            selection = np.nonzero(label[edge_of_point] == view_index)[0]
+            if selection.size:
+                wanted.setdefault(int(view_index), []).append((side, selection))
+
+    sampled = np.zeros((2, len(points), 3), dtype=np.float64)
+    seen = np.zeros((2, len(points)), dtype=bool)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    for chunk, colors, _weights, view_index in _view_samples(
+        scene, o3d, dataset, points, normals, max_views, 1 << 20
+    ):
+        for side, selection in wanted.get(view_index, ()):
+            keep = np.zeros(len(points), dtype=bool)
+            keep[selection] = True
+            take = keep[chunk]
+            if take.any():
+                sampled[side, chunk[take]] = colors[take]
+                seen[side, chunk[take]] = True
+
+    # 4. Per edge, the mean over the points *both* views saw -- otherwise the
+    #    two means would describe different stretches of the edge and their
+    #    difference would be geometry, not exposure.
+    both = (seen[0] & seen[1]).reshape(num_edges, samples_per_edge)
+    counts = both.sum(axis=1)
+    measured = counts > 0
+    stats["num_unmeasured_edges"] = int((~measured).sum())
+    difference = np.zeros((num_edges, 3))
+    if measured.any():
+        masked = both[..., None]
+        totals = (sampled.reshape(2, num_edges, samples_per_edge, 3) * masked).sum(
+            axis=2
+        )
+        means = totals / np.clip(counts, 1, None)[None, :, None]
+        difference[measured] = (means[0] - means[1])[measured]
+
+    # 5. Residual rows. Every row is a difference of two unknowns, which is
+    #    what makes the system singular along the constants (see the solver's
+    #    `project_mean`).
+    row_a, row_b, row_weight, row_target = [], [], [], []
+
+    def pair_at(face, vertex):
+        """The (vertex, label) unknown for `vertex` as a corner of `face`."""
+        corner = (triangles[face] == vertex[:, None]).argmax(axis=1)
+        return corner_pairs[face, corner]
+
+    for edge_end in range(2):
+        vertex = shared[measured, edge_end]
+        row_a.append(pair_at(face_a[measured], vertex))
+        row_b.append(pair_at(face_b[measured], vertex))
+        row_weight.append(np.ones(int(measured.sum())))
+        # g[a] - g[b] should cancel the two views' colour disagreement.
+        row_target.append(-difference[measured])
+    stats["num_seam_terms"] = int(sum(len(r) for r in row_a))
+
+    if smoothness > 0:
+        weight = np.sqrt(smoothness)
+        for corner in range(3):
+            first = corner_pairs[labelled, corner]
+            second = corner_pairs[labelled, (corner + 1) % 3]
+            row_a.append(first)
+            row_b.append(second)
+            row_weight.append(np.full(len(first), weight))
+            row_target.append(np.zeros((len(first), 3)))
+
+    if sum(len(r) for r in row_a) == 0:
+        return empty
+
+    row_a = np.concatenate(row_a)
+    row_b = np.concatenate(row_b)
+    row_weight = np.concatenate(row_weight)
+    row_target = np.concatenate(row_target)
+
+    def matvec(g):
+        scaled = row_weight[:, None] ** 2 * (g[row_a] - g[row_b])
+        out = np.zeros_like(g)
+        np.add.at(out, row_a, scaled)
+        np.add.at(out, row_b, -scaled)
+        return out
+
+    rhs = np.zeros((num_pairs, 3))
+    scaled_target = row_weight[:, None] * row_target
+    np.add.at(rhs, row_a, scaled_target)
+    np.add.at(rhs, row_b, -scaled_target)
+
+    correction, solver_stats = _conjugate_gradient(
+        matvec, rhs, max_iterations=max_iterations, project_mean=True
+    )
+    stats.update(solver_stats)
+    magnitude = np.linalg.norm(correction, axis=1)
+    stats["mean_correction"] = float(magnitude.mean())
+    stats["max_correction"] = float(magnitude.max())
+    return _SeamCorrection(corner_pairs, correction, stats)

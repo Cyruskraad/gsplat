@@ -22,13 +22,14 @@
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
        tests/test_texturing.py -q
    ```
-   Expect **110 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **115 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
-4. **If you are picking up the texturing work**, its approved plan is
-   [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md) —
-   a status table of which steps are landed, the measured premise that dictates
-   the success metric, and the exact remaining design. Start from the step its
-   table marks "next".
+4. **Before touching the texturing code**, read
+   [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md). All
+   four of its steps are landed, so it is no longer a to-do list — it is the
+   record of what was measured and why the tests are shaped as they are. Its
+   "Premise, measured" section and the step 2/3 findings each document a
+   plausible-looking measurement that turned out to measure the wrong thing.
 5. **Otherwise start from §5.1.** As of the latest session all three §5.1 items
    are still blocked (re-verified, see §4) — Actions is still off, the PR is
    still an unreviewed draft, and the sandbox still has no GPU/CUDA/`colmap`/
@@ -246,8 +247,8 @@ that surfaced them is (sixth §2.4, seventh §2.2, eighth/ninth §2.3, tenth
 | `tests/test_colmap_dataset.py` | 13 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 14 | Geometry metrics against known analytic ground truth, plus `atlas_sharpness` (detail ordering, chart-border exclusion, empty/uint8 handling) |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
-| `tests/test_texturing.py` | 20 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12 |
-| **Total** | **110** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| `tests/test_texturing.py` | 25 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12; and seam levelling — the conjugate-gradient solver against a dense solve, shared-edge recovery, and that levelling closes the exposure steps without introducing a colour cast |
+| **Total** | **115** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -280,7 +281,7 @@ top-level definition before and after reported 19 definitions before, 19 after,
 none missing, none added, **none changed**. The suite went 85 passed -> 85
 passed with no test file edited.
 
-### 2.12 Per-face view selection (texturing plan, step 2)
+### 2.12 Per-face view selection and seam levelling (texturing plan, steps 2–3)
 
 `bake_texture_atlas_view_selected` textures each face from a **single chosen
 view** instead of blending every view that sees it — Waechter et al., *Let
@@ -331,13 +332,61 @@ obvious measurement measured the wrong thing.**
     clamped at zero. Observed on a real sphere render (9 negative readouts) and
     reproduced synthetically in the test.
 
-**Executed:** full suite 110 passed; the delivery path end to end on CPU
-(3480 → 400 triangles, view-selected albedo + normal + AO on one shared UV
-layout, OBJ/MTL/PNGs written and read back, `mesh_metrics.json` round-tripped);
-six mutations checked (drop the clamp, drop the float64 promotion, blacken the
+#### Seam levelling (step 3)
+
+One view per face means neighbouring faces meet at a step wherever the two
+cameras disagree about exposure and white balance. `level_seams` solves for an
+additive correction per **(vertex, label)** pair — not per vertex, since a
+single per-vertex offset provably cannot close a discontinuity *at* that
+vertex — through the normal equations of a linear least squares, with a
+hand-rolled conjugate gradient (`_conjugate_gradient`, ~50 lines applying
+`AᵀA` as a matvec, since `gsplat[mesh]` cannot take scipy as a hard
+dependency). `seam_discontinuity` measures the result on the atlas as shipped,
+and `--texture_seam_smoothness` exposes λ_s.
+
+**The obvious formulation does not work, and the failure is the useful part.**
+Comparing what each view reports *at the shared vertex* gives a target
+dominated by noise: two views of one vertex disagree by **0.288** (L2 over RGB)
+from pixel quantisation and silhouette bleed alone, where the exposure
+difference being corrected is 0.26. The solve fitted noise larger than the
+signal and made the atlas *worse* — seam discontinuity 0.184 → 0.221 on a scene
+with no exposure differences at all. Using each view's **mean colour along the
+shared edge**, over the same sample points (which is what Waechter et al.
+actually specify), fixed it: **2.1x** reduction with ±0.15 per-view exposure,
+1.5x without, and the atlas also moves *closer* to the mean-exposure ground
+truth (L1 0.078 → 0.052), so it is removing real error rather than hiding a
+boundary. Robust across λ_s from 0.003 to 1; default 0.1.
+
+**A second measurement error, in the metric.** The first `seam_discontinuity`
+stepped a *fraction of the face* inward from the shared edge before sampling
+either side; on a seam-free ground-truth atlas that reads 0.087, i.e. it was
+reporting the texture's own spatial variation as a seam. The inset is now
+measured in **texels**. A floor remains — two samples either side of a border
+are different surface points — so the metric is a before/after ratio, not an
+absolute, and the test measures that floor on the same scene rather than
+assuming it. **That is the fifth time on this branch that the obvious
+measurement measured the wrong thing.**
+
+**One guard is deliberately not mutation-checked, and is documented as such:**
+the solver's `project_mean` gauge anchor. Removing it changes the seam solve by
+less than 1e-9, because every row of the system is a difference of two unknowns
+so the right-hand side is already orthogonal to the constants and CG from zero
+never leaves the range space. It is kept against rounding on a larger system
+and against an inconsistent right-hand side; the docstring says which. The test
+asserts the zero-mean *property*, not the mechanism.
+
+**Executed:** full suite 115 passed; the delivery path end to end on CPU
+(3480 → 400 triangles, view-selected and levelled albedo + normal + AO on one
+shared UV layout, OBJ/MTL/PNGs written and read back, `mesh_metrics.json`
+round-tripped);
+nine mutations checked (drop the clamp, drop the float64 promotion, blacken the
 fallback, ignore the MRF labels, ignore the per-texel face id, disable view
-selection) — each fails a test. **Reviewed only:** the
-`--texture_view_selection` CLI guard, which needs a real checkpoint to reach.
+selection, compare views at the vertex instead of along the edge, never apply
+the seam correction, sample the seam metric at the shared vertex) — each fails
+a test. Seam discontinuity on the shipped asset: 0.262 → 0.090.
+**Reviewed only:** the `--texture_view_selection` /
+`--texture_seam_smoothness` CLI guards and warnings, which need a real
+checkpoint to reach.
 
 ### 2.10 Decimation + normal-map baking (the delivery path)
 
