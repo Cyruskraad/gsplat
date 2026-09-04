@@ -56,6 +56,29 @@ from gsplat.photogrammetry.mesh_extraction import (
 from gsplat.photogrammetry.metrics import mesh_quality_stats, point_to_mesh_distance
 
 
+def _write_map(path: str, image: np.ndarray) -> None:
+    """Write a texture map, at 8 or 16 bits per channel.
+
+    imageio's default PNG backend is Pillow, which cannot write a **16-bit
+    RGB** PNG at all (it supports 16-bit grayscale only, and raises
+    ``TypeError: Cannot handle this data type``). OpenCV can, and is already a
+    dependency of the dataset loader, so 16-bit maps go through it.
+
+    OpenCV is BGR: the channels have to be reversed on the way out or the
+    normal map's X and Z are swapped -- an asset that loads fine and shades
+    wrong. `tests/test_extract_mesh_io.py` pins the round trip.
+    """
+    if image.dtype == np.uint16:
+        import cv2
+
+        if image.ndim == 3 and image.shape[2] == 3:
+            image = image[:, :, ::-1]
+        if not cv2.imwrite(path, image):
+            raise RuntimeError(f"Failed to write {path!r}.")
+        return
+    imageio.imwrite(path, image)
+
+
 @dataclass
 class Config:
     # Path to a gsplat checkpoint (.pt) with a "splats" state dict of
@@ -146,6 +169,13 @@ class Config:
     # Normal-map space. "tangent" is what engines expect; "object" is simpler
     # and immune to UV-seam tangent artifacts, fine for a static scanned asset.
     normal_map_space: Literal["tangent", "object"] = "tangent"
+    # Bits per channel in the normal map. An 8-bit map cannot represent a
+    # normal deviation finer than 2/255 (~0.0078, about 0.45 degrees of tilt)
+    # however dense the source mesh is, so on a lightly decimated mesh it adds
+    # quantization noise instead of recovering detail -- measured on a sphere
+    # decimated 6240 -> 3000 triangles, 16 bits is 2.5x more accurate. Costs a
+    # file twice the size, and not every downstream tool reads 16-bit PNGs.
+    normal_map_bits: Literal[8, 16] = 8
     # Bake an ambient-occlusion map onto the same UV atlas: how much of the sky
     # each point can see, so creases and contact points darken. Requires
     # --texture_mode atlas. Writes mesh_ao.png next to mesh.obj.
@@ -365,6 +395,7 @@ def main(cfg: Config) -> None:
             mesh,
             texture_size=cfg.texture_size,
             space=cfg.normal_map_space,
+            bits=cfg.normal_map_bits,
         )
         print(
             f"[extract_mesh] baked a {cfg.normal_map_space}-space normal map "
@@ -418,7 +449,7 @@ def main(cfg: Config) -> None:
 
     if normal_map_stats is not None:
         normal_path = os.path.join(cfg.result_dir, "mesh_normal.png")
-        imageio.imwrite(normal_path, normal_map)
+        _write_map(normal_path, normal_map)
         # open3d's OBJ writer emits map_Kd but nothing for a normal map, so
         # reference it here -- otherwise the .png ships beside an .mtl that
         # never mentions it and every importer ignores it.
@@ -431,7 +462,7 @@ def main(cfg: Config) -> None:
 
     if ao_stats is not None:
         ao_path = os.path.join(cfg.result_dir, "mesh_ao.png")
-        imageio.imwrite(ao_path, ao_image)
+        _write_map(ao_path, ao_image)
         # There is no standard MTL key for an AO map (it is an engine-side
         # input, not a Wavefront material property), so reference it as a
         # comment rather than inventing a key importers would choke on.

@@ -358,11 +358,38 @@ gives different layouts -- so a second unwrap would leave the normal map
 addressed by different coordinates than the albedo, silently breaking the
 asset. Baking onto a mesh that already has `triangle_uvs` always reuses them.
 
-Note the resolution floor of an 8-bit normal map: encoded as `0.5 + 0.5 * n`,
-the smallest representable deviation is about `0.004`. On a surface whose
-low-poly normals are already that accurate there is nothing to recover, and
-the map only adds quantization noise -- decimate far enough that the detail
-you are baking actually exceeds that floor.
+Note the resolution floor of an 8-bit normal map. Encoded as `0.5 + 0.5 * n`,
+the whole range is spent on `[-1, 1]`, so the smallest representable deviation
+is `2/255 ≈ 0.0078` — about 0.45° of tilt, and a hard ceiling on what the map
+can carry however dense the source mesh is. On a surface whose low-poly
+normals are already that accurate there is nothing to recover and the map
+stores quantization noise.
+
+Two ways out. Decimate far enough that the detail you are baking actually
+exceeds the floor — or raise the floor with `--normal_map_bits 16`, which
+drops it to `3.1e-5`. Measured on a sphere decimated 6240 → 3000 triangles
+(a light decimation, exactly the regime where 8 bits stops resolving
+anything), against the analytic normal:
+
+| bits | quantization floor | mean normal error |
+|---|---|---|
+| 8 | 0.0078 | 0.0033 |
+| 16 | 0.000031 | 0.0013 |
+
+The 8-bit error is *entirely* quantization: uniform rounding over a step of
+`2/255` costs about a quarter of a step per channel, ≈0.0034 in L2 over three
+channels, which is what it measures. At 16 bits what remains is the bake's own
+geometric error. The costs are a file twice the size and that not every
+downstream tool reads 16-bit PNGs. `bake_normal_map` reports the
+`quantization_floor` it used in its stats, so the comparison is available on a
+real asset rather than only here.
+
+(Writing that file does not go through imageio: Pillow, its default PNG
+backend, cannot write 16-bit *RGB* PNGs at all — only 16-bit grayscale — so
+the CLI writes them with OpenCV, which is already a dependency of the dataset
+loader. OpenCV is BGR, and a normal map written without reversing the channels
+loads fine and shades wrong, so `tests/test_extract_mesh_io.py` pins the round
+trip.)
 
 UV unwrapping requires a **manifold** mesh. TSDF and Poisson output has
 already been through `remove_non_manifold_edges()`, so this normally holds;
@@ -755,7 +782,7 @@ something gsplat ships.
   `simplify_mesh_to_error(mesh, points, error_over_spacing=...)` returns
   `(mesh, stats)` — the smallest decimation whose *measured* cloud-to-mesh fit
   still meets the target, with every probe's (triangles, error) pair in
-  `stats["probes"]`; `bake_normal_map(high_mesh, low_mesh,
+  `stats["probes"]`; `bake_normal_map(high_mesh, low_mesh, bits=8|16,
   texture_size=..., space="tangent"|"object")` returns
   `(low_mesh, normal_map, stats)`, baking the dense mesh's normals onto the
   decimated one's atlas (reusing its existing UVs when it has them).

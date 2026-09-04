@@ -773,6 +773,7 @@ def bake_normal_map(
     margin: float = 2.0,
     max_stretch: float = 1.0 / 6.0,
     dilation: int = 4,
+    bits: int = 8,
 ):
     """Bake ``high_mesh``'s surface normals onto ``low_mesh``'s UV atlas.
 
@@ -806,6 +807,17 @@ def bake_normal_map(
         max_distance: Reject hits farther than this from the ray origin.
             Defaults to twice ``cage``, so a ray that punches through a gap
             and hits unrelated geometry behind it is discarded.
+        bits: Bit depth per channel, 8 (default) or 16. The encoding
+            ``0.5 + 0.5 * n`` spends the whole range on [-1, 1], so 8 bits
+            resolve a normal deviation no finer than ``2/255 ~ 0.0078`` --
+            about 0.45 degrees of tilt, and a hard floor on what the map can
+            carry however dense ``high_mesh`` is. At 16 bits that floor drops
+            to ``3.1e-5``. Worth reaching for when the low mesh is already
+            close to the high one (a light decimation, or a mesh whose detail
+            is genuinely fine), which is exactly where an 8-bit map stops
+            recovering anything and starts adding quantization noise. The cost
+            is a file twice the size, and not every downstream tool reads
+            16-bit PNGs.
         unwrap_size, gutter, margin, max_stretch, dilation: As in
             :func:`bake_texture_atlas`.
 
@@ -813,9 +825,10 @@ def bake_normal_map(
         ``(low_mesh, normal_map, stats)``:
 
         - ``low_mesh`` with ``triangle_uvs`` set, matching the returned map.
-        - ``normal_map``, a (``texture_size``, ``texture_size``, 3) ``uint8``
-          array encoded the usual way (``0.5 + 0.5 * n``, so a flat texel is
-          ~(128, 128, 255) in tangent space).
+        - ``normal_map``, a (``texture_size``, ``texture_size``, 3) array --
+          ``uint8``, or ``uint16`` when ``bits=16`` -- encoded the usual way
+          (``0.5 + 0.5 * n``, so a flat texel is ~(128, 128, 255) in tangent
+          space at 8 bits).
         - ``stats``: ``num_texels``, ``num_hits``, ``hit_fraction`` and the
           ``cage``/``max_distance`` actually used. A low ``hit_fraction`` means
           most texels fell back to the base normal and the map is doing
@@ -824,7 +837,8 @@ def bake_normal_map(
           which is why it is returned rather than left to be eyeballed.
 
     Raises:
-        ValueError: If ``space`` is not ``"tangent"``/``"object"``, or
+        ValueError: If ``space`` is not ``"tangent"``/``"object"``, if
+            ``bits`` is not 8 or 16, or
             ``low_mesh`` cannot be unwrapped (see
             :func:`bake_texture_atlas`), or ``high_mesh`` has no triangles.
     """
@@ -834,6 +848,8 @@ def bake_normal_map(
         raise ValueError(
             f"Unknown normal-map space {space!r}, expected 'tangent' or 'object'."
         )
+    if bits not in (8, 16):
+        raise ValueError(f"Normal-map bits must be 8 or 16, got {bits}.")
     if len(high_mesh.triangles) == 0:
         raise ValueError("Cannot bake normals from a high mesh with no triangles.")
 
@@ -917,7 +933,12 @@ def bake_normal_map(
         # neutral 0.5 grey in object space.
         neutral = np.array([0.5, 0.5, 1.0]) if space == "tangent" else np.full(3, 0.5)
         normal_map[~_grown_mask(filled, dilation)] = neutral
-    normal_map = (np.clip(normal_map, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    levels = 2**bits - 1
+    normal_map = (
+        (np.clip(normal_map, 0.0, 1.0) * levels)
+        .round()
+        .astype(np.uint8 if bits == 8 else np.uint16)
+    )
 
     low_mesh.triangle_uvs = o3d.utility.Vector2dVector(atlas.triangle_uvs)
     num_texels = int(positions.shape[0])
@@ -928,6 +949,12 @@ def bake_normal_map(
         "cage": float(cage),
         "max_distance": float(max_distance),
         "space": space,
+        "bits": int(bits),
+        # The smallest normal deviation this encoding can represent at all.
+        # Detail finer than this is quantization noise rather than recovered
+        # geometry, so it is the number that says whether the bake was worth
+        # doing on this pair of meshes.
+        "quantization_floor": float(2.0 / levels),
     }
     return low_mesh, normal_map, stats
 
