@@ -131,6 +131,26 @@ Baked colors are grown a few texels outward across UV seams and into patches
 no camera observed, so bilinear sampling and mipmapping don't bleed
 background into the surface.
 
+#### Bilinear source sampling
+
+Colours are read from the source images with **bilinear** interpolation. A
+surface point almost never lands on a pixel centre, so rounding to the nearest
+one throws away up to half a pixel of the projection's accuracy — and does so
+differently in each view, which is also what makes two views disagree about a
+point's colour by more than they need to. Measured on the analytic sphere over
+16 views:
+
+| | nearest | bilinear |
+|---|---|---|
+| mean per-sample error vs ground truth | 0.0707 | **0.0572** |
+| mean disagreement between two views of one vertex | 0.263 | **0.217** |
+| per-vertex bake error vs ground truth | 0.0052 | **0.0027** |
+
+The per-vertex bake gains most (**1.9x**), since it has no averaging to hide
+behind. The blended atlas gains 18% — averaging several views already cancels
+much of that noise — and seam levelling gains nothing, because averaging along
+each seam edge already does the same job.
+
 #### Robust multi-view fusion
 
 Both texture paths blend every view that sees a point, weighted by

@@ -811,3 +811,120 @@ def test_seam_discontinuity_reports_nothing_to_level_for_one_view():
     found = seam_discontinuity(mesh, texture, alternating, atlas.triangle_uvs)
     assert found["num_seam_edges"] > 0
     assert set(found) == set(stats)
+
+
+# ---------------------------------------------------------------------------
+# Source-image sampling
+# ---------------------------------------------------------------------------
+
+
+def _nearest(image, uv):
+    """Nearest-neighbour sampling, written out as the comparison baseline.
+
+    Deliberately independent of the module under test: a bilinear
+    implementation that is quietly broken cannot satisfy a comparison against
+    this by being broken in the same way.
+    """
+    height, width = image.shape[:2]
+    px = np.clip(uv[:, 0].astype(np.int64), 0, width - 1)
+    py = np.clip(uv[:, 1].astype(np.int64), 0, height - 1)
+    return image[py, px]
+
+
+def test_bilinear_reproduces_a_linear_image_exactly():
+    """Bilinear interpolation of a linear ramp is exact, at any coordinate.
+
+    Analytic ground truth that owes nothing to the implementation: if the
+    image *is* a linear function of position, the interpolant must return that
+    same function, to floating-point precision, everywhere.
+    """
+    from gsplat.photogrammetry.texturing import _bilinear
+
+    height, width = 23, 31
+    ys, xs = np.mgrid[0:height, 0:width]
+    # Pixel centres sit at integer + 0.5 in the uv convention.
+    ramp = 0.3 * (xs + 0.5) - 0.2 * (ys + 0.5) + 1.5
+    image = np.stack([ramp, 2.0 * ramp, -ramp], axis=-1)
+
+    rng = np.random.default_rng(0)
+    uv = np.stack(
+        [
+            rng.uniform(0.5, width - 0.5, size=500),
+            rng.uniform(0.5, height - 0.5, size=500),
+        ],
+        axis=1,
+    )
+    expected_ramp = 0.3 * uv[:, 0] - 0.2 * uv[:, 1] + 1.5
+    expected = np.stack([expected_ramp, 2.0 * expected_ramp, -expected_ramp], axis=-1)
+    np.testing.assert_allclose(_bilinear(image, uv), expected, atol=1e-12)
+
+
+def test_bilinear_returns_the_pixel_exactly_at_its_centre():
+    """At a pixel centre there is nothing to interpolate between."""
+    from gsplat.photogrammetry.texturing import _bilinear
+
+    rng = np.random.default_rng(1)
+    image = rng.random((8, 9, 3))
+    ys, xs = np.mgrid[0:8, 0:9]
+    uv = np.stack([xs.ravel() + 0.5, ys.ravel() + 0.5], axis=1).astype(np.float64)
+    np.testing.assert_allclose(_bilinear(image, uv), image.reshape(-1, 3), atol=1e-12)
+
+
+def test_bilinear_clamps_at_the_border_rather_than_wrapping():
+    """A sample past the edge must take the edge pixel, not the opposite one.
+
+    Wrapping would pull the far side of the image into a silhouette texel --
+    the kind of artifact that looks like a reconstruction error rather than a
+    sampling bug.
+    """
+    from gsplat.photogrammetry.texturing import _bilinear
+
+    image = np.zeros((4, 4, 3))
+    image[0, 0] = [1.0, 0.0, 0.0]
+    image[3, 3] = [0.0, 0.0, 1.0]
+
+    corners = np.array([[-5.0, -5.0], [0.0, 0.0], [99.0, 99.0], [4.0, 4.0]])
+    sampled = _bilinear(image, corners)
+    np.testing.assert_allclose(sampled[0], image[0, 0])
+    np.testing.assert_allclose(sampled[1], image[0, 0])
+    np.testing.assert_allclose(sampled[2], image[3, 3])
+    np.testing.assert_allclose(sampled[3], image[3, 3])
+
+
+def test_bilinear_sampling_beats_nearest_on_the_vertex_bake():
+    """The reason the sampler is bilinear, measured end to end.
+
+    A surface point almost never lands on a pixel centre, so rounding to one
+    throws away up to half a pixel of the projection's accuracy -- and does so
+    differently in each view, which is also what makes the views disagree about
+    a point's colour by more than they need to.
+    """
+    from gsplat.photogrammetry import texturing
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    from test_mesh_extraction import _surface_pattern
+
+    dataset = _SphereDataset(num_views=16)
+
+    def bake_error(sampler):
+        original = texturing._bilinear
+        texturing._bilinear = sampler
+        try:
+            mesh = _unit_sphere_mesh(resolution=10)
+            texturing.bake_texture(mesh, dataset)
+        finally:
+            texturing._bilinear = original
+        vertices = np.asarray(mesh.vertices)
+        truth = _surface_pattern(
+            vertices / np.linalg.norm(vertices, axis=1, keepdims=True)
+        )
+        return float(np.abs(np.asarray(mesh.vertex_colors) - truth).mean())
+
+    nearest_error = bake_error(_nearest)
+    bilinear_error = bake_error(texturing._bilinear)
+
+    # Premise: nearest-neighbour must be measurably wrong here, or there is
+    # nothing for interpolation to recover. Measured ~0.0052.
+    assert nearest_error > 0.004, nearest_error
+    # Measured 0.0052 -> 0.0027, a 1.9x improvement.
+    assert bilinear_error < nearest_error / 1.5, (bilinear_error, nearest_error)

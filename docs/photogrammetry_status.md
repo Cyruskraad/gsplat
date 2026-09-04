@@ -22,7 +22,7 @@
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
        tests/test_texturing.py tests/test_extract_mesh_io.py -q
    ```
-   Expect **126 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **130 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Before touching the texturing code**, read
    [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md). All
@@ -248,8 +248,8 @@ that surfaced them is (sixth §2.4, seventh §2.2, eighth/ninth §2.3, tenth
 | `tests/test_photogrammetry_metrics.py` | 14 | Geometry metrics against known analytic ground truth, plus `atlas_sharpness` (detail ordering, chart-border exclusion, empty/uint8 handling) |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
 | `tests/test_extract_mesh_io.py` | 5 | Texture-map writing: the 16-bit RGB PNG round trip (and the BGR channel reversal it depends on), and that 16 bits recovers normal detail 8 bits cannot |
-| `tests/test_texturing.py` | 25 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12; and seam levelling — the conjugate-gradient solver against a dense solve, shared-edge recovery, and that levelling closes the exposure steps without introducing a colour cast |
-| **Total** | **126** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| `tests/test_texturing.py` | 29 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12; and seam levelling — the conjugate-gradient solver against a dense solve, shared-edge recovery, and that levelling closes the exposure steps without introducing a colour cast |
+| **Total** | **130** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -388,6 +388,43 @@ a test. Seam discontinuity on the shipped asset: 0.262 → 0.090.
 **Reviewed only:** the `--texture_view_selection` /
 `--texture_seam_smoothness` CLI guards and warnings, which need a real
 checkpoint to reach.
+
+### 2.15 Bilinear source-image sampling
+
+Every bake in `texturing.py` read its colours from the source images with
+**nearest-neighbour** lookup. A surface point almost never lands on a pixel
+centre, so that threw away up to half a pixel of the projection's accuracy —
+and did so *differently in each view*, which is also what made two views
+disagree about a point's colour by more than they needed to. Now bilinear.
+
+Measured on the analytic sphere over 16 views:
+
+| | nearest | bilinear |
+|---|---|---|
+| mean per-sample error vs ground truth | 0.0707 | 0.0572 |
+| mean disagreement between two views of one vertex | 0.263 | 0.217 |
+| per-vertex bake error vs ground truth | 0.0052 | **0.0027** |
+| blended atlas error vs ground truth | 0.0052 | 0.0043 |
+| seam levelling reduction | 1.97x | 1.94x |
+
+The per-vertex bake gains most (1.9x) because it has no averaging to hide
+behind; the blended atlas gains 18%; **seam levelling gains nothing**, because
+averaging along each seam edge (§2.12) already does the same job. Worth
+recording that the noise floor measured there — 0.288 pairwise disagreement,
+larger than the 0.26 exposure signal it had to see past — is partly this, and
+is now 0.217.
+
+No public parameter: the whole subpackage is unreleased, bilinear is better on
+every measure taken, and adding a `sampling=` argument to six bakers would be
+API surface for a setting with one right answer.
+
+**Executed:** the table above; three mutations checked (revert to
+nearest-neighbour, forget the half-pixel offset, swap x and y in the lookup) —
+each fails a test. **Not mutation-checked, because it is unreachable:** the
+`minimum` clamping `x1`/`y1` to the last pixel. The clip on `x`/`y` already
+forces the fractional weight to zero at the border, so wrapping instead
+produces identical results; it is kept so the intent survives a later change
+to the clip, and the docstring says so.
 
 ### 2.14 16-bit normal maps (§5.2 follow-on)
 
