@@ -155,6 +155,28 @@ normals onto the decimated mesh's UV atlas. The result is
 `mesh.obj` + `mesh.mtl` + `mesh_0.png` (albedo) + `mesh_normal.png`, with the
 `.mtl` referencing both.
 
+Add `--ao_map` for the third map of the standard set: **ambient occlusion**,
+how much of the sky each point of the surface can actually see, so creases,
+cavities and contact points darken. Neither the albedo nor the normal map
+carries that cue, and without it a scanned asset reads flat under ambient
+light. Each texel casts `--ao_samples` rays over the cosine-weighted
+hemisphere about its normal (noise falls as `1/sqrt(n)`; 64 previews, a few
+hundred is smooth), and the value stored is the fraction that escaped. It is
+written as `mesh_ao.png` and noted in the `.mtl` as a comment — there is no
+standard Wavefront key for an AO map, since it is an engine-side input rather
+than a material property.
+
+The CLI bakes AO as *self*-occlusion on the mesh that ships, unlike the normal
+map's dense-vs-decimated bake. Casting against the dense mesh needs a ray cage
+big enough to clear the decimation gap — most of a simplified surface sits
+*inside* the mesh it came from (measured at 80% of texels on a decimated test
+shape), and a ray starting under the occluder hits it immediately, baking a
+uniformly dark map that looks like heavy occlusion and is pure artifact. That
+cage then erases occlusion detail finer than itself, so it costs the very cues
+it was meant to add. AO's real signal is large cavities and creases, which
+survive decimation. `bake_ambient_occlusion(mesh, occluder_mesh=dense, cage=...)`
+is available from the Python API if you want the dense bake anyway.
+
 `--normal_map_space` selects `tangent` (the default -- what engines expect,
 and valid under transforms) or `object` (simpler, immune to UV-seam tangent
 artifacts, and a fine choice for a static scanned asset). Both are reported
@@ -539,6 +561,11 @@ something gsplat ships.
   `bake_mesh_texture(mesh, dataset, mode="vertex"|"atlas", ...)` is the
   dispatching entry point the CLIs use, returning `(mesh, texture_or_None)`
   and falling back to per-vertex colors if the mesh can't be unwrapped.
+- `gsplat.photogrammetry.bake_ambient_occlusion(mesh, occluder_mesh=None,
+  num_samples=..., cage=...)` returns `(mesh, ao_map, stats)`; `stats` reports
+  `mean_ao`/`min_ao` and the `cage`/`max_distance` used. A `mean_ao` of
+  essentially 1.0 means nothing occluded anything — correct for a convex
+  shape, and otherwise a sign the occlusion distance is too small.
 - `gsplat.photogrammetry.simplify_mesh(mesh, target_triangles=...)` returns a
   quadric-decimated copy; `bake_normal_map(high_mesh, low_mesh,
   texture_size=..., space="tangent"|"object")` returns

@@ -44,6 +44,7 @@ import tyro
 from datasets.colmap import Dataset, Parser
 
 from gsplat.photogrammetry.mesh_extraction import (
+    bake_ambient_occlusion,
     bake_mesh_texture,
     bake_normal_map,
     extract_mesh_poisson,
@@ -108,6 +109,13 @@ class Config:
     # Normal-map space. "tangent" is what engines expect; "object" is simpler
     # and immune to UV-seam tangent artifacts, fine for a static scanned asset.
     normal_map_space: Literal["tangent", "object"] = "tangent"
+    # Bake an ambient-occlusion map onto the same UV atlas: how much of the sky
+    # each point can see, so creases and contact points darken. Requires
+    # --texture_mode atlas. Writes mesh_ao.png next to mesh.obj.
+    ao_map: bool = False
+    # Rays per texel for --ao_map. Noise falls as 1/sqrt(n); 64 previews, a few
+    # hundred is smooth (and proportionally slower).
+    ao_samples: int = 64
     # Torch device.
     device: str = "cuda"
 
@@ -151,10 +159,11 @@ def main(cfg: Config) -> None:
         f"{len(mesh.triangles)} triangles"
     )
 
-    if cfg.normal_map and cfg.texture_mode != "atlas":
+    if (cfg.normal_map or cfg.ao_map) and cfg.texture_mode != "atlas":
         raise ValueError(
-            "--normal_map needs UV coordinates to bake into, so it requires "
-            "--texture_mode atlas (which also switches the output to .obj)."
+            "--normal_map/--ao_map need UV coordinates to bake into, so they "
+            "require --texture_mode atlas (which also switches the output to "
+            ".obj)."
         )
 
     # Decimate before texturing, so the atlas is built on the mesh that ships.
@@ -216,6 +225,34 @@ def main(cfg: Config) -> None:
                 "small to span the gap between the two meshes."
             )
 
+    ao_stats = None
+    if cfg.ao_map:
+        # Self-occlusion on the mesh that ships, unlike the normal map's
+        # dense-vs-decimated bake. Casting against the dense mesh would need a
+        # cage large enough to clear the decimation gap (most of a simplified
+        # surface sits *inside* the mesh it came from), and that cage erases
+        # occlusion detail finer than itself -- so it costs the fine cues it
+        # was meant to add. AO's real signal is large cavities and creases,
+        # which survive decimation. Pass `occluder_mesh` via the Python API if
+        # you want the dense bake anyway. Shares the albedo's UVs regardless.
+        mesh, ao_image, ao_stats = bake_ambient_occlusion(
+            mesh,
+            texture_size=cfg.texture_size,
+            num_samples=cfg.ao_samples,
+        )
+        print(
+            f"[extract_mesh] baked an ambient-occlusion map "
+            f"(mean={ao_stats['mean_ao']:.3f}, min={ao_stats['min_ao']:.3f}, "
+            f"{ao_stats['num_samples']} rays/texel)"
+        )
+        if ao_stats["mean_ao"] > 0.999:
+            print(
+                "[extract_mesh] NOTE: nothing occluded anything, so the AO map "
+                "is uniformly white. Expected for a convex shape; otherwise the "
+                f"occlusion distance ({ao_stats['max_distance']:.4g} scene "
+                "units) may be too small."
+            )
+
     os.makedirs(cfg.result_dir, exist_ok=True)
     # A UV atlas needs a format that can carry UVs and a texture image; .ply
     # cannot, so an atlas mesh is written as .obj (+ .mtl + .png alongside).
@@ -238,11 +275,25 @@ def main(cfg: Config) -> None:
                 f.write(f"map_Bump {os.path.basename(normal_path)}\n")
         print(f"[extract_mesh] wrote {normal_path} (referenced from {mtl_path})")
 
+    if ao_stats is not None:
+        ao_path = os.path.join(cfg.result_dir, "mesh_ao.png")
+        imageio.imwrite(ao_path, ao_image)
+        # There is no standard MTL key for an AO map (it is an engine-side
+        # input, not a Wavefront material property), so reference it as a
+        # comment rather than inventing a key importers would choke on.
+        mtl_path = os.path.splitext(out_path)[0] + ".mtl"
+        if os.path.exists(mtl_path):
+            with open(mtl_path, "a") as f:
+                f.write(f"# ambient occlusion map: {os.path.basename(ao_path)}\n")
+        print(f"[extract_mesh] wrote {ao_path}")
+
     stats = mesh_quality_stats(mesh)
     if decimation_stats is not None:
         stats["decimation"] = decimation_stats
     if normal_map_stats is not None:
         stats["normal_map"] = normal_map_stats
+    if ao_stats is not None:
+        stats["ambient_occlusion"] = ao_stats
     if len(mesh.triangles) == 0:
         # Extraction produced nothing usable. Say so plainly instead of
         # letting the cloud-to-mesh measurement fail against an empty surface.

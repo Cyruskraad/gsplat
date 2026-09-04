@@ -684,3 +684,141 @@ def test_albedo_and_normal_maps_share_one_uv_layout():
         "compute_uvatlas became deterministic -- the reuse path is no longer "
         "load-bearing and this test's premise needs revisiting"
     )
+
+
+def test_bake_ambient_occlusion_matches_known_geometry():
+    """AO must be ~fully open on a convex shape and measurably closed inside a
+    concave one -- the two cases whose answer is known without a renderer.
+
+    A sphere is convex, so no ray leaving the surface into the outward
+    hemisphere can hit it again: AO must be ~1 everywhere. A torus is not, and
+    its inner ring sees a large part of its own tube: AO there must be clearly
+    lower than on the outer ring. A bake that returned a constant (or that
+    self-intersected at the ray origin and blackened everything) fails both.
+    """
+    o3d = pytest.importorskip("open3d")
+    from gsplat.photogrammetry.mesh_extraction import (
+        _unwrap_and_rasterize,
+        bake_ambient_occlusion,
+    )
+
+    sphere = _unit_sphere_mesh(resolution=20)
+    sphere, ao_map, stats = bake_ambient_occlusion(
+        sphere, texture_size=96, num_samples=48
+    )
+    assert ao_map.shape == (96, 96, 3)
+    assert ao_map.dtype == np.uint8
+    assert stats["num_samples"] == 48
+    assert stats["mean_ao"] > 0.98, stats
+    assert stats["min_ao"] > 0.8, stats
+
+    torus = o3d.geometry.TriangleMesh.create_torus(
+        torus_radius=1.0, tube_radius=0.35, radial_resolution=60, tubular_resolution=30
+    )
+    torus.compute_vertex_normals()
+    torus, ao_map, stats = bake_ambient_occlusion(
+        torus, texture_size=96, num_samples=48
+    )
+    atlas = _unwrap_and_rasterize(torus, 96, with_tangents=True)
+    openness = ao_map[atlas.rows, atlas.cols][:, 0] / 255.0
+    # Distance from the torus axis separates the inner ring from the outer.
+    axis_distance = np.linalg.norm(atlas.positions[:, :2], axis=1)
+    inner = axis_distance < 0.85
+    outer = axis_distance > 1.15
+    assert inner.any() and outer.any()
+    assert openness[inner].mean() < 0.9
+    assert openness[outer].mean() > 0.95
+    assert openness[inner].mean() < openness[outer].mean() - 0.15
+
+
+def test_bake_ambient_occlusion_is_deterministic_and_validated():
+    """Same seed, same map -- a Monte-Carlo bake nobody can reproduce is not
+    a reviewable artifact."""
+    from gsplat.photogrammetry.mesh_extraction import bake_ambient_occlusion
+
+    # Bake twice onto the *same* mesh: after the first bake it carries UVs, so
+    # the second reuses them. Two separately unwrapped copies would legitimately
+    # differ, because open3d's unwrapper is not deterministic -- the seed fixes
+    # the sampling, not the atlas.
+    sphere = _unit_sphere_mesh(resolution=8)
+    sphere, map_a, stats_a = bake_ambient_occlusion(
+        sphere, texture_size=64, num_samples=16, seed=7
+    )
+    sphere, map_b, stats_b = bake_ambient_occlusion(
+        sphere, texture_size=64, num_samples=16, seed=7
+    )
+    np.testing.assert_array_equal(map_a, map_b)
+    assert stats_a == stats_b
+
+    with pytest.raises(ValueError, match="num_samples"):
+        bake_ambient_occlusion(sphere, texture_size=32, num_samples=0)
+
+
+def test_bake_ambient_occlusion_shares_the_atlas_with_the_other_maps():
+    """All three maps of an asset must be addressed by one UV layout."""
+    from gsplat.photogrammetry.mesh_extraction import (
+        bake_ambient_occlusion,
+        bake_normal_map,
+        bake_texture_atlas,
+        simplify_mesh,
+    )
+
+    dense = _bumpy_sphere()
+    low = simplify_mesh(_unit_sphere_mesh(resolution=8), target_triangles=200)
+
+    low, _ = bake_texture_atlas(low, _SphereDataset(num_views=8), texture_size=64)
+    albedo_uvs = np.asarray(low.triangle_uvs).copy()
+    low, _, _ = bake_normal_map(dense, low, texture_size=64)
+    low, _, _ = bake_ambient_occlusion(low, occluder_mesh=dense, texture_size=64)
+
+    np.testing.assert_allclose(np.asarray(low.triangle_uvs), albedo_uvs)
+
+
+def test_bake_ambient_occlusion_cages_rays_against_a_separate_occluder():
+    """Baking against a *different* mesh must lift ray origins clear of it.
+
+    Decimation cuts corners, so most of a simplified mesh's surface lies
+    *inside* the dense mesh it came from (~80% of texels here). A ray starting
+    under the occluder hits it immediately, so without a cage the whole map
+    bakes uniformly dark -- a result that looks like heavy occlusion and is
+    entirely an artifact.
+    """
+    o3d = pytest.importorskip("open3d")
+    from gsplat.photogrammetry.mesh_extraction import (
+        _unwrap_and_rasterize,
+        bake_ambient_occlusion,
+        simplify_mesh,
+    )
+
+    dense = _bumpy_sphere()
+    low = simplify_mesh(dense, target_triangles=400)
+
+    # Establish the premise: the low surface really does sit inside the dense.
+    atlas = _unwrap_and_rasterize(low, 96)
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(dense))
+    signed = scene.compute_signed_distance(
+        o3d.core.Tensor(atlas.positions.astype(np.float32))
+    ).numpy()
+    assert (signed < 0).mean() > 0.5, "expected the decimated surface to dip inside"
+
+    _, _, caged = bake_ambient_occlusion(
+        simplify_mesh(dense, target_triangles=400),
+        occluder_mesh=dense,
+        texture_size=96,
+        num_samples=32,
+    )
+    # The default cross-mesh cage must clear the deepest excursion.
+    assert caged["cage"] > float(-signed.min())
+    assert caged["mean_ao"] > 0.9, caged
+
+    # Force the self-occlusion cage on the cross-mesh bake and the artifact
+    # comes straight back -- so the cage is what is doing the work.
+    _, _, uncaged = bake_ambient_occlusion(
+        simplify_mesh(dense, target_triangles=400),
+        occluder_mesh=dense,
+        texture_size=96,
+        num_samples=32,
+        cage=1e-4 * 2.0,
+    )
+    assert uncaged["mean_ao"] < 0.5, uncaged

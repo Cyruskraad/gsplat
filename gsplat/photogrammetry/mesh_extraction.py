@@ -1111,3 +1111,174 @@ def _grown_mask(filled: np.ndarray, iterations: int) -> np.ndarray:
             neighbors |= shifted
         grown |= neighbors
     return grown
+
+
+def bake_ambient_occlusion(
+    mesh,
+    occluder_mesh=None,
+    texture_size: int = 2048,
+    num_samples: int = 64,
+    max_distance: Optional[float] = None,
+    cage: Optional[float] = None,
+    seed: int = 0,
+    unwrap_size: Optional[int] = None,
+    gutter: float = 1.0,
+    margin: float = 2.0,
+    max_stretch: float = 1.0 / 6.0,
+    dilation: int = 4,
+    max_rays_per_batch: int = 1 << 22,
+):
+    """Bake an ambient-occlusion map onto ``mesh``'s UV atlas.
+
+    The third map of the standard photogrammetry set, after albedo
+    (:func:`bake_texture_atlas`) and normals (:func:`bake_normal_map`). AO
+    records how much of the sky each point of the surface can actually see, so
+    creases, contact points and cavities darken -- the cue that stops a scanned
+    asset reading as flat under ambient light, and the one thing neither of the
+    other two maps carries.
+
+    Each texel casts ``num_samples`` rays over the cosine-weighted hemisphere
+    about its normal (Malley's method: a uniform disk projected up, which is
+    exactly the distribution the occlusion integral is weighted by, so a plain
+    mean of the results is an unbiased estimate). The value stored is the
+    fraction that escaped -- 1.0 fully open, 0.0 fully enclosed.
+
+    Args:
+        mesh: The ``open3d.geometry.TriangleMesh`` to bake onto. Must be
+            manifold; it gains ``triangle_uvs`` in place, reusing any it
+            already carries so this map lines up with the others.
+        occluder_mesh: What the rays are tested against. Defaults to ``mesh``
+            itself (self-occlusion). Pass the pre-decimation mesh to capture
+            detail the decimated one no longer has, exactly as
+            :func:`bake_normal_map` does.
+        texture_size: Width/height of the (square) map, in texels.
+        num_samples: Rays per texel. The estimate is a Monte-Carlo average, so
+            its noise falls as ``1/sqrt(num_samples)``; 64 is a reasonable
+            preview and a few hundred is smooth.
+        max_distance: Occluders farther than this are ignored, which is what
+            keeps AO a *local* contact cue rather than a global one. Defaults
+            to half the mesh's bounding-box diagonal.
+        cage: How far along the normal each ray starts, in scene units. When
+            ``occluder_mesh`` is a *different* mesh this must clear the gap
+            between the two surfaces, and defaults to 2% of the bounding-box
+            diagonal to do so. Decimation cuts corners, so most of a
+            simplified mesh's surface lies *inside* the dense one it came from
+            -- measured at 80% of texels on a decimated bumpy sphere -- and a
+            ray starting under the occluder hits it immediately, baking a
+            uniformly dark map that looks plausible and is entirely wrong. For
+            self-occlusion the default is a hair off the surface, just enough
+            to avoid re-hitting the originating triangle.
+        seed: Seeds the hemisphere sampling. Re-baking the *same* mesh gives
+            the same map, since it then carries the UVs from the first bake;
+            two separately unwrapped copies of one mesh will differ, because
+            open3d's unwrapper is not deterministic (see
+            :func:`_unwrap_and_rasterize`).
+        unwrap_size, gutter, margin, max_stretch, dilation: As in
+            :func:`bake_texture_atlas`.
+        max_rays_per_batch: Cap on rays cast at once. A large atlas times a
+            high sample count is easily hundreds of millions of rays, so they
+            are cast in batches to bound peak memory.
+
+    Returns:
+        ``(mesh, ao_map, stats)``: the mesh with ``triangle_uvs`` set; the
+        (``texture_size``, ``texture_size``, 3) ``uint8`` grayscale map; and
+        ``stats`` with ``num_texels``, ``num_samples``, ``mean_ao``,
+        ``min_ao`` and the ``max_distance`` used. A ``mean_ao`` of essentially
+        1.0 means nothing occluded anything -- expected for a convex shape,
+        and a sign the distance is too small for anything else.
+
+    Raises:
+        ValueError: If ``num_samples`` is not positive, or ``mesh`` cannot be
+            unwrapped (see :func:`bake_texture_atlas`).
+    """
+    o3d = _require_open3d()
+
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}.")
+
+    occluder = mesh if occluder_mesh is None else occluder_mesh
+    if len(occluder.triangles) == 0:
+        raise ValueError(
+            "Cannot bake ambient occlusion against a mesh with no triangles."
+        )
+
+    atlas = _unwrap_and_rasterize(
+        mesh,
+        texture_size,
+        unwrap_size=unwrap_size,
+        gutter=gutter,
+        margin=margin,
+        max_stretch=max_stretch,
+        with_tangents=True,
+    )
+
+    extent = np.asarray(mesh.get_max_bound()) - np.asarray(mesh.get_min_bound())
+    diagonal = float(np.linalg.norm(extent))
+    if max_distance is None:
+        max_distance = 0.5 * diagonal
+    if cage is None:
+        # Against a different mesh the origin has to clear the gap between the
+        # two surfaces; against itself it only has to clear its own triangle.
+        cage = (0.02 if occluder_mesh is not None else 1e-4) * diagonal
+    cage = max(cage, 1e-9)
+
+    positions, normals = atlas.positions, atlas.normals
+    tangents = atlas.tangents
+    bitangents = np.cross(normals, tangents)
+    num_texels = int(positions.shape[0])
+    openness = np.ones(num_texels, dtype=np.float64)
+
+    if num_texels > 0:
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(occluder))
+        rng = np.random.default_rng(seed)
+        origins_all = positions + normals * cage
+        batch = max(1, max_rays_per_batch // num_samples)
+        for start in range(0, num_texels, batch):
+            stop = min(start + batch, num_texels)
+            count = stop - start
+            # Malley's method: a uniformly sampled disk lifted onto the
+            # hemisphere is cosine-distributed about the normal.
+            r1 = rng.random((count, num_samples))
+            r2 = rng.random((count, num_samples))
+            radius = np.sqrt(r1)
+            angle = 2.0 * np.pi * r2
+            x = radius * np.cos(angle)
+            y = radius * np.sin(angle)
+            z = np.sqrt(np.clip(1.0 - r1, 0.0, None))
+            directions = (
+                x[..., None] * tangents[start:stop, None, :]
+                + y[..., None] * bitangents[start:stop, None, :]
+                + z[..., None] * normals[start:stop, None, :]
+            )
+            origins = np.repeat(origins_all[start:stop, None, :], num_samples, axis=1)
+            rays = np.concatenate([origins, directions], axis=-1).reshape(-1, 6)
+            hit_t = (
+                scene.cast_rays(o3d.core.Tensor(rays.astype(np.float32)))["t_hit"]
+                .numpy()
+                .reshape(count, num_samples)
+            )
+            occluded = np.isfinite(hit_t) & (hit_t < max_distance)
+            openness[start:stop] = 1.0 - occluded.mean(axis=1)
+
+    ao_map = np.zeros((texture_size, texture_size, 3), dtype=np.float64)
+    filled = np.zeros((texture_size, texture_size), dtype=bool)
+    if num_texels > 0:
+        ao_map[atlas.rows, atlas.cols] = openness[:, None]
+        filled[atlas.rows, atlas.cols] = True
+    ao_map = _fill_texture_holes(ao_map, filled, dilation)
+    # Texels the dilation never reaches are outside every chart; leave them
+    # fully open rather than black, so a stray sample can't darken the asset.
+    ao_map[~_grown_mask(filled, dilation)] = 1.0
+    ao_map = (np.clip(ao_map, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(atlas.triangle_uvs)
+    stats = {
+        "num_texels": num_texels,
+        "num_samples": int(num_samples),
+        "mean_ao": float(openness.mean()) if num_texels else 1.0,
+        "min_ao": float(openness.min()) if num_texels else 1.0,
+        "max_distance": float(max_distance),
+        "cage": float(cage),
+    }
+    return mesh, ao_map, stats

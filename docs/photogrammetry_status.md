@@ -21,7 +21,7 @@
        tests/test_neural_sfm.py tests/test_colmap_dataset.py \
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py -q
    ```
-   Expect **78 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **82 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Then start from §5.1.** As of the latest session all three §5.1 items
    are still blocked (re-verified, see §4) — Actions is still off, the PR is
@@ -232,12 +232,12 @@ just re-asserting the buggy behavior):
 | Test file | Count | Covers |
 |---|---|---|
 | `tests/test_bundle_adjustment.py` | 3 | Pure-torch optimization core (no pycolmap needed) |
-| `tests/test_mesh_extraction.py` | 16 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
+| `tests/test_mesh_extraction.py` | 20 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
 | `tests/test_colmap_dataset.py` | 14 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 9 | Geometry metrics against known analytic ground truth |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
-| **Total** | **78** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| **Total** | **82** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -277,6 +277,22 @@ loses detail) but decimate-and-bake, which this now implements:
   would otherwise ship unreferenced).
 - `_unwrap_and_rasterize` factors the unwrap + texel-frame rasterization out
   of `bake_texture_atlas`, so both bakes share one atlas construction.
+
+**Ambient occlusion** completes the map set: `bake_ambient_occlusion` casts
+`num_samples` cosine-weighted hemisphere rays per texel (Malley's method, so a
+plain mean is unbiased) and stores the fraction that escaped, onto the same
+shared atlas. `extract_mesh.py --ao_map/--ao_samples`.
+
+**Bug found while wiring AO (§2.7's eleventh):** baking against a *different*
+occluder mesh was silently wrong. Decimation cuts corners, so ~80% of a
+decimated mesh's texels sit *inside* the dense mesh it came from (measured via
+signed distance); with only the self-occlusion epsilon those rays start under
+the occluder and hit it instantly, baking mean AO 0.204 instead of ~0.98 — a
+map that looks like heavy occlusion and is pure artifact. Fixed with a `cage`
+parameter defaulting to 2% of the bounding-box diagonal for the cross-mesh
+case. Because that cage also erases occlusion finer than itself, the CLI now
+bakes AO as *self*-occlusion on the shipped mesh; the dense bake stays
+available through the Python API.
 
 **Correctness issue this exposed (§2.7's tenth):** open3d's `compute_uvatlas`
 is **not deterministic** — unwrapping the same mesh twice yields different UV

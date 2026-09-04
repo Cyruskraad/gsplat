@@ -76,8 +76,8 @@ For a deliverable asset rather than a raw extraction, add
 ``--target_triangles`` and ``--normal_map`` to step 4: the mesh is decimated
 to a triangle budget (quadric error metrics) and the removed detail is baked
 into a normal map on its UV atlas, so the light mesh still shades like the
-dense one. See "Decimation + normal maps (the delivery path)" in
-``docs/photogrammetry.md``.
+dense one; ``--ao_map`` adds an ambient-occlusion map on the same atlas. See
+"Decimation + normal maps (the delivery path)" in ``docs/photogrammetry.md``.
 
 See ``docs/photogrammetry.md`` (repo root) for the full guide and
 :doc:`../apis/photogrammetry` for the Python API.
