@@ -56,6 +56,7 @@ from .bundle_adjustment import refine_reconstruction
 from .dense_mvs import run_dense_mvs
 from .mesh_extraction import extract_mesh_poisson, extract_mesh_tsdf, simplify_mesh
 from .metrics import (
+    atlas_sharpness,
     depth_prior_stats,
     mask_coverage_stats,
     mesh_quality_stats,
@@ -65,11 +66,15 @@ from .metrics import (
     track_stats,
 )
 from .texturing import (
+    NO_VIEW,
     bake_ambient_occlusion,
     bake_mesh_texture,
     bake_normal_map,
     bake_texture,
     bake_texture_atlas,
+    bake_texture_atlas_view_selected,
+    face_view_quality,
+    select_views_mrf,
 )
 from .neural_sfm import merge_point_maps_to_tracks, write_colmap_reconstruction
 from .pipeline import (
@@ -90,7 +95,11 @@ __all__ = [
     "extract_mesh_poisson",
     "bake_texture",
     "bake_texture_atlas",
+    "bake_texture_atlas_view_selected",
     "bake_mesh_texture",
+    "face_view_quality",
+    "select_views_mrf",
+    "NO_VIEW",
     "bake_normal_map",
     "bake_ambient_occlusion",
     "simplify_mesh",
@@ -103,6 +112,7 @@ __all__ = [
     "track_stats",
     "mask_coverage_stats",
     "depth_prior_stats",
+    "atlas_sharpness",
     "PipelineReport",
     "StageResult",
     "run_stage",

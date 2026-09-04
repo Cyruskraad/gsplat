@@ -385,4 +385,7 @@ from .texturing import (  # noqa: E402,F401  (import placement is deliberate)
     bake_normal_map,
     bake_texture,
     bake_texture_atlas,
+    bake_texture_atlas_view_selected,
+    face_view_quality,
+    select_views_mrf,
 )

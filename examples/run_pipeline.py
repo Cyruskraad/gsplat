@@ -112,6 +112,10 @@ class Config:
     texture_mode: Literal["vertex", "atlas"] = "vertex"
     # Atlas width/height in texels (--texture_mode atlas only).
     texture_size: int = 2048
+    # Texture each face from a single chosen view instead of blending every
+    # view that sees it -- sharper, but pointwise less accurate, and it
+    # requires --texture_mode atlas. See examples/extract_mesh.py.
+    texture_view_selection: bool = False
     # Torch device for the GPU stages.
     device: str = "cuda"
     # Print each stage's command without running anything.
@@ -395,6 +399,8 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                     "--texture_size",
                     str(cfg.texture_size),
                 ]
+                if cfg.texture_view_selection:
+                    cmd += ["--texture_view_selection"]
                 _run(cmd, cfg.dry_run)
                 if not cfg.dry_run:
                     mesh_stats = (

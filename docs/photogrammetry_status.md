@@ -22,7 +22,7 @@
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
        tests/test_texturing.py -q
    ```
-   Expect **98 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **110 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **If you are picking up the texturing work**, its approved plan is
    [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md) —
@@ -213,9 +213,12 @@ conventions.
 Because GitHub Actions is disabled at the repository level on this fork (and
 neither the repo owner nor this session has access to flip that), every
 round of work was followed by a **manual self code-review pass** in place of
-CI. Five real bugs were found and fixed this way, **each verified by
-reverting the fix and confirming a test genuinely fails without it** (not
-just re-asserting the buggy behavior):
+CI. **Thirteen** real bugs have been found and fixed this way so far, **each
+verified by reverting the fix and confirming a test genuinely fails without
+it** (not just re-asserting the buggy behavior). The first five were found in
+the initial pass and are listed here; the rest are described where the work
+that surfaced them is (sixth §2.4, seventh §2.2, eighth/ninth §2.3, tenth
+§2.10, eleventh §2.10, twelfth/thirteenth §2.12):
 
 1. `refine_reconstruction`'s pose-writing broke on modern `pycolmap`'s
    rig/frame model (`Image.cam_from_world` became read-only) — fixed with a
@@ -240,11 +243,11 @@ just re-asserting the buggy behavior):
 | `tests/test_bundle_adjustment.py` | 3 | Pure-torch optimization core (no pycolmap needed) |
 | `tests/test_mesh_extraction.py` | 23 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9) |
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
-| `tests/test_colmap_dataset.py` | 14 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
-| `tests/test_photogrammetry_metrics.py` | 9 | Geometry metrics against known analytic ground truth |
+| `tests/test_colmap_dataset.py` | 13 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
+| `tests/test_photogrammetry_metrics.py` | 14 | Geometry metrics against known analytic ground truth, plus `atlas_sharpness` (detail ordering, chart-border exclusion, empty/uint8 handling) |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
-| `tests/test_texturing.py` | 13 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, and the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape |
-| **Total** | **98** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| `tests/test_texturing.py` | 20 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12 |
+| **Total** | **110** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -276,6 +279,65 @@ Verified as a **pure move**, not just by the tests: an AST comparison of every
 top-level definition before and after reported 19 definitions before, 19 after,
 none missing, none added, **none changed**. The suite went 85 passed -> 85
 passed with no test file edited.
+
+### 2.12 Per-face view selection (texturing plan, step 2)
+
+`bake_texture_atlas_view_selected` textures each face from a **single chosen
+view** instead of blending every view that sees it — Waechter et al., *Let
+There Be Color!* (ECCV 2014). The labelling (`face_view_quality` +
+`select_views_mrf`) landed in the previous session; this wires it to the atlas,
+adds the `atlas_sharpness` metric, and exposes
+`--texture_view_selection` / `--texture_mrf_lambda` on `extract_mesh.py`.
+
+Faces no view can texture, and texels their face's chosen view cannot see, keep
+the **blended** colour, so this never punches holes; `--texture_outlier_sigma`
+still governs those fallback regions.
+
+**It is opt-in because it is a real tradeoff, not a strict win.** Measured on a
+synthetic sphere with cameras rotated 45′ to simulate residual pose error:
+blended retains **59%** of the ground truth's gradient detail and view-selected
+**106%**, but pointwise L1 goes the *other* way (0.171 blended vs 0.199
+selected). Blending attenuates detail; single-view sampling displaces it, and a
+displaced-but-sharp texture scores worse pointwise than a blurred one while
+looking far better. The docs say so plainly and the CLI warns when view
+selection came out *less* sharp than blending — which means that capture's
+poses were well enough registered that blending is the better choice.
+
+**The premise had to be re-measured, and the redo is the interesting part.**
+The plan's original numbers do not reproduce against
+`tests/test_mesh_extraction.py`'s `_surface_pattern`: its wavelength is roughly
+half the sphere, far coarser than the few pixels a pose error displaces a
+projection by, so blending it loses nothing (98–100% gradient retention out to
+90′). The effect only exists when the detail sits near the misregistration
+scale, which is why `tests/test_texturing.py` defines its own
+`_high_frequency_pattern` and `_SphereDataset` gained `pattern=` and
+`pose_error_arcmin=`. **This is the fourth time on this branch that the
+obvious measurement measured the wrong thing.**
+
+**Two bugs found while building it** (§2.7's twelfth and thirteenth):
+
+12. **`_gradient_summed_area` accumulated its summed-area table in float32** —
+    the dtype training images actually arrive in. Over a 512×512 image that
+    leaves box readouts wrong by **0.087** against a table maximum of ~1e5,
+    four orders of magnitude worse than the 1.1e-5 the input rounding alone
+    costs, and the error lands straight in the (face, view) quality scores the
+    table exists to compute. Fixed by promoting to float64 before accumulating.
+13. **`_box_means` could return a negative mean of gradient magnitudes**, from
+    four-corner cancellation reading a near-empty box out of a large table.
+    That reaches `-log()` in `select_views_mrf` as `NaN` — and `np.argmin`
+    returns a `NaN`'s index in preference to every real cost, so the face would
+    be textured from the one view that *cannot see it*. It also silently breaks
+    the multi-seed search, since every comparison against `NaN` is False. Now
+    clamped at zero. Observed on a real sphere render (9 negative readouts) and
+    reproduced synthetically in the test.
+
+**Executed:** full suite 110 passed; the delivery path end to end on CPU
+(3480 → 400 triangles, view-selected albedo + normal + AO on one shared UV
+layout, OBJ/MTL/PNGs written and read back, `mesh_metrics.json` round-tripped);
+six mutations checked (drop the clamp, drop the float64 promotion, blacken the
+fallback, ignore the MRF labels, ignore the per-texel face id, disable view
+selection) — each fails a test. **Reviewed only:** the
+`--texture_view_selection` CLI guard, which needs a real checkpoint to reach.
 
 ### 2.10 Decimation + normal-map baking (the delivery path)
 

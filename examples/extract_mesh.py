@@ -33,6 +33,7 @@ instead of per-vertex colors, writing `mesh.obj` + `mesh.mtl` + `mesh_0.png`
 
 import json
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Literal, Optional
 
@@ -104,6 +105,19 @@ class Config:
     # mean). Only helps where the bad views are a per-point minority -- use
     # --mask_dir for content that occludes a surface in most views.
     texture_outlier_sigma: float = 0.0
+    # Texture each face from a single chosen view instead of blending every
+    # view that sees it (Waechter et al., "Let There Be Color!", ECCV 2014).
+    # Blending is a low-pass filter -- views are never registered to sub-pixel
+    # accuracy after real SfM -- so this keeps detail that would otherwise be
+    # averaged away. It is a *tradeoff*, not a strict win: the result is
+    # sharper but pointwise less accurate, so it is off by default. Requires
+    # --texture_mode atlas. Complements --texture_outlier_sigma, which still
+    # governs the blended fallback regions.
+    texture_view_selection: bool = False
+    # Seam penalty for --texture_view_selection: how much worse a view the
+    # labelling will accept to avoid a colour discontinuity between two
+    # neighbouring faces. Higher means fewer, larger single-view regions.
+    texture_mrf_lambda: float = 1.0
     # Decimate the extracted mesh to roughly this many triangles before
     # texturing (quadric error metrics). TSDF/Poisson output is tessellated to
     # the voxel grid rather than to the scene's complexity, so this is usually
@@ -172,6 +186,12 @@ def main(cfg: Config) -> None:
             "require --texture_mode atlas (which also switches the output to "
             ".obj)."
         )
+    if cfg.texture_view_selection and cfg.texture_mode != "atlas":
+        raise ValueError(
+            "--texture_view_selection chooses a view per *face* and bakes it "
+            "into an atlas, so it requires --texture_mode atlas. Per-vertex "
+            "colors have nothing to select a view for."
+        )
 
     # Decimate before texturing, so the atlas is built on the mesh that ships.
     # Keep the dense mesh: it is what --normal_map bakes detail from.
@@ -193,6 +213,7 @@ def main(cfg: Config) -> None:
         )
 
     texture = None
+    view_selection_stats: dict = {}
     if cfg.bake_texture_:
         mesh, texture = bake_mesh_texture(
             mesh,
@@ -202,6 +223,9 @@ def main(cfg: Config) -> None:
             outlier_sigma=(
                 cfg.texture_outlier_sigma if cfg.texture_outlier_sigma > 0 else None
             ),
+            view_selection=cfg.texture_view_selection,
+            mrf_smoothness=cfg.texture_mrf_lambda,
+            stats_out=view_selection_stats,
         )
         if texture is not None:
             print(
@@ -210,6 +234,38 @@ def main(cfg: Config) -> None:
             )
         else:
             print("[extract_mesh] baked per-vertex texture from training images")
+        if view_selection_stats:
+            mrf = view_selection_stats["mrf"]
+            sharp = view_selection_stats["atlas_sharpness"]["mean_gradient"]
+            blended_sharp = view_selection_stats["blended_atlas_sharpness"][
+                "mean_gradient"
+            ]
+            print(
+                f"[extract_mesh] view selection: {mrf['num_views_used']} views "
+                f"over {mrf['num_faces']} faces, {mrf['num_seams']} seams, "
+                f"{view_selection_stats['fallback_fraction']:.1%} of texels fell "
+                "back to blending"
+            )
+            print(
+                f"[extract_mesh] atlas sharpness {sharp:.4f} vs {blended_sharp:.4f} "
+                f"blended ({sharp / blended_sharp - 1.0:+.1%})"
+                if blended_sharp > 0
+                else f"[extract_mesh] atlas sharpness {sharp:.4f}"
+            )
+            if blended_sharp > 0 and sharp <= blended_sharp:
+                warnings.warn(
+                    "View selection produced a *less* sharp atlas than blending "
+                    f"({sharp:.4f} vs {blended_sharp:.4f}). That usually means "
+                    "the views are already well registered, in which case "
+                    "blending is the better choice here -- it is pointwise more "
+                    "accurate. Consider dropping --texture_view_selection.",
+                    RuntimeWarning,
+                )
+            if mrf["num_unlabelled"]:
+                print(
+                    f"[extract_mesh] {mrf['num_unlabelled']} faces could not be "
+                    "textured from any single view and kept the blended color"
+                )
 
     normal_map_stats = None
     if cfg.normal_map:
@@ -304,6 +360,8 @@ def main(cfg: Config) -> None:
         stats["normal_map"] = normal_map_stats
     if ao_stats is not None:
         stats["ambient_occlusion"] = ao_stats
+    if view_selection_stats:
+        stats["view_selection"] = view_selection_stats
     if len(mesh.triangles) == 0:
         # Extraction produced nothing usable. Say so plainly instead of
         # letting the cloud-to-mesh measurement fail against an empty surface.

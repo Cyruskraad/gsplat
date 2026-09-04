@@ -146,8 +146,36 @@ class _SphereDataset:
     analytic sphere and shaded by `_surface_pattern` at the hit point.
     """
 
-    def __init__(self, num_views=24, radius=1.0, cam_dist=3.5, width=192, height=192):
+    def __init__(
+        self,
+        num_views=24,
+        radius=1.0,
+        cam_dist=3.5,
+        width=192,
+        height=192,
+        pattern=None,
+        pose_error_arcmin=0.0,
+        seed=0,
+    ):
+        """
+        Args:
+            pattern: Surface color function, defaulting to `_surface_pattern`.
+                Overridden by tests that need detail at a *specific* spatial
+                frequency -- `_surface_pattern` is deliberately smooth relative
+                to a camera pixel, which makes it useless for measuring what
+                blending does to high-frequency detail.
+            pose_error_arcmin: Rotate each *reported* `camtoworld` by this angle
+                about the camera's own optical centre, leaving the rendered
+                image alone. That is exactly residual SfM error: the pose you
+                have does not quite match the photograph it belongs to, so
+                views disagree about where a surface point lands.
+            seed: For the pose-error directions, so a perturbed dataset is
+                reproducible.
+        """
         torch = pytest.importorskip("torch")
+        if pattern is None:
+            pattern = _surface_pattern
+        rng = np.random.default_rng(seed)
         self.width, self.height = width, height
         focal = 260.0
         K = np.array(
@@ -194,8 +222,28 @@ class _SphereDataset:
             hit_points = cam_pos[None, None, :] + dirs_world * t0[..., None]
 
             image = np.zeros((height, width, 3), dtype=np.float64)
-            image[hit] = _surface_pattern(hit_points[hit])
+            image[hit] = pattern(hit_points[hit])
             image = (np.clip(image, 0, 1) * 255.0).round().astype(np.uint8)
+
+            # The image was rendered from the true pose; only the pose we
+            # *report* is perturbed.
+            if pose_error_arcmin:
+                axis = rng.normal(size=3)
+                axis /= np.linalg.norm(axis)
+                angle = np.deg2rad(pose_error_arcmin / 60.0)
+                cross = np.array(
+                    [
+                        [0.0, -axis[2], axis[1]],
+                        [axis[2], 0.0, -axis[0]],
+                        [-axis[1], axis[0], 0.0],
+                    ]
+                )
+                rot = (
+                    np.eye(3)
+                    + np.sin(angle) * cross
+                    + (1.0 - np.cos(angle)) * (cross @ cross)
+                )
+                camtoworld[:3, :3] = camtoworld[:3, :3] @ rot
 
             self._items.append(
                 {

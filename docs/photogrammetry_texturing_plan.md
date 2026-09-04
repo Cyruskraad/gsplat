@@ -1,6 +1,6 @@
 # Plan: sharp texturing via per-face view selection + seam levelling
 
-**Status:** in progress — steps 0 and 1 are landed, **start at step 2**.
+**Status:** in progress — steps 0, 1 and 2 are landed, **start at step 3**.
 **Branch:** `claude/photogrammetry-techniques-plan-jb0pod` (PR #3).
 **Read first:** [`photogrammetry_status.md`](photogrammetry_status.md) for the
 pipeline's overall state, ground rules, and blockers.
@@ -9,8 +9,8 @@ pipeline's overall state, ground rules, and blockers.
 |---|---|---|
 | 0 | Module split: `texturing.py` / `mesh_extraction.py` / `_open3d.py` | **done** (`f2c1011`) |
 | 1 | `face_view_quality`, `_face_adjacency`, `select_views_mrf` | **done** (`385099c`) |
-| 2 | View-selected atlas bake + `atlas_sharpness` metric | **next** |
-| 3 | Global seam levelling + `seam_discontinuity` metric | not started |
+| 2 | View-selected atlas bake + `atlas_sharpness` metric | **done** |
+| 3 | Global seam levelling + `seam_discontinuity` metric | **next** |
 
 ---
 
@@ -51,6 +51,14 @@ to simulate residual SfM pose error, textured with a known analytic pattern:
 
 Blending destroys **half the high-frequency detail** at 45′; single-view
 sampling retains all of it. That is the justification for this work.
+
+> **Re-measured in step 2, and the caveat is load-bearing:** these numbers
+> only appear when the pattern's detail is near the misregistration scale.
+> With `tests/test_mesh_extraction.py`'s `_surface_pattern` (wavelength ~half
+> the sphere) blending retains 98–100% of the gradient out to 90′ and the
+> effect is invisible. `tests/test_texturing.py::_high_frequency_pattern`
+> exists for this reason. Re-measured at that frequency: blended **59%**,
+> view-selected **106%**, L1 0.171 vs 0.199.
 
 **But per-pixel L1 error goes the other way** — at 45′, blended 0.152 vs
 best-view 0.185 — and on a *smooth* pattern blending wins at every error level
@@ -142,7 +150,58 @@ In `texturing.py`:
 
 ---
 
-## Step 2 — view-selected bake + `atlas_sharpness` — **START HERE**
+## Step 2 — view-selected bake + `atlas_sharpness` — **DONE**
+
+`bake_texture_atlas_view_selected` in `texturing.py` returns
+`(mesh, texture, stats)`; `bake_mesh_texture` reaches it via
+`view_selection=True` plus a `stats_out` dict (an out-parameter, because
+several callers unpack its `(mesh, texture)` pair). `atlas_sharpness` is in
+`metrics.py`; `--texture_view_selection` / `--texture_mrf_lambda` are on
+`examples/extract_mesh.py`, and the stats land in `mesh_metrics.json` under
+`"view_selection"`.
+
+**The premise measurement had to be redone, and the redo matters.** The
+numbers in the table above do *not* reproduce with
+`tests/test_mesh_extraction.py`'s `_surface_pattern`: its wavelength is about
+half the sphere, far coarser than the few pixels a pose error displaces a
+projection by, so blending it loses nothing (blended gradient retention stayed
+at 98-100% out to 90 arcminutes). The effect only appears once the pattern's
+detail is near the misregistration scale. `tests/test_texturing.py` now
+defines `_high_frequency_pattern` (wavelength ~0.14 world units) for exactly
+this, and `_SphereDataset` gained `pattern=` and `pose_error_arcmin=`
+arguments. At that operating point the original measurement reproduces
+closely: blended retains **59%** of the ground truth's gradient, view-selected
+**106%**, while pointwise L1 goes the other way (0.171 blended vs 0.199
+selected).
+
+**Two bugs found and fixed while building it** (both mutation-checked):
+
+- `_gradient_summed_area` accumulated the summed-area table in **float32**,
+  because that is the dtype training images arrive in. Over a 512x512 image
+  that leaves box readouts wrong by 0.087 against a table maximum of ~1e5 --
+  four orders of magnitude worse than the 1.1e-5 the input rounding alone
+  costs, and the error lands directly in the (face, view) quality scores.
+- `_box_means` could return a **negative** mean of gradient magnitudes, from
+  four-corner cancellation on a near-empty box. That reaches `-log()` in
+  `select_views_mrf` as `NaN`, and `np.argmin` returns a `NaN`'s index in
+  preference to every real cost -- so the face would be textured from the one
+  view that cannot see it. It also breaks the seed search, since every
+  comparison against `NaN` is False. Now clamped at zero.
+
+### What was executed
+
+Full suite **110 passed** (98 before). Delivery path run end to end on CPU:
+3480 -> 400 triangles, view-selected albedo + normal + AO on one shared UV
+layout, OBJ/MTL/PNGs written and read back, `mesh_metrics.json` round-tripped.
+Mutations checked: dropping the `_box_means` clamp, dropping the float64
+promotion, blacking out the fallback, ignoring the MRF labels, ignoring the
+per-texel face id, and disabling view selection entirely -- each fails a test.
+The `--texture_view_selection` CLI guard is placed beside the existing
+`--normal_map` guard and was **verified by code review only**: reaching it
+needs a real checkpoint.
+
+<details>
+<summary>Original step 2 design (for reference)</summary>
 
 ### Bake from labels
 
@@ -189,7 +248,9 @@ otherwise, matching the existing `--normal_map` guard) and
 3. **Shared UV layout.** View-selected albedo, normal and AO maps must report
    identical `triangle_uvs`.
 
-## Step 3 — seam levelling + `seam_discontinuity`
+</details>
+
+## Step 3 — seam levelling + `seam_discontinuity` — **START HERE**
 
 After labelling, a vertex on a seam has two colours depending on which side you
 sample. Solve for an additive correction `g` per **(vertex, label)** pair — not

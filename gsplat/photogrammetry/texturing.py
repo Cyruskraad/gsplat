@@ -24,6 +24,10 @@ module dresses it.
 - :func:`bake_texture_atlas` bakes that same color signal into a UV-unwrapped
   texture atlas, so the result carries detail beyond the mesh's vertex density
   and loads with its texture in standard DCC tools and game engines.
+- :func:`bake_texture_atlas_view_selected` bakes that atlas from *one chosen
+  view per face* instead of a blend (:func:`face_view_quality` +
+  :func:`select_views_mrf`), which keeps the high-frequency detail blending
+  destroys -- at the cost of pointwise accuracy, so it is opt-in.
 - :func:`bake_normal_map` records a dense mesh's normals onto a decimated
   mesh's atlas, and :func:`bake_ambient_occlusion` records how much of the sky
   each point can see. With the albedo atlas these are the standard
@@ -657,6 +661,9 @@ def bake_mesh_texture(
     outlier_sigma: Optional[float] = None,
     outlier_iterations: int = 3,
     allow_atlas_fallback: bool = True,
+    view_selection: bool = False,
+    mrf_smoothness: float = 1.0,
+    stats_out: Optional[dict] = None,
 ):
     """Bake texture onto ``mesh`` in either supported form.
 
@@ -679,6 +686,15 @@ def bake_mesh_texture(
             instead of raising. Defaults to ``True``: this runs at the end of a
             long training run or pipeline, where losing the mesh entirely is
             the worse outcome.
+        view_selection: In ``"atlas"`` mode, texture each face from a single
+            chosen view rather than blending -- see
+            :func:`bake_texture_atlas_view_selected` for the tradeoff this
+            makes. Ignored in ``"vertex"`` mode, which has no faces to label.
+        mrf_smoothness: Seam penalty, for ``view_selection``.
+        stats_out: If given, a dict updated in place with the view-selection
+            stats. An out-parameter rather than a third return value because
+            several callers unpack this function's ``(mesh, texture)`` pair,
+            and a selection that fell back to blending has no stats to report.
 
     Returns:
         ``(mesh, texture)``. ``texture`` is the ``uint8`` atlas in ``"atlas"``
@@ -703,6 +719,19 @@ def bake_mesh_texture(
         )
 
     try:
+        if view_selection:
+            mesh, texture, stats = bake_texture_atlas_view_selected(
+                mesh,
+                dataset,
+                texture_size=texture_size,
+                max_views=max_views,
+                mrf_smoothness=mrf_smoothness,
+                outlier_sigma=outlier_sigma,
+                outlier_iterations=outlier_iterations,
+            )
+            if stats_out is not None:
+                stats_out.update(stats)
+            return mesh, texture
         return bake_texture_atlas(
             mesh,
             dataset,
@@ -1127,6 +1156,12 @@ def _gradient_summed_area(image: np.ndarray) -> np.ndarray:
     what makes scoring every (face, view) pair affordable: the alternative is a
     variable-size slice per pair, in Python, F x V times.
     """
+    # float64 throughout: training images arrive as float32, and accumulating
+    # a 200k-entry cumulative sum in float32 leaves box readouts wrong by up to
+    # 6e-5 -- comparable to a typical gradient magnitude over a flat patch, and
+    # enough to drive the readout negative. That error lands directly in the
+    # (face, view) quality scores this table exists to compute.
+    image = np.asarray(image, dtype=np.float64)
     gray = image.mean(axis=2) if image.ndim == 3 else image
     grad_x = np.zeros_like(gray)
     grad_y = np.zeros_like(gray)
@@ -1139,10 +1174,19 @@ def _gradient_summed_area(image: np.ndarray) -> np.ndarray:
 
 
 def _box_means(table: np.ndarray, x0, y0, x1, y1) -> np.ndarray:
-    """Mean of the tabulated quantity over each ``[x0, x1) x [y0, y1)`` box."""
+    """Mean of the tabulated quantity over each ``[x0, x1) x [y0, y1)`` box.
+
+    Clamped at zero. The four-corner difference of a cumulative sum loses
+    precision catastrophically when a nearly-empty box is read out of a large
+    table, and can come back a few times ``1e-5`` *below* zero -- which is
+    impossible for a mean of gradient magnitudes. It matters because the caller
+    feeds this to ``-log()``: a negative quality becomes ``NaN``, ``np.argmin``
+    returns the index of a ``NaN`` in preference to any real value, and the
+    face would be textured from the one view that cannot see it.
+    """
     total = table[y1, x1] - table[y0, x1] - table[y1, x0] + table[y0, x0]
     area = np.maximum((x1 - x0) * (y1 - y0), 1)
-    return total / area
+    return np.maximum(total / area, 0.0)
 
 
 def face_view_quality(mesh, dataset, max_views: Optional[int] = None):
@@ -1407,3 +1451,212 @@ def select_views_mrf(
         "num_seeds": int(len(seeds)),
     }
     return labels, stats
+
+
+def _texel_face_ids(o3d, mesh, positions, normals):
+    """Which triangle each atlas texel's surface point belongs to.
+
+    The atlas rasterizer interpolates positions and normals but does not record
+    the source triangle, and view selection is *per face*, so it has to be
+    recovered: nudge each texel out along its normal and cast straight back
+    down, then read ``primitive_ids``. Measured 100% recovery on a sphere.
+
+    Texels rasterized in the margin around a chart are extrapolated off the
+    surface and may hit nothing (or a neighbour); those come back as -1 so the
+    caller can fall back rather than texture them from a wrong face's view.
+
+    Returns:
+        ``(F_ids, hit)``: the ``(N,)`` face index per texel (-1 where none) and
+        the ``(N,)`` bool mask of texels that hit.
+    """
+    if positions.shape[0] == 0:
+        return (
+            np.full(0, -1, dtype=np.int64),
+            np.zeros(0, dtype=bool),
+        )
+
+    extent = np.asarray(mesh.get_max_bound()) - np.asarray(mesh.get_min_bound())
+    eps = max(1e-4 * float(np.linalg.norm(extent)), 1e-9)
+
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    rays = np.concatenate([positions + normals * eps, -normals], axis=1)
+    result = scene.cast_rays(o3d.core.Tensor(rays.astype(np.float32)))
+    hit_t = result["t_hit"].numpy()
+    primitives = result["primitive_ids"].numpy()
+
+    # A texel on the surface hits its own face at t ~ eps. A much longer hit
+    # means the ray started off-surface and landed on unrelated geometry.
+    hit = np.isfinite(hit_t) & (hit_t <= 4.0 * eps)
+    face_ids = np.where(hit, primitives.astype(np.int64), -1)
+    return face_ids, hit
+
+
+def bake_texture_atlas_view_selected(
+    mesh,
+    dataset,
+    texture_size: int = 2048,
+    max_views: Optional[int] = None,
+    mrf_smoothness: float = 1.0,
+    outlier_sigma: Optional[float] = None,
+    outlier_iterations: int = 3,
+    unwrap_size: Optional[int] = None,
+    gutter: float = 1.0,
+    margin: float = 2.0,
+    max_stretch: float = 1.0 / 6.0,
+    dilation: int = 4,
+):
+    """Bake a UV atlas that samples **one** view per face instead of blending.
+
+    :func:`bake_texture_atlas` averages every view that sees a texel. Two views
+    of a surface point are never registered to sub-pixel accuracy after real
+    SfM, so that average is a low-pass filter and the atlas comes out blurrier
+    than any single source photograph. This instead chooses one view per face
+    (:func:`select_views_mrf` over :func:`face_view_quality`, following Waechter
+    et al., *Let There Be Color!*, ECCV 2014) and samples each texel from that
+    view alone.
+
+    **This is a tradeoff, not a strict improvement, and it is deliberately not
+    the default.** Measured on a synthetic sphere with cameras perturbed to
+    simulate residual pose error: at 45' of rotation the blended atlas retains
+    53% of the ground truth's contrast and this one retains 105% -- but the
+    blended atlas is *closer pointwise* (L1 0.152 vs 0.185), because blending
+    attenuates detail while single-view sampling displaces it. Pick this for an
+    asset that will be looked at; pick blending for one that will be measured.
+    :func:`gsplat.photogrammetry.metrics.atlas_sharpness` reports the numbers
+    that distinguish them.
+
+    The blended atlas is computed anyway and used wherever a single view will
+    not do: faces no view can texture (:data:`NO_VIEW`), texels whose face
+    could not be recovered, and texels their face's chosen view cannot actually
+    see. Averaging a handful of views is the right answer there, and it is what
+    keeps this from punching holes in the atlas.
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``. Must be manifold, as for
+            :func:`bake_texture_atlas`.
+        dataset: An ``examples.datasets.colmap.Dataset``-like object.
+        texture_size: Width/height of the (square) texture, in texels.
+        max_views: If given, only the first ``max_views`` images are used.
+        mrf_smoothness: Seam penalty passed to :func:`select_views_mrf`. Higher
+            means fewer, larger single-view regions textured from worse views.
+        outlier_sigma: Robust fusion for the *blended fallback* -- see
+            :func:`_bake_points_from_views`. The two are complements, not
+            alternatives: robust blending still governs the fallback regions.
+        unwrap_size: See :func:`bake_texture_atlas`.
+        gutter: See :func:`bake_texture_atlas`.
+        margin: See :func:`bake_texture_atlas`.
+        max_stretch: See :func:`bake_texture_atlas`.
+        dilation: See :func:`bake_texture_atlas`.
+
+    Returns:
+        ``(mesh, texture, stats)``. ``mesh`` carries ``triangle_uvs``/
+        ``textures``; ``texture`` is the ``(texture_size, texture_size, 3)``
+        ``uint8`` atlas. ``stats`` reports the labelling under ``"mrf"``, the
+        texel accounting (``num_texels``, ``num_texels_view_selected``,
+        ``num_texels_blended``, ``fallback_fraction``, ``num_texels_no_face``),
+        and ``atlas_sharpness`` for both this atlas and the blended one it
+        replaced, measured over the same covered texels so they are comparable.
+
+    Raises:
+        ValueError: If ``mesh`` has no triangles, ``texture_size`` is not
+            positive, or ``mesh`` is non-manifold (see
+            :func:`_unwrap_and_rasterize`).
+    """
+    from .metrics import atlas_sharpness
+
+    o3d = _require_open3d()
+
+    atlas = _unwrap_and_rasterize(
+        mesh,
+        texture_size,
+        unwrap_size=unwrap_size,
+        gutter=gutter,
+        margin=margin,
+        max_stretch=max_stretch,
+    )
+    rows, cols = atlas.rows, atlas.cols
+    positions, normals = atlas.positions, atlas.normals
+
+    texture = np.zeros((texture_size, texture_size, 3), dtype=np.float64)
+    blended_texture = np.zeros_like(texture)
+    filled = np.zeros((texture_size, texture_size), dtype=bool)
+    stats = {
+        "num_texels": int(rows.size),
+        "num_texels_view_selected": 0,
+        "num_texels_blended": 0,
+        "fallback_fraction": 0.0,
+        "num_texels_no_face": 0,
+        "mrf": {},
+        "atlas_sharpness": {},
+        "blended_atlas_sharpness": {},
+    }
+
+    if rows.size > 0:
+        # 1. The blended bake, unchanged -- the fallback everywhere a single
+        #    view won't do.
+        color_accum, weight_accum = _bake_points_from_views(
+            mesh,
+            dataset,
+            positions,
+            normals,
+            max_views=max_views,
+            outlier_sigma=outlier_sigma,
+            outlier_iterations=outlier_iterations,
+        )
+        observed = weight_accum > 0
+        blended = np.zeros_like(color_accum)
+        blended[observed] = color_accum[observed] / weight_accum[observed, None]
+
+        # 2. One view per face.
+        face_ids, has_face = _texel_face_ids(o3d, mesh, positions, normals)
+        quality = face_view_quality(mesh, dataset, max_views=max_views)
+        adjacency = _face_adjacency(np.asarray(mesh.triangles))
+        labels, mrf_stats = select_views_mrf(
+            quality, adjacency, smoothness=mrf_smoothness
+        )
+        texel_label = np.full(positions.shape[0], NO_VIEW, dtype=np.int64)
+        texel_label[has_face] = labels[face_ids[has_face]]
+
+        # 3. Sample each texel from its one view. Reusing _view_samples means
+        #    the projection, in-frame test and occlusion ray cast are the same
+        #    ones the blended path uses, rather than a second implementation
+        #    that could disagree about what "visible" means.
+        selected = np.zeros_like(blended)
+        picked = np.zeros(positions.shape[0], dtype=bool)
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+        for chunk, colors, _weights, view_index in _view_samples(
+            scene, o3d, dataset, positions, normals, max_views, 1 << 20
+        ):
+            take = texel_label[chunk] == view_index
+            if take.any():
+                selected[chunk[take]] = colors[take]
+                picked[chunk[take]] = True
+
+        final = np.where(picked[:, None], selected, blended)
+        covered = observed | picked
+        texture[rows[covered], cols[covered]] = final[covered]
+        blended_texture[rows[covered], cols[covered]] = blended[covered]
+        filled[rows[covered], cols[covered]] = True
+
+        num_covered = int(covered.sum())
+        stats["mrf"] = mrf_stats
+        stats["num_texels_view_selected"] = int(picked.sum())
+        stats["num_texels_blended"] = num_covered - int(picked.sum())
+        stats["fallback_fraction"] = (
+            float(1.0 - picked.sum() / num_covered) if num_covered else 0.0
+        )
+        stats["num_texels_no_face"] = int((~has_face).sum())
+        stats["atlas_sharpness"] = atlas_sharpness(texture, filled)
+        stats["blended_atlas_sharpness"] = atlas_sharpness(blended_texture, filled)
+
+    texture = _fill_texture_holes(texture, filled, dilation)
+    texture = (np.clip(texture, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(atlas.triangle_uvs)
+    mesh.textures = [o3d.geometry.Image(texture)]
+    mesh.triangle_material_ids = o3d.utility.IntVector(
+        np.zeros(len(mesh.triangles), dtype=np.int32)
+    )
+    return mesh, texture, stats

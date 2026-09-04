@@ -29,6 +29,7 @@ pytest.importorskip(
 import open3d as o3d
 
 from gsplat.photogrammetry.metrics import (
+    atlas_sharpness,
     mesh_quality_stats,
     point_cloud_stats,
     point_to_mesh_distance,
@@ -155,3 +156,73 @@ def test_point_to_mesh_distance_with_no_points_reports_nothing_measured():
     # Percentile keys are present too, so the schema doesn't change shape.
     populated = point_to_mesh_distance(np.zeros((5, 3)), sphere)
     assert set(stats) == set(populated)
+
+
+# ---------------------------------------------------------------------------
+# atlas_sharpness
+# ---------------------------------------------------------------------------
+
+
+def test_atlas_sharpness_rises_with_detail():
+    """A checkerboard is sharper than a ramp is sharper than a flat field."""
+    size = 64
+    flat = np.full((size, size, 3), 0.5)
+    ramp = np.tile(np.linspace(0.0, 1.0, size)[None, :, None], (size, 1, 3))
+    checker = np.indices((size, size)).sum(axis=0) % 2
+    checker = np.repeat(checker[..., None].astype(float), 3, axis=2)
+
+    gradients = [atlas_sharpness(t)["mean_gradient"] for t in (flat, ramp, checker)]
+    assert gradients[0] == pytest.approx(0.0)
+    assert gradients[0] < gradients[1] < gradients[2]
+    # Contrast tracks the same ordering but is a different quantity: the ramp
+    # and the checkerboard span the same range, so only the gradient separates
+    # them, which is why both are reported.
+    assert atlas_sharpness(flat)["color_std"] == pytest.approx(0.0)
+
+
+def test_atlas_sharpness_ignores_the_edge_of_the_covered_region():
+    """A chart's border against the fill color is layout, not detail.
+
+    The step from a baked texel to an unbaked one is arbitrary in size, and
+    counting it would report a *more fragmented* UV atlas as a *sharper* one.
+    """
+    size = 32
+    texture = np.zeros((size, size, 3))
+    covered = np.zeros((size, size), dtype=bool)
+    # A flat, bright square on a black (unbaked) background: zero real detail,
+    # but a large step all the way round its edge.
+    texture[8:24, 8:24] = 0.9
+    covered[8:24, 8:24] = True
+
+    assert atlas_sharpness(texture, covered)["mean_gradient"] == pytest.approx(0.0)
+    # Premise: without the mask that same step is reported as detail, so the
+    # assertion above is not vacuous.
+    assert atlas_sharpness(texture)["mean_gradient"] > 0.01
+
+
+def test_atlas_sharpness_handles_an_uncovered_atlas():
+    """Nothing baked is a real outcome, and returns zeros like the rest of the
+    module rather than dividing by an empty count."""
+    texture = np.zeros((8, 8, 3), dtype=np.uint8)
+    stats = atlas_sharpness(texture, np.zeros((8, 8), dtype=bool))
+    assert stats["num_covered_texels"] == 0
+    assert stats["mean_gradient"] == 0.0 and stats["color_std"] == 0.0
+    # Same keys as a populated result, so the report's schema doesn't change.
+    assert set(stats) == set(atlas_sharpness(texture))
+
+
+def test_atlas_sharpness_reads_uint8_and_float_alike():
+    """uint8 atlases (what the bakers return) and floats must agree."""
+    rng = np.random.default_rng(0)
+    as_uint8 = (rng.random((32, 32, 3)) * 255).round().astype(np.uint8)
+    as_float = as_uint8 / 255.0
+    a, b = atlas_sharpness(as_uint8), atlas_sharpness(as_float)
+    assert a["mean_gradient"] == pytest.approx(b["mean_gradient"])
+    assert a["color_std"] == pytest.approx(b["color_std"])
+
+
+def test_atlas_sharpness_rejects_a_mismatched_mask():
+    with pytest.raises(ValueError, match="does not match"):
+        atlas_sharpness(np.zeros((8, 8, 3)), np.zeros((4, 4), dtype=bool))
+    with pytest.raises(ValueError, match=r"must be \(H, W, 3\)"):
+        atlas_sharpness(np.zeros((8, 8)))

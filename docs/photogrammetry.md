@@ -156,6 +156,64 @@ complements: masking removes the wholesale occlusions, robust fusion cleans up
 the residual disagreement masking doesn't catch. Each extra round costs one
 more pass over the dataset.
 
+#### Per-face view selection (sharper, but a tradeoff)
+
+Blending is the wrong operator for *sharpness*, and robust fusion cannot fix
+that. Two views of the same surface point are never registered to sub-pixel
+accuracy after real SfM, so averaging them is a low-pass filter: the atlas
+comes out systematically blurrier than any single source photograph, and
+sigma-clipping only removes *outliers* -- the surviving inliers are still
+averaged, and averaging slightly-misaligned inliers is exactly what destroys
+high-frequency detail.
+
+`--texture_view_selection` does what production photogrammetry texturers do
+(Waechter et al., *Let There Be Color!*, ECCV 2014): choose **one** view per
+face, so each face is textured from a single un-averaged photograph. The
+choice is an MRF over the mesh's face-adjacency graph, minimising
+
+```
+E(labels) = sum_f -log(quality[f, label_f])  +  lambda * (number of seams)
+```
+
+where `quality[f, v]` is the gradient energy of view `v` over face `f`'s
+projection -- one number that rewards being close, fronto-parallel *and* in
+focus, so a motion-smeared view loses to a sharper one with worse geometry.
+`--texture_mrf_lambda` is that lambda: raise it for fewer, larger single-view
+regions.
+
+**This is a genuine tradeoff, not a strict improvement, which is why it is off
+by default.** Measured on a synthetic sphere whose cameras were rotated to
+simulate residual pose error, at 45 arcminutes:
+
+| | detail retained (gradient) | pointwise error (L1) |
+|---|---|---|
+| blended | 59% | **0.171** |
+| view-selected | **106%** | 0.199 |
+
+Blending *attenuates* detail; single-view sampling *displaces* it. A
+displaced-but-sharp texture scores worse pointwise than a blurred one even
+though it looks far better. Choose view selection for an asset that will be
+*looked at*, and blending for one that will be *measured*. The
+`view_selection` block in `mesh_metrics.json` reports both numbers
+(`atlas_sharpness` vs `blended_atlas_sharpness`) for the actual capture, and
+the CLI warns if view selection came out *less* sharp -- which means the poses
+were already well registered and blending is the better choice for that scene.
+
+Faces no single view can texture, and texels their face's chosen view cannot
+see, keep the **blended** colour: averaging a handful of views is the right
+answer where one view is unavailable. So `--texture_outlier_sigma` and
+`--texture_view_selection` are complements, not alternatives -- robust
+blending still governs the fallback regions.
+
+The labelling uses ICM (iterated conditional modes) rather than the
+alpha-expansion graph cut the paper uses, because alpha-expansion needs a
+max-flow solver and `gsplat[mesh]` is deliberately just `open3d` + `imageio`.
+ICM has no optimality bound where alpha-expansion is within a known factor of
+the global optimum; it is run from several seeds (the per-face best, and
+"every face takes view alpha" for the strongest few views) because a single
+greedy sweep is badly seed-dependent under a strong seam penalty. The
+practical gap is a few extra seams.
+
 #### Decimation + normal maps (the delivery path)
 
 TSDF and Poisson extraction tessellate to the voxel grid, not to the scene's
@@ -585,7 +643,21 @@ something gsplat ships.
   `.mtl` and `.png` together) and the `uint8` atlas as a numpy array.
   `bake_mesh_texture(mesh, dataset, mode="vertex"|"atlas", ...)` is the
   dispatching entry point the CLIs use, returning `(mesh, texture_or_None)`
-  and falling back to per-vertex colors if the mesh can't be unwrapped.
+  and falling back to per-vertex colors if the mesh can't be unwrapped; pass
+  `view_selection=True` (and a `stats_out={}` dict to receive the numbers) to
+  route it through the single-view path.
+- `gsplat.photogrammetry.bake_texture_atlas_view_selected(mesh, dataset,
+  texture_size=..., mrf_smoothness=...)` returns `(mesh, texture, stats)`,
+  texturing each face from one chosen view instead of a blend. `stats` carries
+  the labelling (`mrf`), the texel accounting, and `atlas_sharpness` for both
+  this atlas and the blended one it replaced. The pieces are usable on their
+  own: `face_view_quality(mesh, dataset)` returns the `(F, V)` score matrix and
+  `select_views_mrf(quality, adjacency, smoothness=...)` returns
+  `(labels, stats)` with `NO_VIEW` for faces no view can texture.
+- `gsplat.photogrammetry.atlas_sharpness(texture, covered_mask=None)` measures
+  how much high-frequency detail a baked atlas carries. This is the metric that
+  distinguishes view selection from blending -- pointwise error does not, and
+  goes the other way.
 - `gsplat.photogrammetry.bake_ambient_occlusion(mesh, occluder_mesh=None,
   num_samples=..., cage=...)` returns `(mesh, ao_map, stats)`; `stats` reports
   `mean_ao`/`min_ao` and the `cage`/`max_distance` used. A `mean_ao` of
