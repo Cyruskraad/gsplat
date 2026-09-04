@@ -869,7 +869,7 @@ def _contamination_weight_fraction(mesh, dataset, points, normals):
     bad = np.zeros(len(points))
     total = np.zeros(len(points))
     magenta = np.array([1.0, 0.0, 1.0])
-    for chunk, sampled, weight in _view_samples(
+    for chunk, sampled, weight, _view in _view_samples(
         scene, o3d, dataset, points, normals, None, 1 << 20
     ):
         is_bad = np.all(np.abs(sampled - magenta) < 0.02, axis=1)

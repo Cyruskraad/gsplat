@@ -43,12 +43,14 @@ from ._open3d import _require_open3d
 
 
 def _view_samples(scene, o3d, dataset, points, normals, max_views, chunk_size):
-    """Yield ``(indices, colors, weights)`` for every visible (point, view) pair.
+    """Yield ``(indices, colors, weights, view_index)`` per visible (point, view).
 
     One pass over the dataset: project every point into each camera, drop the
     out-of-frame ones, ray-cast away the occluded ones, and weight what is left
     by view-direction/normal alignment and inverse distance. Factored out so a
-    robust estimator can run the same sampling twice without duplicating it.
+    robust estimator can run the same sampling twice without duplicating it,
+    and so view selection can reuse exactly this visibility test rather than
+    reimplementing the subtle part.
     """
     num_views = len(dataset) if max_views is None else min(max_views, len(dataset))
     for i in range(num_views):
@@ -98,7 +100,7 @@ def _view_samples(scene, o3d, dataset, points, normals, max_views, chunk_size):
             weight = cos_weight * dist_weight + 1e-6
             # `chunk` indexes each point at most once per view, so callers can
             # use plain in-place adds rather than the much slower np.add.at.
-            yield chunk, sampled, weight
+            yield chunk, sampled, weight, i
 
 
 def _bake_points_from_views(
@@ -186,7 +188,7 @@ def _bake_points_from_views(
 
     square_accum = np.zeros((num_points, 3), dtype=np.float64)
     view_counts = np.zeros((num_points,), dtype=np.int64)
-    for chunk, sampled, weight in stream():
+    for chunk, sampled, weight, _ in stream():
         color_accum[chunk] += sampled * weight[:, None]
         weight_accum[chunk] += weight
         if outlier_sigma is not None:
@@ -220,7 +222,7 @@ def _bake_points_from_views(
         round_color = np.zeros_like(color_accum)
         round_weight = np.zeros_like(weight_accum)
         round_square = np.zeros_like(square_accum)
-        for chunk, sampled, weight in stream():
+        for chunk, sampled, weight, _ in stream():
             residual = np.linalg.norm(sampled - mean[chunk], axis=1)
             keep = sparse[chunk] | (residual <= outlier_sigma * spread[chunk])
             if not keep.any():
@@ -1089,3 +1091,319 @@ def bake_ambient_occlusion(
         "cage": float(cage),
     }
     return mesh, ao_map, stats
+
+
+def _face_adjacency(triangles: np.ndarray) -> np.ndarray:
+    """Pairs of faces sharing an edge, as an ``(E, 2)`` array.
+
+    Built by sorting each face's three vertex-pairs into canonical edge keys and
+    grouping with ``np.unique`` -- no graph library needed. Edges shared by more
+    than two faces (non-manifold) contribute no pair rather than a
+    combinatorial explosion of them.
+    """
+    edges = np.concatenate(
+        [triangles[:, [0, 1]], triangles[:, [1, 2]], triangles[:, [2, 0]]], axis=0
+    )
+    edges = np.sort(edges, axis=1)
+    faces = np.tile(np.arange(len(triangles)), 3)
+
+    order = np.lexsort((edges[:, 1], edges[:, 0]))
+    edges, faces = edges[order], faces[order]
+    same = np.all(edges[1:] == edges[:-1], axis=1)
+    # A manifold interior edge appears exactly twice and so shows up as a
+    # single True; a boundary edge once (no True); a non-manifold edge more
+    # often, where the runs below deliberately pair only consecutive duplicates.
+    starts = np.nonzero(same)[0]
+    if starts.size == 0:
+        return np.zeros((0, 2), dtype=np.int64)
+    pairs = np.stack([faces[starts], faces[starts + 1]], axis=1)
+    return pairs[pairs[:, 0] != pairs[:, 1]].astype(np.int64)
+
+
+def _gradient_summed_area(image: np.ndarray) -> np.ndarray:
+    """Summed-area table of an image's gradient magnitude.
+
+    Lets the mean gradient over any axis-aligned box be read in O(1), which is
+    what makes scoring every (face, view) pair affordable: the alternative is a
+    variable-size slice per pair, in Python, F x V times.
+    """
+    gray = image.mean(axis=2) if image.ndim == 3 else image
+    grad_x = np.zeros_like(gray)
+    grad_y = np.zeros_like(gray)
+    grad_x[:, :-1] = np.abs(np.diff(gray, axis=1))
+    grad_y[:-1, :] = np.abs(np.diff(gray, axis=0))
+    magnitude = grad_x + grad_y
+    table = np.zeros((magnitude.shape[0] + 1, magnitude.shape[1] + 1), dtype=np.float64)
+    table[1:, 1:] = magnitude.cumsum(axis=0).cumsum(axis=1)
+    return table
+
+
+def _box_means(table: np.ndarray, x0, y0, x1, y1) -> np.ndarray:
+    """Mean of the tabulated quantity over each ``[x0, x1) x [y0, y1)`` box."""
+    total = table[y1, x1] - table[y0, x1] - table[y1, x0] + table[y0, x0]
+    area = np.maximum((x1 - x0) * (y1 - y0), 1)
+    return total / area
+
+
+def face_view_quality(mesh, dataset, max_views: Optional[int] = None):
+    """Score how well each view could texture each face.
+
+    The data term of the view-selection MRF (see :func:`select_views_mrf`).
+    Following Waechter et al., a view's worth for a face is the *gradient energy
+    over the face's projection* -- which rewards being close and
+    fronto-parallel (a large projection) and being in focus (a strong gradient)
+    in one number, and correctly demotes a blurred or motion-smeared view whose
+    geometry is otherwise ideal.
+
+    Visibility comes from :func:`_view_samples`, so occlusion is decided by
+    exactly the same ray cast the blended bakes use rather than a second,
+    subtly-different implementation.
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``.
+        dataset: An ``examples.datasets.colmap.Dataset``-like object.
+        max_views: If given, only the first ``max_views`` images are scored.
+
+    Returns:
+        ``(F, V)`` float array. Zero means the view cannot texture that face at
+        all -- occluded, out of frame, or facing away.
+    """
+    o3d = _require_open3d()
+
+    if not mesh.has_vertex_normals():
+        mesh.compute_vertex_normals()
+    triangles = np.asarray(mesh.triangles)
+    vertices = np.asarray(mesh.vertices)
+    if len(triangles) == 0:
+        raise ValueError("Cannot score views for a mesh with no triangles.")
+
+    centroids = vertices[triangles].mean(axis=1)
+    face_normals = np.asarray(
+        mesh.triangle_normals
+        if mesh.has_triangle_normals()
+        else mesh.compute_triangle_normals().triangle_normals
+    )
+
+    num_views = len(dataset) if max_views is None else min(max_views, len(dataset))
+    quality = np.zeros((len(triangles), num_views), dtype=np.float64)
+
+    # Visibility, from the same ray cast the blended bakes use.
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    visible = np.zeros((len(triangles), num_views), dtype=bool)
+    for chunk, _colors, _weights, view_index in _view_samples(
+        scene, o3d, dataset, centroids, face_normals, max_views, 1 << 20
+    ):
+        visible[chunk, view_index] = True
+
+    # 3D face area, the part of the projected area that doesn't depend on view.
+    edge1 = vertices[triangles[:, 1]] - vertices[triangles[:, 0]]
+    edge2 = vertices[triangles[:, 2]] - vertices[triangles[:, 0]]
+    face_area = 0.5 * np.linalg.norm(np.cross(edge1, edge2), axis=1)
+
+    for view_index in range(num_views):
+        seen = visible[:, view_index]
+        if not seen.any():
+            continue
+        data = dataset[view_index]
+        camtoworld = data["camtoworld"].numpy()
+        K = data["K"].numpy()
+        image = data["image"].numpy() / 255.0
+        height, width = image.shape[:2]
+        viewmat = np.linalg.inv(camtoworld)
+
+        corners = vertices[triangles[seen]]  # (S, 3, 3)
+        cam = (viewmat[:3, :3] @ corners.reshape(-1, 3).T + viewmat[:3, 3:4]).T
+        uvw = (K @ cam.T).T
+        uv = (uvw[:, :2] / np.clip(uvw[:, 2:3], 1e-8, None)).reshape(-1, 3, 2)
+
+        # Projected triangle area, in pixels.
+        d1 = uv[:, 1] - uv[:, 0]
+        d2 = uv[:, 2] - uv[:, 0]
+        projected_area = 0.5 * np.abs(d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0])
+
+        x0 = np.clip(np.floor(uv[..., 0].min(axis=1)), 0, width - 1).astype(np.int64)
+        x1 = np.clip(np.ceil(uv[..., 0].max(axis=1)) + 1, 1, width).astype(np.int64)
+        y0 = np.clip(np.floor(uv[..., 1].min(axis=1)), 0, height - 1).astype(np.int64)
+        y1 = np.clip(np.ceil(uv[..., 1].max(axis=1)) + 1, 1, height).astype(np.int64)
+        x1 = np.maximum(x1, x0 + 1)
+        y1 = np.maximum(y1, y0 + 1)
+        sharpness = _box_means(_gradient_summed_area(image), x0, y0, x1, y1)
+
+        # Gradient energy over the projection: sharpness carried over the area
+        # the face actually covers, not the box used to measure it.
+        quality[seen, view_index] = projected_area * sharpness
+        # A face degenerate in this view contributes nothing, whatever its
+        # gradient: it has no pixels to take colour from.
+        quality[seen, view_index] *= face_area[seen] > 0
+
+    return quality
+
+
+NO_VIEW = -1
+
+
+def select_views_mrf(
+    quality: np.ndarray,
+    adjacency: np.ndarray,
+    smoothness: float = 1.0,
+    max_iterations: int = 20,
+    max_seeds: int = 8,
+):
+    """Choose one view per face, trading per-face quality against seam count.
+
+    Blending every view is a low-pass filter: two views of a point are never
+    registered to sub-pixel accuracy after real SfM, so averaging them destroys
+    exactly the high-frequency detail the photographs contain. Texturing each
+    face from a *single* view keeps that detail. The cost is a colour
+    discontinuity wherever neighbouring faces choose differently, so the choice
+    is posed as an energy that also counts those seams:
+
+    .. code-block:: text
+
+        E(l) = sum_f  D_f(l_f)  +  smoothness * sum_(f,g adjacent) [ l_f != l_g ]
+        D_f(v) = -log(quality[f, v] + eps),   D_f(NO_VIEW) = a large constant
+
+    The Potts smoothness term penalises the *number* of seams, which is both
+    what we want minimised and what keeps the levelling step afterwards
+    tractable.
+
+    **Optimiser: ICM (iterated conditional modes).** Start from the per-face
+    best view, then sweep faces repeatedly, moving each to the label that
+    minimises its local energy given its neighbours, until a sweep changes
+    nothing.
+
+    A single ICM run is badly seed-dependent, and not in a subtle way: swept
+    from the per-face best view with a strong smoothness term, the first face
+    to move can cascade every other face onto its neighbour's label. On a
+    three-face example that lands on total energy 4.14 where 4.39 *below zero*
+    was available. So ICM is run from several seeds -- the per-face best, and
+    "every face takes view alpha" for each of the strongest few views -- and
+    the lowest-energy result wins. Each seed is a fixed point of the same
+    sweep, so this is deterministic, and it can only improve on any one seed.
+
+    *Honest tradeoff:* even so, ICM is a greedy local optimiser with no
+    optimality bound, where alpha-expansion via graph cut is within a known
+    factor of the global optimum. ICM is used because alpha-expansion needs a
+    max-flow solver, and this package's optional ``mesh`` extra is deliberately
+    just open3d and imageio. For a Potts model with a strong data term the
+    residual gap is mostly a few extra seams -- which is what seam levelling
+    removes anyway. The signature is kept optimiser-agnostic so a graph cut can
+    be dropped in behind it.
+
+    Args:
+        quality: ``(F, V)`` from :func:`face_view_quality`. Zero = unusable.
+        adjacency: ``(E, 2)`` face pairs from :func:`_face_adjacency`.
+        smoothness: Weight on the seam count. Raising it yields fewer, larger
+            single-view regions at the cost of using worse views inside them.
+        max_iterations: Cap on ICM sweeps per seed.
+        max_seeds: Cap on the "every face takes view alpha" seeds tried, taken
+            from the views with the most total quality. Bounds the cost on
+            captures with hundreds of images.
+
+    Returns:
+        ``(labels, stats)``. ``labels`` is ``(F,)`` of view indices, with
+        :data:`NO_VIEW` where no view can texture the face at all. ``stats``
+        reports ``num_faces``, ``num_unlabelled``, ``num_seams``,
+        ``num_views_used``, ``energy``, ``iterations`` and ``num_seeds``.
+    """
+    quality = np.asarray(quality, dtype=np.float64)
+    num_faces, num_views = quality.shape
+
+    # Data term. An unusable (zero-quality) view must never be chosen, so give
+    # it +inf rather than a merely-large cost -- a large finite cost can still
+    # win against enough smoothness pressure, which would texture a face from a
+    # camera that cannot see it.
+    with np.errstate(divide="ignore"):
+        data = -np.log(quality)
+    data[quality <= 0] = np.inf
+
+    usable = np.isfinite(data)
+    has_any = usable.any(axis=1)
+    # Cost of giving up on a face: worse than any real option, so NO_VIEW is
+    # only ever chosen where nothing else is available.
+    finite = data[usable]
+    no_view_cost = (finite.max() + 1.0) if finite.size else 0.0
+
+    # Neighbours per face, so each sweep can vectorise over candidate labels.
+    neighbours = [[] for _ in range(num_faces)]
+    for face_a, face_b in adjacency:
+        neighbours[face_a].append(face_b)
+        neighbours[face_b].append(face_a)
+    neighbours = [np.asarray(n, dtype=np.int64) for n in neighbours]
+
+    def total_energy(labels):
+        cost = 0.0
+        for face in range(num_faces):
+            label = int(labels[face])
+            cost += no_view_cost if label == NO_VIEW else data[face, label]
+        if len(adjacency):
+            cost += smoothness * float(
+                np.sum(labels[adjacency[:, 0]] != labels[adjacency[:, 1]])
+            )
+        return cost
+
+    def sweep(labels):
+        """Run ICM from `labels` until a pass changes nothing."""
+        labels = labels.copy()
+        iterations = 0
+        for iterations in range(1, max_iterations + 1):
+            changed = 0
+            for face in range(num_faces):
+                if not has_any[face]:
+                    continue
+                candidates = np.nonzero(usable[face])[0]
+                costs = data[face, candidates].copy()
+                neighbour_labels = labels[neighbours[face]]
+                if neighbour_labels.size:
+                    costs = costs + smoothness * (
+                        candidates[:, None] != neighbour_labels[None, :]
+                    ).sum(axis=1)
+                best = candidates[int(np.argmin(costs))]
+                if best != labels[face]:
+                    labels[face] = best
+                    changed += 1
+            if changed == 0:
+                break
+        return labels, iterations
+
+    # Seed 1: each face's own best view, ignoring seams.
+    greedy = np.full(num_faces, NO_VIEW, dtype=np.int64)
+    greedy[has_any] = np.argmin(np.where(usable, data, np.inf), axis=1)[has_any]
+    seeds = [greedy]
+
+    # Seeds 2..n: "every face that can, takes view alpha", for the strongest
+    # few views. These are the labellings a seam-dominated energy actually
+    # wants, and no per-face sweep from the greedy seed can reach them.
+    strength = np.where(usable, quality, 0.0).sum(axis=0)
+    for alpha in np.argsort(strength)[::-1][: max(max_seeds, 0)]:
+        if strength[alpha] <= 0:
+            break
+        seed = greedy.copy()
+        takeable = usable[:, alpha]
+        seed[takeable] = alpha
+        seeds.append(seed)
+
+    best_labels, best_energy, best_iterations = None, np.inf, 0
+    for seed in seeds:
+        candidate, iterations = sweep(seed)
+        energy = total_energy(candidate)
+        if energy < best_energy:
+            best_labels, best_energy, best_iterations = candidate, energy, iterations
+    labels = best_labels
+
+    seams = (
+        int(np.sum(labels[adjacency[:, 0]] != labels[adjacency[:, 1]]))
+        if len(adjacency)
+        else 0
+    )
+    stats = {
+        "num_faces": int(num_faces),
+        "num_unlabelled": int(np.sum(labels == NO_VIEW)),
+        "num_seams": seams,
+        "num_views_used": int(len(np.unique(labels[labels != NO_VIEW]))),
+        "energy": float(best_energy),
+        "iterations": int(best_iterations),
+        "num_seeds": int(len(seeds)),
+    }
+    return labels, stats
