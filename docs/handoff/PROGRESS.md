@@ -9,7 +9,7 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **161 tests pass** (153 before this session's Task 1). Every guard
+- **168 tests pass** (153 before this session). Every guard
   mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
@@ -34,6 +34,21 @@ looks right.
   original `TypeError`.
 - **`run_pipeline.py` non-dry-run**, delivering a textured mesh through the
   `extract_mesh` stage with no checkpoint and no GPU.
+- **Photometric camera refinement** (Zhou & Koltun 2014), on views ray-cast
+  from the same mesh it refines against, at 45' of injected pose error:
+  photometric residual **0.145 → 0.041** (3.5x), pairwise pose disagreement
+  **55.9' → 24.8'** (2.3x). Its effect on texturing, on the larger fixture:
+  blending's contrast retention **59.1% → 92.5%** against a
+  perfectly-registered ceiling of 92.9%, atlas L1 **0.180 → 0.057**, and
+  view selection's L1 **0.229 → 0.053** — which *flips the L1 ranking* to the
+  one exact poses produce. The headline tradeoff is a symptom of
+  misregistration, and this is it going away, measured.
+- **Three claims this session set out to confirm and instead falsified**, each
+  recorded in `ISSUES.md` § 4 rather than quietly dropped: open3d's shipped
+  implementation of the same algorithm (worse in every configuration, including
+  on exact poses); "single-scale will not recover 45'" (false at equal work);
+  and "blending retains >= 95% after refinement" (above the ceiling — exact
+  poses reach ~93%).
 - `black --check --required-version 22.3.0`, `py_compile`, and an `import` of
   every changed example script.
 
@@ -64,7 +79,7 @@ docstring too.
 
 ---
 
-## The 15 bugs found and fixed
+## The 16 bugs found and fixed
 
 Each was confirmed by reverting the fix and showing a test genuinely fails.
 
@@ -131,6 +146,15 @@ Each was confirmed by reverting the fix and showing a test genuinely fails.
     capture the frames differ by ~3.4x in scale plus a rotation, which puts
     every camera *inside* the reconstructed mesh. Pre-existing, and found only
     by running the path.
+
+16. **A rotation delta that does not carry its translation moves the camera
+    centre.** `bundle_adjustment._optimize`'s `R = exp(δ)·R₀`, `t = t₀ + Δt`
+    is fine there — reprojection BA's translation is always free to compensate
+    — but reused as-is for a photometric solve it swings the optical centre by
+    |t₀|·δ, which at |t₀| ≈ 3.5 and 45' is 0.046 world units: a third of the
+    texture's wavelength. The solve then made registration **worse**
+    (62' → 155'). Fixed by rotating `t₀` with the delta. Found by measuring the
+    outcome rather than the objective — the residual fell throughout.
 
 Two sharp edges are **guarded rather than fixed**, because they are upstream:
 `compute_uvatlas` segfaults (exit 139) on non-manifold input, so manifoldness is

@@ -126,10 +126,65 @@ Each of these cost real time to discover. Do not re-derive them.
     cameras should not see is also facing away and back-face rejection already
     removes it. Use `tests/test_texturing.py::_two_quads`.
 
+### Photometric camera refinement
+
+17. **open3d already ships this algorithm and it does not work here.**
+    `open3d.pipelines.color_map.run_rigid_optimizer` made the poses **worse in
+    every configuration tested** — including on *exact* poses, which it walked
+    72' away from. That is not a tuning problem on the caller's side. The cause
+    is structural: it optimises **per-vertex colours** as its surface proxy, so
+    the objective can only see detail the mesh's vertex density carries, and a
+    760-vertex sphere cannot represent the texture whose misregistration is
+    being measured. (This package bakes into a UV *atlas* for exactly that
+    reason.) Reuse was the right thing to try — it is an existing dependency
+    and "external tools stay external" — but the measurement decided it.
+18. **A rotation delta must carry the translation with it.** Parameterising a
+    pose as `R = exp(δ)·R₀`, `t = t₀ + Δt` — which is what
+    `bundle_adjustment._optimize` does — moves the camera *centre* when δ
+    changes, because the centre is `−Rᵀt`. Reprojection BA gets away with it
+    because its translation is always free to compensate. A photometric solve
+    does not: at |t₀| ≈ 3.5 a 45' rotation swings the centre by 0.046 world
+    units, a third of the texture's wavelength. With `t = exp(δ)·t₀ + Δt` the
+    solve improves the registration 62' → 20'; without it, it makes it *worse*,
+    62' → 155'.
+19. **The pyramid is not what makes 45' recoverable — the re-baked target is.**
+    The received claim ("a photometric objective has a tiny basin of
+    convergence; single-scale will not recover 45'") is false on this fixture,
+    and the numbers say why: the detail's wavelength is 5.2 px in the image and
+    45' displaces a projection by 1.70 px, well inside the 2.6 px
+    half-wavelength where the objective is unambiguous. **At equal work** — 9
+    optimisation rounds either way — single-scale reaches 23.6' and the 3-level
+    pyramid 24.75'. The pyramid earns its place further out, at 90'
+    (3.39 px, past the half-wavelength) where single-scale lands at 183' and
+    the pyramid at 133'. Neither *recovers* there, so the method's working
+    range is a displacement below half the detail's wavelength; the pyramid
+    widens the margin rather than extending the range.
+20. **Contrast retention is not a fidelity metric, in either direction.**
+    Trap 1 records that a sharp-but-displaced atlas scores worse on L1. The
+    converse also holds: an atlas can retain *more* gradient energy than a
+    perfectly-registered one, because residual misregistration **adds**
+    high-frequency energy. Measured against the analytic sphere, refined poses
+    gave 92.2% retention where exact poses gave 79.2% — the refined atlas is
+    not better, it is noisier. Always read retention against the
+    perfectly-registered ceiling, never against 100%.
+21. **Rendering views from the analytic sphere while refining against the mesh
+    is a confound, not a fixture.** `_SphereDataset` ray-traces the analytic
+    sphere; `_unit_sphere_mesh` is a polyhedron inscribed in it, and at
+    resolution 10 the sagitta is ~9% of the high-frequency pattern's
+    wavelength. The photometric optimum is then genuinely not the true pose, so
+    refinement spends its freedom compensating for the geometry: it moved
+    *correct* cameras by 15' and made the bake 3.9% worse. That reads as "the
+    method harms good poses" when it is really "the method was handed the wrong
+    surface". Rendering the views from the mesh itself (as
+    `examples/make_synthetic_capture.py` does) removes it, and the same test
+    then shows no harm at all.
+
 ## 5. The recurring testing failure — read this before writing tests
 
-**Four times on this branch, a test proved a *mechanism* worked while the
-*call site* went unpinned.** Each time the mutation passed the entire suite:
+**Seven times on this branch, a test proved a *mechanism* worked while the
+*call site* went unpinned.** Twice in this session's own work, *after* writing
+the test that was meant to pre-empt it — both caught only by mutating the
+caller. Each time the mutation passed the entire suite:
 
 | Mutation that escaped | Why the existing test missed it | What closed it |
 |---|---|---|
@@ -137,6 +192,9 @@ Each of these cost real time to discover. Do not re-derive them.
 | Sum projected areas instead of max | Every scaling test uses *ratios*, and a consistent over-count cancels out of a ratio | A test pinning absolute evidence against view count |
 | `bake_texture_atlas_pages(occluder=None)` | The occlusion test supplies its own occluder either way | A test driving the page bake itself |
 | Return an unmeasured decimation result | The first attempt produced the same mesh by coincidence | A stronger mutation (return an over-decimated mesh) |
+| `bake_mesh_texture` never accepted the `seam_smoothness` its CLI passed | No test had ever called `extract_mesh.main()` — the `assert cfg.ckpt` before the method dispatch made a GPU checkpoint the price of reaching it | `tests/test_extract_mesh_cli.py`, driving `main()` |
+| Force every pyramid level to full resolution | The pyramid test compared `num_levels=1` against `num_levels=3` at the same `alternations`, i.e. 3 optimisation rounds against 9. The extra *rounds* were doing the work the pyramid got credit for | An **equal-work** comparison (3 levels × 3 rounds vs 1 level × 9), in the regime where the objective actually aliases |
+| Compute the refined poses, then discard them | The CLI test asserted the alignment *stats* reached `mesh_metrics.json`. Stats are an output of the solve, not evidence it was used | Comparing the delivered per-vertex colours, aligned vs not, against the analytic truth |
 
 **The lesson: after mutation-checking a mechanism, mutate the *caller* too.** If
 the suite stays green, the wiring is untested no matter how good the unit test

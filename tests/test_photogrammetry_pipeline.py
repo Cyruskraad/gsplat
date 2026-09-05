@@ -911,6 +911,9 @@ def test_pipeline_reaches_the_whole_delivery_path(tmp_path):
             "2",
             "--texture_outlier_sigma",
             "1.5",
+            "--photometric_align",
+            "--photometric_align_levels",
+            "4",
         ],
     )
     for expected in (
@@ -921,6 +924,11 @@ def test_pipeline_reaches_the_whole_delivery_path(tmp_path):
         "--ao_map",
         "--texture_pages 2",
         "--texture_outlier_sigma 1.5",
+        # Fixing the registration is the one delivery option that addresses the
+        # cause rather than the symptom, so an unreachable-from-here version of
+        # it is the most expensive kind to leave unwired.
+        "--photometric_align",
+        "--photometric_align_levels 4",
     ):
         assert expected in line, (expected, line)
 

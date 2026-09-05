@@ -61,6 +61,7 @@ from .mesh_extraction import (
     simplify_mesh,
     simplify_mesh_to_error,
 )
+from .photometric_alignment import refine_camera_poses_photometric
 from .metrics import (
     atlas_sharpness,
     depth_prior_stats,
@@ -126,6 +127,7 @@ __all__ = [
     "cull_unobserved_faces",
     "merge_point_maps_to_tracks",
     "write_colmap_reconstruction",
+    "refine_camera_poses_photometric",
     "point_to_mesh_distance",
     "mesh_quality_stats",
     "point_cloud_stats",

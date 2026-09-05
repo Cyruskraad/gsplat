@@ -57,6 +57,10 @@ from gsplat.photogrammetry.mesh_extraction import (
     simplify_mesh_to_error,
 )
 from gsplat.photogrammetry.metrics import mesh_quality_stats, point_to_mesh_distance
+from gsplat.photogrammetry.photometric_alignment import (
+    _PosedPyramidDataset,
+    refine_camera_poses_photometric,
+)
 
 
 def _write_map(path: str, image: np.ndarray) -> None:
@@ -177,6 +181,27 @@ class Config:
     # close the seam at all. 0 disables levelling, which is only useful for
     # measuring what it was doing.
     texture_seam_smoothness: float = 0.1
+    # Refine the camera poses photometrically against the mesh before
+    # texturing (Zhou & Koltun, SIGGRAPH 2014): alternate baking the surface
+    # colour with the poses you have and moving each camera so its own image
+    # agrees with that colour. Every other thing this pipeline does about
+    # misregistration -- robust fusion, per-face view selection, seam levelling
+    # -- works around the symptom; this addresses the cause. Measured on a
+    # synthetic sphere at 45' of residual pose error, it takes blending from
+    # 63% of the ground truth's contrast to 84% (the ceiling exact poses reach
+    # is 84%), and halves the atlas's L1 error. Needs no GPU. Costs one bake
+    # plus one small solve per round.
+    photometric_align: bool = False
+    # Optimiser steps per bake/optimise round for --photometric_align.
+    photometric_align_iters: int = 60
+    # Image-pyramid levels for --photometric_align, coarsest first. The pyramid
+    # is not what makes a moderate error recoverable -- the re-baked target is
+    # -- but it is strictly more robust once the pose error displaces a
+    # projection by more than half the texture detail's wavelength, where the
+    # objective starts to alias. See the module docstring for the measurements.
+    photometric_align_levels: int = 3
+    # Bake/optimise rounds per pyramid level for --photometric_align.
+    photometric_align_rounds: int = 3
     # Remove faces no training camera ever saw before decimating and
     # texturing. TSDF fusion returns a *closed* surface, so it invents the
     # underside of anything resting on the ground and the back of anything the
@@ -383,6 +408,57 @@ def main(cfg: Config) -> None:
             "steps to level. Add --texture_view_selection or drop this flag.",
             RuntimeWarning,
         )
+
+    # Refine the poses before anything reads them. Culling, atlas sizing, view
+    # selection and the bake itself all ask "what does this camera see", so a
+    # correction applied here is worth more than the same correction applied
+    # later -- and every one of those steps is currently absorbing the error
+    # instead.
+    alignment_stats = None
+    if cfg.photometric_align:
+        if len(mesh.triangles) == 0:
+            print(
+                "[extract_mesh] WARNING: skipping --photometric_align -- there "
+                "is no surface for the views to agree about."
+            )
+        else:
+            camtoworlds, alignment_stats = refine_camera_poses_photometric(
+                mesh,
+                dataset,
+                num_levels=cfg.photometric_align_levels,
+                iterations=cfg.photometric_align_iters,
+                alternations=cfg.photometric_align_rounds,
+                device="cpu",
+            )
+            # Substituting the poses rather than mutating the dataset keeps the
+            # originals intact and reuses the wrapper the refinement itself
+            # runs through, so downstream sees exactly what the solve saw.
+            dataset = _PosedPyramidDataset(dataset, camtoworlds, levels=0)
+            print(
+                "[extract_mesh] photometric alignment: residual "
+                f"{alignment_stats['mean_photometric_residual_before']:.4f} -> "
+                f"{alignment_stats['mean_photometric_residual_after']:.4f} over "
+                f"{alignment_stats['num_observations']} observations; cameras "
+                f"moved {alignment_stats['mean_pose_correction_arcmin']:.1f}' "
+                f"on average (max "
+                f"{alignment_stats['max_pose_correction_arcmin']:.1f}')"
+            )
+            if (
+                alignment_stats["mean_photometric_residual_after"]
+                >= alignment_stats["mean_photometric_residual_before"]
+            ):
+                warnings.warn(
+                    "Photometric alignment did not reduce the residual "
+                    f"({alignment_stats['mean_photometric_residual_before']:.4f}"
+                    f" -> "
+                    f"{alignment_stats['mean_photometric_residual_after']:.4f})."
+                    " Its working range is a pose error that displaces a "
+                    "projection by less than half the texture detail's "
+                    "wavelength; past that the objective aliases and the solve "
+                    "cannot tell which way to move. Either the poses are "
+                    "already good or they are too far out for this to fix.",
+                    RuntimeWarning,
+                )
 
     # Cull before decimating: the triangle budget should be spent on surface
     # that will actually be seen, and the atlas should not reserve area for
@@ -696,6 +772,8 @@ def main(cfg: Config) -> None:
         stats["ambient_occlusion"] = ao_stats
     if view_selection_stats:
         stats["view_selection"] = view_selection_stats
+    if alignment_stats is not None:
+        stats["photometric_alignment"] = alignment_stats
     if len(mesh.triangles) == 0:
         # Extraction produced nothing usable. Say so plainly instead of
         # letting the cloud-to-mesh measurement fail against an empty surface.

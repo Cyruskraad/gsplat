@@ -121,6 +121,15 @@ class Config:
     # needs no checkpoint and no GPU, so the delivery half of the pipeline runs
     # on a machine that cannot train. See examples/extract_mesh.py.
     mesh_path: Optional[str] = None
+    # Refine the camera poses photometrically against the extracted mesh
+    # before texturing (Zhou & Koltun, SIGGRAPH 2014). Addresses the *cause* of
+    # the blur/ghosting the texturing options work around. Needs no GPU.
+    # See examples/extract_mesh.py.
+    photometric_align: bool = False
+    # Image-pyramid levels for --photometric_align.
+    photometric_align_levels: int = 3
+    # Optimiser steps per bake/optimise round for --photometric_align.
+    photometric_align_iters: int = 60
     # Remove faces no training camera ever saw before decimating and texturing.
     # TSDF fusion returns a closed surface, so it invents the underside and the
     # unvisited back of the subject. See examples/extract_mesh.py.
@@ -455,6 +464,14 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                 ]
                 if cfg.texture_view_selection:
                     cmd += ["--texture_view_selection"]
+                if cfg.photometric_align:
+                    cmd += [
+                        "--photometric_align",
+                        "--photometric_align_levels",
+                        str(cfg.photometric_align_levels),
+                        "--photometric_align_iters",
+                        str(cfg.photometric_align_iters),
+                    ]
                 if cfg.cull_unobserved:
                     cmd += ["--cull_unobserved"]
                 if cfg.texture_pages > 1:

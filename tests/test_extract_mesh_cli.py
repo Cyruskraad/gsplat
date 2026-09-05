@@ -88,6 +88,33 @@ def capture(tmp_path_factory):
     return summary
 
 
+@pytest.fixture(scope="module")
+def misregistered(tmp_path_factory):
+    """The same capture, with the reported poses perturbed by 45'.
+
+    `pose_error_arcmin` moves the pose that is *written to the COLMAP model*
+    and leaves the rendered image alone, which is exactly residual SfM error --
+    the pose you have does not quite match the photograph it belongs to.
+    """
+    _examples_on_path()
+    import make_synthetic_capture
+
+    data_dir = tmp_path_factory.mktemp("misregistered")
+    return make_synthetic_capture.main(
+        make_synthetic_capture.Config(
+            data_dir=str(data_dir),
+            shape="sphere",
+            resolution=12,
+            num_views=8,
+            width=96,
+            height=96,
+            pose_error_arcmin=45.0,
+            num_dense_points=2000,
+            num_sparse_points=300,
+        )
+    )
+
+
 def _config(capture, tmp_path, **overrides):
     """An `extract_mesh.Config` pointed at the capture, on the mesh entry."""
     import extract_mesh
@@ -235,6 +262,116 @@ def test_seam_smoothness_reaches_the_bake_from_the_cli(capture, tmp_path):
     levelling = stats["view_selection"]["seam_levelling"]
     assert levelling["num_seam_edges"] > 0
     assert "seam_discontinuity_before" in stats["view_selection"]
+
+
+def test_photometric_alignment_runs_from_the_cli_and_reports_itself(capture, tmp_path):
+    """`--photometric_align` end to end, with its numbers in mesh_metrics.json.
+
+    The library function has its own tests
+    (`tests/test_photometric_alignment.py`); this pins the *call site*, which is
+    the thing that has broken five times on this branch. A flag accepted by the
+    CLI and then dropped, mis-spelled into the callee, or run against the
+    original dataset instead of the re-posed one would pass every one of those
+    tests and do nothing here.
+    """
+    _examples_on_path()
+    import json
+
+    import extract_mesh
+
+    cfg = _config(
+        capture,
+        tmp_path,
+        texture_mode="atlas",
+        texture_size=64,
+        photometric_align=True,
+        # Small: this is a wiring test, not a measurement of the method.
+        photometric_align_levels=2,
+        photometric_align_iters=15,
+        photometric_align_rounds=1,
+    )
+    extract_mesh.main(cfg)
+
+    stats = json.loads((Path(cfg.result_dir) / "mesh_metrics.json").read_text())
+    alignment = stats["photometric_alignment"]
+    assert alignment["num_observations"] > 0
+    assert alignment["num_views"] == alignment["num_views"]
+    for key in (
+        "mean_photometric_residual_before",
+        "mean_photometric_residual_after",
+        "mean_pose_correction_arcmin",
+    ):
+        assert key in alignment, key
+    # The cameras actually moved: a no-op wiring would report exactly zero.
+    assert alignment["mean_pose_correction_arcmin"] > 0.0
+
+
+def test_the_refined_poses_are_the_ones_the_bake_uses(misregistered, tmp_path):
+    """Computing the refinement and then ignoring it must not pass.
+
+    It did. The test above asserts the *stats* land in `mesh_metrics.json`, and
+    a mutation that solved for the refined poses and then dropped them on the
+    floor -- never substituting them into the dataset the bake reads -- kept
+    that test green. Stats are an output of the solve, not evidence the solve
+    was used: this is the ISSUES.md § 5 failure mode arriving *inside* a test
+    written to pre-empt it.
+
+    So this compares the delivered colours. Per-vertex mode deliberately, not an
+    atlas: `compute_uvatlas` is non-deterministic, so two runs produce two UV
+    layouts and their texture images are not comparable pixel to pixel. Vertex
+    colours ride the mesh's own vertex order, which is fixed by the file.
+    """
+    _examples_on_path()
+    import open3d as o3d
+    from datasets.colmap import Parser
+
+    import extract_mesh
+    from make_synthetic_capture import surface_pattern
+
+    def bake(align: bool):
+        cfg = _config(
+            misregistered,
+            tmp_path / ("aligned" if align else "raw"),
+            data_dir=misregistered["data_dir"],
+            mesh_path=misregistered["mesh_path"],
+            texture_mode="vertex",
+            photometric_align=align,
+            photometric_align_levels=3,
+            photometric_align_iters=40,
+            photometric_align_rounds=2,
+        )
+        extract_mesh.main(cfg)
+        mesh = o3d.io.read_triangle_mesh(str(Path(cfg.result_dir) / "mesh.ply"))
+        return np.asarray(mesh.vertices), np.asarray(mesh.vertex_colors)
+
+    raw_xyz, raw_rgb = bake(False)
+    _, aligned_rgb = bake(True)
+
+    # Discarding the refined poses would make these byte-identical.
+    assert not np.allclose(raw_rgb, aligned_rgb), (
+        "the aligned and unaligned bakes are identical, so the refined poses "
+        "never reached the bake"
+    )
+
+    # And it is used the right way round: the vertices are written in the
+    # dataset's normalized frame, so map them back to world coordinates to
+    # evaluate the analytic colour the capture was rendered with.
+    parser = Parser(
+        data_dir=misregistered["data_dir"],
+        factor=1,
+        normalize=True,
+        test_every=10_000,
+    )
+    world = (
+        np.linalg.inv(parser.transform) @ np.c_[raw_xyz, np.ones(len(raw_xyz))].T
+    ).T[:, :3]
+    truth = np.clip(surface_pattern(world), 0.0, 1.0)
+    # Only vertices some camera actually coloured; an unobserved vertex keeps
+    # a default and would compare against the pattern as pure noise.
+    seen = raw_rgb.sum(axis=1) > 0
+    raw_l1 = float(np.abs(raw_rgb[seen] - truth[seen]).mean())
+    aligned_l1 = float(np.abs(aligned_rgb[seen] - truth[seen]).mean())
+    assert aligned_l1 < raw_l1, (raw_l1, aligned_l1)
 
 
 # ---------------------------------------------------------------------------
