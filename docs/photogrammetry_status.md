@@ -22,7 +22,7 @@
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
        tests/test_texturing.py tests/test_extract_mesh_io.py -q
    ```
-   Expect **137 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **144 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Before touching the texturing code**, read
    [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md). All
@@ -248,8 +248,8 @@ that surfaced them is (sixth §2.4, seventh §2.2, eighth/ninth §2.3, tenth
 | `tests/test_photogrammetry_metrics.py` | 14 | Geometry metrics against known analytic ground truth, plus `atlas_sharpness` (detail ordering, chart-border exclusion, empty/uint8 handling) |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
 | `tests/test_extract_mesh_io.py` | 5 | Texture-map writing: the 16-bit RGB PNG round trip (and the BGR channel reversal it depends on), and that 16 bits recovers normal detail 8 bits cannot |
-| `tests/test_texturing.py` | 29 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12; and seam levelling — the conjugate-gradient solver against a dense solve, shared-edge recovery, and that levelling closes the exposure steps without introducing a colour cast |
-| **Total** | **137** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| `tests/test_texturing.py` | 36 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12; and seam levelling — the conjugate-gradient solver against a dense solve, shared-edge recovery, and that levelling closes the exposure steps without introducing a colour cast |
+| **Total** | **144** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -388,6 +388,51 @@ a test. Seam discontinuity on the shipped asset: 0.262 → 0.090.
 **Reviewed only:** the `--texture_view_selection` /
 `--texture_seam_smoothness` CLI guards and warnings, which need a real
 checkpoint to reach.
+
+### 2.17 Sizing the atlas from the evidence
+
+`--texture_size` was the same wrong question `--target_triangles` was, and gets
+the same answer. `recommended_texture_size` / `--texture_texels_per_pixel`
+chooses it from how much photographic evidence exists: the source pixels
+covering each patch of surface, at **the best look the capture ever got at it**
+— the maximum over views, not the sum. Photographing a wall twenty times is not
+more detail than photographing it twice from the same distance. (Measured:
+tripling the views raises the evidence 1.26x, not 3x.)
+
+Two numbers are measured rather than assumed, and both changed the design:
+
+- **Packing efficiency.** I was about to hardcode 0.75, measured 44% on one
+  sphere, then found the real range is **42.7%–73.2%** across meshes and not
+  monotonic in density. It *is* stable per mesh (five repeated unwraps spread
+  by ≤2.8%, by 0.0% on two of three), so it is now measured with one probe
+  unwrap rather than guessed.
+- **Rounding.** Rounding *up* to a power of two quadruples the atlas for an
+  arbitrarily small overshoot: an exact size of 518.1 rounded to 1024 and baked
+  **3.88x** more texels than there were pixels to fill them. Nearest lands on
+  512 and covers 0.98x. Found by running it, not by reading it.
+
+The projection is checked against closed form: the faces one view sees tile a
+silhouette disc of area `π(f·r/√(d²−r²))²` — measured 18850.9 against an
+analytic 18877.5, 0.1%.
+
+**A test premise I got wrong, and what replaced it.** I predicted the evidence
+would fall with camera distance by the disc law, `√((d₂²−r²)/(d₁²−r²))` = 2.07,
+and asserted it. It measures 2.27. The disc law describes a *silhouette*; this
+sums each face's *best* view, and a face seen head-on projects like a patch at
+range `(d−r)`, giving 2.40 as the other bound. The truth sits between because
+faces spread across the visible cap rather than sitting at its closest point.
+The test now asserts that bracket, with both ends derived.
+
+**Executed:** the measurements above; full suite 144 passed; the complete
+delivery path on CPU (6960 faces → cull 3480 → fit-decimate to 592 → atlas 512
+chosen from evidence → view-selected, seam-levelled albedo + 16-bit normal + AO
+on one shared UV layout, OBJ/MTL/PNGs written and read back). Four mutations
+checked (round up instead of nearest, sum instead of max over views, ignore
+packing efficiency, drop the absolute value in the triangle area) — each fails
+a test. The max-over-views one needed a second test: every scaling test uses
+*ratios*, and a consistent over-count cancels out of a ratio, so nothing caught
+it until a test pinned absolute evidence against view count. **Reviewed only:**
+the `--texture_texels_per_pixel` atlas-mode guard and clamp warning.
 
 ### 2.16 Culling geometry no camera observed
 

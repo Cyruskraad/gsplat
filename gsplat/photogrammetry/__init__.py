@@ -80,9 +80,11 @@ from .texturing import (
     bake_texture,
     bake_texture_atlas,
     bake_texture_atlas_view_selected,
+    face_projected_areas,
     face_view_quality,
     face_visibility,
     level_seams,
+    recommended_texture_size,
     select_views_mrf,
 )
 from .neural_sfm import merge_point_maps_to_tracks, write_colmap_reconstruction
@@ -108,6 +110,8 @@ __all__ = [
     "bake_mesh_texture",
     "face_view_quality",
     "face_visibility",
+    "face_projected_areas",
+    "recommended_texture_size",
     "select_views_mrf",
     "level_seams",
     "NO_VIEW",

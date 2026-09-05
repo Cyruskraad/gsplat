@@ -153,6 +153,7 @@ class _SphereDataset:
         cam_dist=3.5,
         width=192,
         height=192,
+        focal=260.0,
         pattern=None,
         pose_error_arcmin=0.0,
         exposure=0.0,
@@ -170,6 +171,11 @@ class _SphereDataset:
                 image alone. That is exactly residual SfM error: the pose you
                 have does not quite match the photograph it belongs to, so
                 views disagree about where a surface point lands.
+            focal: Focal length in pixels. Scaling it together with
+                `width`/`height` is how a test asks for "the same capture, shot
+                at higher resolution" -- the subject's projected area then
+                scales as focal squared, which is an exact, analytic handle on
+                anything that reasons about pixel evidence.
             exposure: Give each view its own constant brightness offset,
                 drawn uniformly from [-exposure, exposure], applied only where
                 the view actually sees the sphere. Simulates the auto-exposure
@@ -183,7 +189,6 @@ class _SphereDataset:
             pattern = _surface_pattern
         rng = np.random.default_rng(seed)
         self.width, self.height = width, height
-        focal = 260.0
         K = np.array(
             [[focal, 0, width / 2], [0, focal, height / 2], [0, 0, 1.0]],
             dtype=np.float64,

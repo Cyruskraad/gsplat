@@ -131,6 +131,46 @@ Baked colors are grown a few texels outward across UV seams and into patches
 no camera observed, so bilinear sampling and mipmapping don't bleed
 background into the surface.
 
+#### Sizing the atlas from the evidence
+
+`--texture_size` is the same wrong question `--target_triangles` was: the right
+value depends on the capture, and guessing it is only checked afterwards by
+looking at the result. Too small throws away detail the photographs actually
+contain; too large invents texels no photograph can fill, and pays for them in
+memory, upload time and bake time for nothing.
+
+`--texture_texels_per_pixel 1.0` chooses the size instead, from how much
+photographic evidence there is: the source pixels covering each patch of
+surface, counted at **the best look the capture ever got at it** — the maximum
+over views, not the sum. Photographing the same wall twenty times is not more
+detail than photographing it twice from the same distance, and summing would
+make the atlas grow with the shutter count. (Measured: tripling the views on a
+test sphere raises the evidence by 1.26x, not 3x.)
+
+Two details are measured rather than assumed:
+
+- **Packing efficiency.** A UV unwrap only covers part of the atlas; the rest
+  is the gaps between charts. There is no defensible constant — across test
+  spheres it ranges **42.7% to 73.2%**, and not monotonically in mesh density —
+  so it is measured on your mesh with one probe unwrap. It is a stable property
+  of the mesh rather than noise: five repeated unwraps of one mesh spread by at
+  most 2.8%, and by 0.0% on two of three tried.
+- **Rounding is to the *nearest* power of two, not the next one up.** Rounding
+  up quadruples the atlas for an arbitrarily small overshoot: on a test sphere
+  an exact size of 518.1 rounded up to 1024 and baked 3.88x more texels than
+  there were source pixels to fill them. Nearest lands on 512 and covers 0.98x.
+  Under-provisioning by a few percent costs a little detail; over-provisioning
+  by 4x costs four times the memory for detail that does not exist.
+
+`stats["exact_size"]` reports the unrounded number, which is what to reason
+with — the power-of-two grid quantises everything else, and near a boundary a
+few percent of packing can move the answer a whole step.
+
+The projection behind this is checked against closed form: for a sphere of
+radius `r` at distance `d` with focal `f`, the faces one view can see tile a
+silhouette disc of area `π(f·r/√(d²−r²))²`. Measured 18850.9 against an
+analytic 18877.5 — 0.1%.
+
 #### Bilinear source sampling
 
 Colours are read from the source images with **bilinear** interpolation. A
@@ -832,6 +872,10 @@ something gsplat ships.
   `mean_ao`/`min_ao` and the `cage`/`max_distance` used. A `mean_ao` of
   essentially 1.0 means nothing occluded anything — correct for a convex
   shape, and otherwise a sign the occlusion distance is too small.
+- `gsplat.photogrammetry.recommended_texture_size(mesh, dataset,
+  texels_per_pixel=1.0)` returns `(size, stats)`, the atlas resolution the
+  capture's own evidence supports; `face_projected_areas(mesh, dataset)`
+  returns the raw per-face source-pixel areas behind it.
 - `gsplat.photogrammetry.cull_unobserved_faces(mesh, dataset, min_views=1)`
   returns `(mesh, stats)` with the unobserved faces removed and an observation
   histogram; `face_visibility(mesh, dataset)` returns the raw `(F, V)` bool

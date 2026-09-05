@@ -721,8 +721,10 @@ from .texturing import (  # noqa: E402,F401  (import placement is deliberate)
     bake_texture,
     bake_texture_atlas,
     bake_texture_atlas_view_selected,
+    face_projected_areas,
     face_view_quality,
     face_visibility,
     level_seams,
+    recommended_texture_size,
     select_views_mrf,
 )

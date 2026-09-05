@@ -928,3 +928,238 @@ def test_bilinear_sampling_beats_nearest_on_the_vertex_bake():
     assert nearest_error > 0.004, nearest_error
     # Measured 0.0052 -> 0.0027, a 1.9x improvement.
     assert bilinear_error < nearest_error / 1.5, (bilinear_error, nearest_error)
+
+
+# ---------------------------------------------------------------------------
+# Sizing the atlas from the evidence
+# ---------------------------------------------------------------------------
+
+
+def test_projected_areas_match_the_analytic_silhouette():
+    """A sphere's front faces tile its silhouette disc, whose area is known.
+
+    For radius ``r`` at distance ``d`` with focal ``f``, the silhouette is a
+    circle of image radius ``f*r/sqrt(d^2 - r^2)``. Summing the projected areas
+    of the faces one view can see must reproduce its area -- a check on the
+    projection maths that owes nothing to the implementation.
+    """
+    from gsplat.photogrammetry.texturing import (
+        _project_triangles,
+        _triangle_pixel_areas,
+        face_visibility,
+    )
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    radius, distance, focal = 1.0, 3.5, 260.0
+    mesh = _unit_sphere_mesh(resolution=40)
+    dataset = _SphereDataset(num_views=8, cam_dist=distance, focal=focal)
+
+    visible = face_visibility(mesh, dataset)
+    seen = visible[:, 0]
+    view = dataset[0]
+    uv = _project_triangles(
+        np.asarray(mesh.vertices),
+        np.asarray(mesh.triangles)[seen],
+        view["camtoworld"].numpy(),
+        view["K"].numpy(),
+    )
+    measured = float(_triangle_pixel_areas(uv).sum())
+
+    image_radius = focal * radius / np.sqrt(distance**2 - radius**2)
+    analytic = np.pi * image_radius**2
+    # Measured 18850.9 against an analytic 18877.5 -- 0.1%, the rest being the
+    # polygon's chord error against the true sphere.
+    assert measured == pytest.approx(analytic, rel=0.01), (measured, analytic)
+
+
+def test_recommended_size_scales_with_the_evidence():
+    """Four times the pixels must ask for twice the atlas, on every route.
+
+    Three independent ways to change the amount of evidence -- shoot at higher
+    resolution, move the camera closer, or ask for more texels per pixel -- and
+    all three are exact factors, so `exact_size` (before the power-of-two
+    rounding quantises it) has an exact expected ratio.
+    """
+    from gsplat.photogrammetry.texturing import recommended_texture_size
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    mesh = _unit_sphere_mesh(resolution=20)
+    # Fix the packing so the comparison isolates the evidence: measuring it
+    # re-unwraps, and this is not a test about the unwrapper.
+    fixed = dict(packing_efficiency=0.5)
+
+    base = recommended_texture_size(mesh, _SphereDataset(num_views=8), **fixed)[1]
+
+    # 1. Same capture at twice the resolution: area scales as focal squared.
+    bigger = recommended_texture_size(
+        mesh, _SphereDataset(num_views=8, focal=520.0, width=384, height=384), **fixed
+    )[1]
+    assert bigger["exact_size"] / base["exact_size"] == pytest.approx(2.0, rel=0.02)
+
+    # 2. Twice as far away is less evidence, but *how much* less is bracketed
+    #    rather than exact, and the bracket is the interesting part.
+    #
+    #    The silhouette-disc law gives sqrt((d2^2 - r^2)/(d1^2 - r^2)) = 2.07.
+    #    That is a lower bound here, not the answer: this sums each face's
+    #    *best* view, and a face seen head-on projects like a patch at range
+    #    (d - r), giving (d2 - r)/(d1 - r) = 2.40 as the upper bound. Faces are
+    #    spread across the visible cap rather than all at its closest point, so
+    #    the truth sits between. (Measured: 2.27.) Asserting the disc law alone
+    #    fails, which is how this bracket came to be written down.
+    farther = recommended_texture_size(
+        mesh, _SphereDataset(num_views=8, cam_dist=7.0), **fixed
+    )[1]
+    ratio = base["exact_size"] / farther["exact_size"]
+    disc_law = np.sqrt((7.0**2 - 1.0) / (3.5**2 - 1.0))
+    head_on_law = (7.0 - 1.0) / (3.5 - 1.0)
+    assert disc_law < head_on_law  # premise: the bracket is the right way round
+    assert disc_law * 0.97 < ratio < head_on_law * 1.03, (
+        ratio,
+        disc_law,
+        head_on_law,
+    )
+
+    # 3. Four texels per pixel is twice the linear size, exactly.
+    supersampled = recommended_texture_size(
+        mesh, _SphereDataset(num_views=8), texels_per_pixel=4.0, **fixed
+    )[1]
+    assert supersampled["exact_size"] / base["exact_size"] == pytest.approx(2.0)
+
+
+def test_recommended_size_rounds_to_the_nearest_power_of_two():
+    """Not the next one up: that quadruples the atlas for any overshoot.
+
+    Measured on a test sphere, an exact size of 518.1 rounded *up* landed on
+    1024 and baked 3.88x more texels than there were source pixels to fill
+    them; nearest lands on 512 and covers 0.98x. Forced here by choosing the
+    packing efficiency that puts `exact_size` just either side of the midpoint
+    between two powers of two (512 * sqrt(2) = 724).
+    """
+    from gsplat.photogrammetry.texturing import recommended_texture_size
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    mesh = _unit_sphere_mesh(resolution=20)
+    dataset = _SphereDataset(num_views=8)
+
+    pixels = recommended_texture_size(mesh, dataset, packing_efficiency=1.0)[1][
+        "total_source_pixels"
+    ]
+    for target, expected in ((600.0, 512), (800.0, 1024)):
+        # exact = sqrt(pixels / packing)  =>  packing = pixels / target^2
+        packing = pixels / target**2
+        assert 0 < packing <= 1, packing
+        size, stats = recommended_texture_size(
+            mesh, dataset, packing_efficiency=packing
+        )
+        assert stats["exact_size"] == pytest.approx(target, rel=0.01)
+        assert size == expected, (target, size, expected)
+
+
+def test_recommended_size_measures_packing_on_the_mesh_by_default():
+    """There is no defensible constant, so it is measured rather than assumed.
+
+    Across test spheres the packing ranges 42.7%-73.2% and not monotonically in
+    density, while five repeated unwraps of one mesh spread by at most 2.8%.
+    That combination -- mesh-dependent but stable -- is what makes a probe
+    worth an extra unwrap.
+    """
+    from gsplat.photogrammetry.texturing import recommended_texture_size
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    dataset = _SphereDataset(num_views=8)
+
+    _, measured = recommended_texture_size(_unit_sphere_mesh(resolution=20), dataset)
+    assert measured["packing_efficiency_measured"] is True
+    assert 0.1 < measured["packing_efficiency"] < 1.0, measured
+
+    _, given = recommended_texture_size(
+        _unit_sphere_mesh(resolution=20), dataset, packing_efficiency=0.5
+    )
+    assert given["packing_efficiency_measured"] is False
+    assert given["packing_efficiency"] == 0.5
+
+    # Premise: the two routes really do disagree here, so the flag is not
+    # distinguishing identical results.
+    assert measured["packing_efficiency"] != pytest.approx(0.5, abs=0.02)
+
+
+def test_recommended_size_rejects_nonsense():
+    from gsplat.photogrammetry.texturing import (
+        face_projected_areas,
+        recommended_texture_size,
+    )
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    mesh = _unit_sphere_mesh(resolution=6)
+    dataset = _SphereDataset(num_views=4)
+
+    with pytest.raises(ValueError, match="texels_per_pixel must be positive"):
+        recommended_texture_size(mesh, dataset, texels_per_pixel=0.0)
+    with pytest.raises(ValueError, match=r"packing_efficiency must be in \(0, 1\]"):
+        recommended_texture_size(mesh, dataset, packing_efficiency=1.5)
+    with pytest.raises(ValueError, match="probe_size must be positive"):
+        recommended_texture_size(mesh, dataset, probe_size=0)
+    with pytest.raises(ValueError, match="min_size <= max_size"):
+        recommended_texture_size(mesh, dataset, min_size=4096, max_size=512)
+    with pytest.raises(ValueError, match="no triangles"):
+        face_projected_areas(o3d.geometry.TriangleMesh(), dataset)
+
+
+def test_recommended_size_is_clamped_and_says_so():
+    """A bound biting is reported, not silently applied."""
+    from gsplat.photogrammetry.texturing import recommended_texture_size
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    mesh = _unit_sphere_mesh(resolution=8)
+    dataset = _SphereDataset(num_views=8)
+
+    size, stats = recommended_texture_size(
+        mesh, dataset, packing_efficiency=0.5, min_size=4096, max_size=8192
+    )
+    assert size == 4096
+    assert stats["clamped"] is True
+    # And the unclamped truth is still reported, so a caller can see how far
+    # off the bound was.
+    assert stats["exact_size"] < 4096
+
+    _, unclamped = recommended_texture_size(mesh, dataset, packing_efficiency=0.5)
+    assert unclamped["clamped"] is False
+
+
+def test_evidence_is_bounded_by_the_surface_not_the_view_count():
+    """Photographing the same surface more times is not more detail.
+
+    `face_projected_areas` takes the *maximum* over views, not the sum, because
+    texture detail is limited by the best look the capture ever got at a
+    surface. Summing would make the recommended atlas grow with the number of
+    photographs -- shoot the same object twice as many times from the same
+    distance and get an atlas twice the area, carrying no more detail.
+
+    Ratio-based tests cannot catch that: a consistent over-count cancels out of
+    every ratio. This pins the absolute behaviour.
+    """
+    from gsplat.photogrammetry.texturing import (
+        face_projected_areas,
+        face_visibility,
+    )
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    mesh = _unit_sphere_mesh(resolution=20)
+
+    few, many = _SphereDataset(num_views=8), _SphereDataset(num_views=24)
+    # Premise: tripling the views really does mean each face is seen by far
+    # more of them -- 2.9 on average rising to 8.6 -- so summing and maxing
+    # would give very different answers here.
+    seen_few = face_visibility(mesh, few).sum(axis=1).mean()
+    seen_many = face_visibility(mesh, many).sum(axis=1).mean()
+    assert seen_many > 2.5 * seen_few, (seen_few, seen_many)
+
+    evidence_few = float(face_projected_areas(mesh, few).sum())
+    evidence_many = float(face_projected_areas(mesh, many).sum())
+
+    # More views do buy a little -- each face's *best* look improves -- but
+    # nothing like proportionally. Measured 1.26x for 3x the photographs.
+    assert 1.0 <= evidence_many / evidence_few < 1.6, (
+        evidence_few,
+        evidence_many,
+    )

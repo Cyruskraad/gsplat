@@ -51,6 +51,7 @@ from gsplat.photogrammetry.mesh_extraction import (
     cull_unobserved_faces,
     extract_mesh_poisson,
     extract_mesh_tsdf,
+    recommended_texture_size,
     simplify_mesh,
     simplify_mesh_to_error,
 )
@@ -123,6 +124,15 @@ class Config:
     texture_mode: Literal["vertex", "atlas"] = "vertex"
     # Atlas width/height in texels (--texture_mode atlas only).
     texture_size: int = 2048
+    # Choose --texture_size from the evidence instead of guessing it: allocate
+    # roughly this many texels per source pixel covering the surface, measured
+    # over the views that see it. 1.0 is the point where the atlas stops
+    # discarding detail the photographs contain and starts inventing texels no
+    # photograph can fill. Overrides --texture_size when set. Costs one extra
+    # UV unwrap, to measure how much of an atlas this mesh's charts cover
+    # (there is no defensible constant -- measured across test meshes it
+    # ranges 43%-73%).
+    texture_texels_per_pixel: Optional[float] = None
     # Robust multi-view fusion: discard observations more than this many
     # standard deviations from a point's own mean colour before averaging, so
     # a specular highlight or a slightly misregistered camera doesn't get
@@ -352,6 +362,32 @@ def main(cfg: Config) -> None:
             f"({decimation_stats['reduction']:.1%} fewer)"
         )
 
+    texture_size = cfg.texture_size
+    texture_size_stats = None
+    if cfg.texture_texels_per_pixel is not None:
+        if cfg.texture_mode != "atlas":
+            raise ValueError(
+                "--texture_texels_per_pixel sizes a UV atlas, so it requires "
+                "--texture_mode atlas. Per-vertex colors have no texels to "
+                "budget."
+            )
+        texture_size, texture_size_stats = recommended_texture_size(
+            mesh, dataset, texels_per_pixel=cfg.texture_texels_per_pixel
+        )
+        print(
+            f"[extract_mesh] atlas size {texture_size} chosen from "
+            f"{texture_size_stats['total_source_pixels']:.3g} source pixels of "
+            f"evidence at {texture_size_stats['packing_efficiency']:.0%} packing "
+            f"(exact {texture_size_stats['exact_size']:.0f}, requested "
+            f"--texture_size {cfg.texture_size})"
+        )
+        if texture_size_stats["clamped"]:
+            warnings.warn(
+                f"The atlas size was clamped to {texture_size}; the evidence "
+                f"supports {texture_size_stats['exact_size']:.0f}.",
+                RuntimeWarning,
+            )
+
     texture = None
     view_selection_stats: dict = {}
     if cfg.bake_texture_:
@@ -359,7 +395,7 @@ def main(cfg: Config) -> None:
             mesh,
             dataset,
             mode=cfg.texture_mode,
-            texture_size=cfg.texture_size,
+            texture_size=texture_size,
             outlier_sigma=(
                 cfg.texture_outlier_sigma if cfg.texture_outlier_sigma > 0 else None
             ),
@@ -446,7 +482,7 @@ def main(cfg: Config) -> None:
         mesh, normal_map, normal_map_stats = bake_normal_map(
             dense_mesh,
             mesh,
-            texture_size=cfg.texture_size,
+            texture_size=texture_size,
             space=cfg.normal_map_space,
             bits=cfg.normal_map_bits,
         )
@@ -475,7 +511,7 @@ def main(cfg: Config) -> None:
         # you want the dense bake anyway. Shares the albedo's UVs regardless.
         mesh, ao_image, ao_stats = bake_ambient_occlusion(
             mesh,
-            texture_size=cfg.texture_size,
+            texture_size=texture_size,
             num_samples=cfg.ao_samples,
         )
         print(
@@ -526,6 +562,8 @@ def main(cfg: Config) -> None:
         print(f"[extract_mesh] wrote {ao_path}")
 
     stats = mesh_quality_stats(mesh)
+    if texture_size_stats is not None:
+        stats["texture_size"] = texture_size_stats
     if cull_stats is not None:
         stats["culling"] = cull_stats
     if decimation_stats is not None:

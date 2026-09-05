@@ -38,8 +38,8 @@ Texturing
 .. automodule:: gsplat.photogrammetry.texturing
    :members: bake_texture, bake_texture_atlas,
              bake_texture_atlas_view_selected, bake_mesh_texture,
-             face_view_quality, face_visibility, select_views_mrf,
-             level_seams,
+             face_view_quality, face_visibility, face_projected_areas,
+             recommended_texture_size, select_views_mrf, level_seams,
              bake_normal_map, bake_ambient_occlusion
 
 Neural SfM Import
