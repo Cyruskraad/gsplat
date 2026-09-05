@@ -631,6 +631,74 @@ def test_bake_mesh_texture_dispatches_to_view_selection_and_reports_it():
     assert blended_stats == {}
 
 
+def test_bake_mesh_texture_forwards_seam_smoothness_to_the_levelling():
+    """The dispatcher must *carry* --texture_seam_smoothness, not just accept it.
+
+    This pins the call site that shipped broken. ``bake_mesh_texture`` had no
+    ``seam_smoothness`` parameter at all while ``examples/extract_mesh.py``
+    passed one unconditionally, so every texture-baking run of that script --
+    and therefore ``run_pipeline.py``'s whole delivery stage -- died with
+    ``TypeError: bake_mesh_texture() got an unexpected keyword argument
+    'seam_smoothness'``. Seam levelling was reachable from the library but not
+    from the CLI, and nothing noticed because nothing drove either.
+
+    Accepting the argument is not enough: silently dropping it would make the
+    crash go away while leaving ``None`` (levelling off) indistinguishable from
+    ``0.1`` (levelling on), because the callee supplies its own default. So the
+    assertion is on the *effect* -- ``None`` must reach
+    :func:`bake_texture_atlas_view_selected` and suppress the levelling stats
+    that any other value produces.
+    """
+    from gsplat.photogrammetry.texturing import bake_mesh_texture
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    # Exposure drift is what levelling exists to remove; without it the solve
+    # has almost nothing to do and the stats are less clearly attributable.
+    dataset = _SphereDataset(num_views=8, exposure=0.15)
+
+    levelled: dict = {}
+    bake_mesh_texture(
+        _unit_sphere_mesh(resolution=8),
+        dataset,
+        mode="atlas",
+        texture_size=128,
+        view_selection=True,
+        seam_smoothness=0.1,
+        stats_out=levelled,
+    )
+    assert "seam_levelling" in levelled
+    assert levelled["seam_levelling"]["num_seam_edges"] > 0
+
+    unlevelled: dict = {}
+    bake_mesh_texture(
+        _unit_sphere_mesh(resolution=8),
+        dataset,
+        mode="atlas",
+        texture_size=128,
+        view_selection=True,
+        seam_smoothness=None,
+        stats_out=unlevelled,
+    )
+    # Dropped on the floor instead of forwarded, this key would be present:
+    # the callee's own default (0.1) would have levelled anyway.
+    assert "seam_levelling" not in unlevelled
+
+    # And it is accepted-and-ignored without view selection, the same contract
+    # mrf_smoothness already has -- raising here would resurrect the crash on
+    # the default blended path, which is what the CLI actually runs.
+    blended: dict = {}
+    _, texture = bake_mesh_texture(
+        _unit_sphere_mesh(resolution=8),
+        dataset,
+        mode="atlas",
+        texture_size=128,
+        seam_smoothness=0.1,
+        stats_out=blended,
+    )
+    assert texture.shape == (128, 128, 3)
+    assert blended == {}
+
+
 # ---------------------------------------------------------------------------
 # Seam levelling
 # ---------------------------------------------------------------------------

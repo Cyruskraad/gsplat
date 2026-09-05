@@ -43,6 +43,7 @@ import open3d as o3d
 import torch
 import tyro
 from datasets.colmap import Dataset, Parser
+from datasets.normalize import transform_points
 
 from gsplat.photogrammetry.mesh_extraction import (
     bake_ambient_occlusion,
@@ -99,8 +100,19 @@ class Config:
     # Renderer used to produce depth maps for TSDF fusion.
     renderer: Literal["2dgs", "3dgs"] = "2dgs"
     # Path to a dense MVS point cloud (see examples/dense_mvs.py). Required
-    # for --method poisson; optional fallback source for TSDF is unused.
+    # for --method poisson. With --mesh_path it is optional, and is used as the
+    # reference cloud that --target_fit_ratio measures the mesh against.
     dense_points: Optional[str] = None
+    # Path to an existing mesh (.obj/.ply) to cull, decimate and texture,
+    # instead of reconstructing one. This is the "texture a mesh you already
+    # have" entry: nothing downstream of reconstruction needs a GPU or a
+    # checkpoint, so with this the whole delivery path -- cull, decimate,
+    # texture, normal/AO maps, OBJ/MTL/PNG -- runs on CPU alone.
+    #
+    # The mesh is expected in the same world coordinates as the COLMAP model
+    # under --data_dir (as a dense MVS cloud or a mesh built from one is), and
+    # is mapped into the normalized frame the dataset's cameras use.
+    mesh_path: Optional[str] = None
     # TSDF voxel size, in scene units.
     voxel_size: float = 0.01
     # TSDF truncation distance, in scene units.
@@ -217,8 +229,52 @@ class Config:
     device: str = "cuda"
 
 
+def _surface_source(cfg: Config) -> str:
+    """Decide which of the three inputs builds the surface, or say why not.
+
+    This replaced a blanket ``assert cfg.ckpt`` that ran *before* the method
+    dispatch. That assert made a trained GPU checkpoint the price of admission
+    to the entire script -- including ``--method poisson``, which never opens
+    the checkpoint, and including every guard and warning below it. Nothing
+    could reach :func:`main` without one, so nothing ever tested it, and a
+    ``TypeError`` on the default texture path shipped undetected. See
+    ``tests/test_extract_mesh_cli.py``.
+    """
+    sources = {
+        "--mesh_path": cfg.mesh_path is not None,
+        "--ckpt": bool(cfg.ckpt),
+    }
+    given = [name for name, present in sources.items() if present]
+    if len(given) > 1:
+        raise ValueError(
+            f"{' and '.join(given)} are two different surfaces and this script "
+            "delivers one. Pass --mesh_path to texture a mesh you already "
+            "have, or --ckpt to extract one from a trained checkpoint."
+        )
+    if cfg.mesh_path is not None:
+        return "mesh"
+    if cfg.method == "poisson":
+        if not cfg.dense_points:
+            raise ValueError(
+                "--method poisson reconstructs a surface from a dense point "
+                "cloud, so it needs --dense_points (see examples/dense_mvs.py)."
+            )
+        return "poisson"
+    if cfg.method == "tsdf":
+        if not cfg.ckpt:
+            raise ValueError(
+                "--method tsdf fuses depth maps rendered from a trained model, "
+                "so it needs --ckpt. Without a checkpoint the surface has to "
+                "come from somewhere else: pass --mesh_path to texture a mesh "
+                "you already have, or --method poisson --dense_points to "
+                "reconstruct one from a dense cloud. Both run without a GPU."
+            )
+        return "tsdf"
+    raise ValueError(f"Unknown method: {cfg.method!r}")
+
+
 def main(cfg: Config) -> None:
-    assert cfg.ckpt, "--ckpt is required."
+    source = _surface_source(cfg)
     parser = Parser(
         data_dir=cfg.data_dir,
         factor=cfg.data_factor,
@@ -227,7 +283,18 @@ def main(cfg: Config) -> None:
     )
     dataset = Dataset(parser, split="train", mask_dir=cfg.mask_dir)
 
-    if cfg.method == "tsdf":
+    # Parser(normalize=True) rescales and reorients the world so the cameras
+    # sit in a well-conditioned frame, and every pose the dataset hands out is
+    # in *that* frame. Geometry read straight off disk is not: a dense cloud or
+    # a mesh is in the COLMAP model's original world coordinates. Baking one
+    # against the other silently produces nonsense -- measured on the synthetic
+    # capture, the cameras end up *inside* a mesh 3.4x too large. Parser does
+    # exactly this transform for its own `dense_points_path`; these paths read
+    # the file themselves, so they have to do it too.
+    def _into_dataset_frame(points: np.ndarray) -> np.ndarray:
+        return transform_points(parser.transform, np.asarray(points))
+
+    if source == "tsdf":
         ckpt = torch.load(cfg.ckpt, map_location=cfg.device)
         splats = {k: v.to(cfg.device) for k, v in ckpt["splats"].items()}
         mesh = extract_mesh_tsdf(
@@ -239,17 +306,40 @@ def main(cfg: Config) -> None:
             device=cfg.device,
         )
         # No dense MVS cloud on this path -- fall back to the sparse SfM
-        # cloud as the cloud-to-mesh fit reference.
+        # cloud as the cloud-to-mesh fit reference. `parser.points` is already
+        # in the dataset's frame, so it needs no transform.
         reference_points = parser.points
-    elif cfg.method == "poisson":
-        assert cfg.dense_points, "--dense_points is required for --method poisson."
+    elif source == "poisson":
         pcd = o3d.io.read_point_cloud(cfg.dense_points)
-        points_xyz = np.asarray(pcd.points)
+        points_xyz = _into_dataset_frame(np.asarray(pcd.points))
         points_rgb = np.asarray(pcd.colors) if pcd.has_colors() else None
         mesh = extract_mesh_poisson(points_xyz, points_rgb, depth=cfg.poisson_depth)
         reference_points = points_xyz
+    elif source == "mesh":
+        mesh = o3d.io.read_triangle_mesh(cfg.mesh_path)
+        if len(mesh.triangles) == 0:
+            raise ValueError(
+                f"--mesh_path {cfg.mesh_path!r} has no triangles. Expected an "
+                "existing .obj/.ply surface to cull, decimate and texture."
+            )
+        mesh.vertices = o3d.utility.Vector3dVector(
+            _into_dataset_frame(np.asarray(mesh.vertices))
+        )
+        mesh.compute_vertex_normals()
+        # A dense cloud is the better fit reference when one is available;
+        # otherwise the sparse SfM points, as on the TSDF path.
+        if cfg.dense_points:
+            reference_points = _into_dataset_frame(
+                np.asarray(o3d.io.read_point_cloud(cfg.dense_points).points)
+            )
+        else:
+            reference_points = parser.points
+        print(
+            f"[extract_mesh] loaded {cfg.mesh_path} "
+            f"({len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles)"
+        )
     else:
-        raise ValueError(f"Unknown method: {cfg.method!r}")
+        raise ValueError(f"Unknown surface source: {source!r}")
 
     print(
         f"[extract_mesh] extracted mesh with {len(mesh.vertices)} vertices, "
@@ -272,6 +362,26 @@ def main(cfg: Config) -> None:
             "--texture_view_selection chooses a view per *face* and bakes it "
             "into an atlas, so it requires --texture_mode atlas. Per-vertex "
             "colors have nothing to select a view for."
+        )
+    # Seam levelling only exists to repair the steps view selection leaves
+    # between faces textured from different photographs; a blended atlas has
+    # no such steps. bake_mesh_texture accepts and ignores it (same contract
+    # as --texture_mrf_lambda), so this is the one place that can tell the
+    # user their flag will do nothing. Compared against the dataclass default
+    # rather than against 0, so it fires only when a value was actually typed
+    # -- warning whenever levelling is merely *available* would fire on every
+    # plain blended run, and a warning nobody can act on is noise.
+    if (
+        not cfg.texture_view_selection
+        and cfg.texture_seam_smoothness != Config.texture_seam_smoothness
+    ):
+        warnings.warn(
+            f"--texture_seam_smoothness {cfg.texture_seam_smoothness} does "
+            "nothing without --texture_view_selection: it levels the exposure "
+            "steps between faces textured from *different* chosen views, and "
+            "a blended atlas averages every view instead, so it has no such "
+            "steps to level. Add --texture_view_selection or drop this flag.",
+            RuntimeWarning,
         )
 
     # Cull before decimating: the triangle budget should be spent on surface

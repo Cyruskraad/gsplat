@@ -826,6 +826,7 @@ def bake_mesh_texture(
     allow_atlas_fallback: bool = True,
     view_selection: bool = False,
     mrf_smoothness: float = 1.0,
+    seam_smoothness: Optional[float] = 0.1,
     stats_out: Optional[dict] = None,
     num_pages: int = 1,
 ):
@@ -855,6 +856,20 @@ def bake_mesh_texture(
             :func:`bake_texture_atlas_view_selected` for the tradeoff this
             makes. Ignored in ``"vertex"`` mode, which has no faces to label.
         mrf_smoothness: Seam penalty, for ``view_selection``.
+        seam_smoothness: Levelling strength, for ``view_selection`` -- see
+            :func:`level_seams`. ``None`` skips levelling.
+
+            **Ignored unless ``view_selection`` is on**, which is the same
+            contract ``mrf_smoothness`` above already has: both configure a
+            stage that only the view-selected bake runs, and this function is a
+            dispatcher whose options are per-mode. Rejecting the combination
+            was the alternative and is worse here -- the CLI passes this
+            unconditionally at its default, so raising would turn every plain
+            blended run into an error. That is precisely the failure this
+            parameter exists to fix: it was accepted by the CLI and passed to a
+            function that had no such argument, so *every* texture-baking run
+            of ``examples/extract_mesh.py`` died with ``TypeError``. The CLI
+            warns instead when the flag was set explicitly and can do nothing.
         num_pages: In ``"atlas"`` mode, split the surface across this many
             atlas pages (see :func:`bake_texture_atlas_pages`). Above 1 the
             returned ``texture`` is the *first* page; the rest are on the mesh,
@@ -916,6 +931,7 @@ def bake_mesh_texture(
                 texture_size=texture_size,
                 max_views=max_views,
                 mrf_smoothness=mrf_smoothness,
+                seam_smoothness=seam_smoothness,
                 outlier_sigma=outlier_sigma,
                 outlier_iterations=outlier_iterations,
             )

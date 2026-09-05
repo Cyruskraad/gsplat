@@ -9,7 +9,8 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **153 tests pass.** Every guard mutation-checked — the fix reverted, a test
+- **161 tests pass** (153 before this session's Task 1). Every guard
+  mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
   perturbed points: removed **96.5%** of the reprojection error.
@@ -23,18 +24,26 @@ looks right.
     byte-identical;
   - every sizing decision measured: 6960 faces → cull 3480 → fit-decimate 592 →
     atlas 512 chosen from the evidence.
+- **`examples/extract_mesh.py`'s `main()` itself**, against a synthetic capture
+  written to disk by the new `examples/make_synthetic_capture.py` — with the
+  full delivery flag set (`--cull_unobserved --texture_mode atlas
+  --texture_view_selection --texture_seam_smoothness --target_fit_ratio
+  --normal_map --normal_map_bits 16 --ao_map`), reading the OBJ/MTL/PNGs back.
+  This is what converts the "reviewed only" block below from ~ten guards to
+  two, and it is the pin that reproduces bug 14: reverted, it fails with the
+  original `TypeError`.
+- **`run_pipeline.py` non-dry-run**, delivering a textured mesh through the
+  `extract_mesh` stage with no checkpoint and no GPU.
 - `black --check --required-version 22.3.0`, `py_compile`, and an `import` of
   every changed example script.
 
 ### Reviewed by code inspection only
 
-- **Every CLI guard and warning in `extract_mesh.py`** — `--normal_map`/`--ao_map`,
-  `--texture_view_selection`, `--texture_seam_smoothness`, `--cull_unobserved`
-  and its histogram warning, `--texture_texels_per_pixel` and its clamp warning,
-  `--texture_pages`, and the `--target_fit_ratio`/`--target_triangles` mutual
-  exclusion. **All of them sit after an `assert cfg.ckpt`, so reaching any of
-  them needs a real checkpoint.** They are mutually consistent and modelled on
-  the already-shipped `--normal_map` guard, but none has been executed.
+- The GPU-only half of `extract_mesh.py`: `--method tsdf` (which renders depth
+  maps from a checkpoint) and the `--texture_texels_per_pixel` clamp warning,
+  which needs an atlas larger than the cap. Everything else in that script now
+  runs in `tests/test_extract_mesh_cli.py` — see the executed list above; the
+  `assert cfg.ckpt` that used to gate all of it is gone.
 - The GPU stages themselves: `train`, `extract_mesh`, `dense_mvs` end to end.
 - Both AI-prior recipes against a *real* model. The Mask R-CNN recipe's full API
   path was executed with a randomly-initialised model and its output loaded
@@ -55,7 +64,7 @@ docstring too.
 
 ---
 
-## The 13 bugs found and fixed
+## The 15 bugs found and fixed
 
 Each was confirmed by reverting the fix and showing a test genuinely fails.
 
@@ -102,6 +111,26 @@ Each was confirmed by reverting the fix and showing a test genuinely fails.
     four-corner cancellation. That reaches `-log()` as `NaN`, and `np.argmin`
     returns a `NaN`'s index in preference to every real cost — so the face
     would be textured from the one view that *cannot see it*.
+14. **The delivery CLI could not run at all.** `examples/extract_mesh.py`
+    passed `seam_smoothness=` to `bake_mesh_texture()`, which had no such
+    parameter and no `**kwargs`. `bake_texture_` defaults to `True` and the
+    kwarg went unconditionally, so **every texture-baking run of
+    `extract_mesh.py` — and therefore `run_pipeline.py`'s whole delivery stage —
+    died with `TypeError`.** Seam levelling was reachable from the library but
+    not from the CLI. It shipped in `fa70683` and nothing caught it because **no
+    test had ever called `extract_mesh.main()`**: the script opened with an
+    `assert cfg.ckpt` that ran *before* the method dispatch, so no test could
+    reach `main()` without a trained GPU checkpoint. Fifth instance of the
+    failure mode in `ISSUES.md` § 5, and the first that was a hard crash.
+15. **Geometry read off disk was never mapped into the dataset's frame.**
+    `extract_mesh.py` builds its `Parser` with `normalize=True`, which rescales
+    and reorients the world and hands out every pose in *that* frame; the
+    `--method poisson` path read `--dense_points` with `o3d.io.read_point_cloud`
+    and used it raw. `Parser` applies exactly this transform to its own
+    `dense_points_path`, so the two disagreed. Measured on the synthetic
+    capture the frames differ by ~3.4x in scale plus a rotation, which puts
+    every camera *inside* the reconstructed mesh. Pre-existing, and found only
+    by running the path.
 
 Two sharp edges are **guarded rather than fixed**, because they are upstream:
 `compute_uvatlas` segfaults (exit 139) on non-manifold input, so manifoldness is

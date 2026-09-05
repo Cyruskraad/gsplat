@@ -116,6 +116,11 @@ class Config:
     # view that sees it -- sharper, but pointwise less accurate, and it
     # requires --texture_mode atlas. See examples/extract_mesh.py.
     texture_view_selection: bool = False
+    # Deliver an existing mesh instead of reconstructing one: cull, decimate,
+    # texture and map the .obj/.ply at this path. The extract_mesh stage then
+    # needs no checkpoint and no GPU, so the delivery half of the pipeline runs
+    # on a machine that cannot train. See examples/extract_mesh.py.
+    mesh_path: Optional[str] = None
     # Remove faces no training camera ever saw before decimating and texturing.
     # TSDF fusion returns a closed surface, so it invents the underside and the
     # unvisited back of the subject. See examples/extract_mesh.py.
@@ -405,7 +410,14 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
     # -- Stage: mesh extraction ------------------------------------------
     if "extract_mesh" in selected:
         ckpt = _latest_checkpoint(cfg.result_dir)
-        if ckpt is None and not cfg.strict and not cfg.dry_run:
+        # --mesh_path replaces the reconstruction, so this stage no longer
+        # depends on the train stage having produced anything.
+        if (
+            ckpt is None
+            and cfg.mesh_path is None
+            and not cfg.strict
+            and not cfg.dry_run
+        ):
             record_skipped(
                 report,
                 "extract_mesh",
@@ -416,8 +428,14 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                 cmd = [
                     sys.executable,
                     os.path.join(EXAMPLES_DIR, "extract_mesh.py"),
-                    "--ckpt",
-                    ckpt or "<checkpoint>",
+                ]
+                if cfg.mesh_path is not None:
+                    # --ckpt and --mesh_path are two different surfaces, and
+                    # extract_mesh.py refuses both at once.
+                    cmd += ["--mesh_path", cfg.mesh_path]
+                else:
+                    cmd += ["--ckpt", ckpt or "<checkpoint>"]
+                cmd += [
                     "--data_dir",
                     cfg.data_dir,
                     "--data_factor",
