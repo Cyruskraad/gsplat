@@ -813,3 +813,137 @@ def test_run_pipeline_forwards_texture_mode_to_extract_mesh(
     report = json.loads((result_dir / "pipeline_report.json").read_text())
     stage = {s["name"]: s for s in report["stages"]}["extract_mesh"]
     assert stage["outputs"] == [os.path.join(str(result_dir), expected_mesh)]
+
+
+def _dry_run_extract_mesh_command(tmp_path, extra_args):
+    """The extract_mesh command `run_pipeline.py --dry_run` would execute."""
+    pytest.importorskip("tyro", reason="tyro not installed")
+    import subprocess
+    import sys
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    proc = subprocess.run(
+        [
+            sys.executable,
+            os.path.join(repo_root, "examples", "run_pipeline.py"),
+            "--stages",
+            "extract_mesh",
+            "--dry_run",
+            "--data_dir",
+            str(tmp_path / "data"),
+            "--result_dir",
+            str(tmp_path / "out"),
+            *extra_args,
+        ],
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": repo_root},
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    line = next(
+        (
+            l
+            for l in proc.stdout.splitlines()
+            if "extract_mesh.py" in l and l.startswith("$")
+        ),
+        None,
+    )
+    assert line is not None, proc.stdout
+    return line
+
+
+def test_every_flag_the_pipeline_forwards_is_one_extract_mesh_accepts():
+    """A forwarded flag the stage rejects only fails *after* the training run.
+
+    `run_pipeline.py` builds `extract_mesh.py`'s argv by hand, so a renamed or
+    mistyped option is invisible until the subprocess exits non-zero -- hours
+    into a real run, with the GPU work already paid for. This compares every
+    long option the runner can emit against `extract_mesh.Config`'s actual
+    fields.
+    """
+    pytest.importorskip("tyro", reason="tyro not installed")
+    import dataclasses
+    import inspect
+    import re
+    import sys
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    sys.path.insert(0, os.path.join(repo_root, "examples"))
+    import extract_mesh
+    import run_pipeline
+
+    accepted = {f.name for f in dataclasses.fields(extract_mesh.Config)}
+    # Every "--flag" literal in the extract_mesh stage's command construction.
+    source = inspect.getsource(run_pipeline)
+    stage = source[source.index("Stage: mesh extraction") :]
+    stage = stage[: stage.index("_run(cmd, cfg.dry_run)")]
+    emitted = set(re.findall(r'"--([a-z_]+)"', stage))
+
+    assert emitted, "found no forwarded flags -- the parse is wrong, not the code"
+    unknown = sorted(f for f in emitted if f not in accepted)
+    assert not unknown, (
+        f"run_pipeline.py forwards {unknown} to extract_mesh.py, which does not "
+        f"accept them. Accepted: {sorted(accepted)}"
+    )
+
+
+def test_pipeline_reaches_the_whole_delivery_path(tmp_path):
+    """The one-command path must reach decimation and the extra maps.
+
+    The PR's claim is that every stage runs from one command; for a while it
+    was only half true -- the runner could ask for a texture but not for
+    decimation, a normal map or ambient occlusion, so the "one command" asset
+    was a raw TSDF mesh with an albedo and nothing else.
+    """
+    line = _dry_run_extract_mesh_command(
+        tmp_path,
+        [
+            "--texture_mode",
+            "atlas",
+            "--cull_unobserved",
+            "--target_fit_ratio",
+            "1.0",
+            "--normal_map",
+            "--normal_map_bits",
+            "16",
+            "--ao_map",
+            "--texture_pages",
+            "2",
+            "--texture_outlier_sigma",
+            "1.5",
+        ],
+    )
+    for expected in (
+        "--cull_unobserved",
+        "--target_fit_ratio 1.0",
+        "--normal_map",
+        "--normal_map_bits 16",
+        "--ao_map",
+        "--texture_pages 2",
+        "--texture_outlier_sigma 1.5",
+    ):
+        assert expected in line, (expected, line)
+
+
+def test_pipeline_passes_unnamed_flags_through_verbatim(tmp_path):
+    """The escape hatch, so a new extract_mesh option is never unreachable.
+
+    Each stage's own CLI is the source of truth for its options; this runner
+    naming a subset of them is a convenience, not a gate. Without this, every
+    new flag is blocked here until someone remembers to mirror it -- which is
+    exactly how the delivery path came to be unreachable.
+    """
+    line = _dry_run_extract_mesh_command(
+        tmp_path,
+        [
+            "--texture_mode",
+            "atlas",
+            # The first element has to be bound with "=", or the parser reads
+            # its leading "--" as a new option and rejects the whole call.
+            "--extract_mesh_extra_args=--texture_seam_smoothness",
+            "0.25",
+        ],
+    )
+    assert "--texture_seam_smoothness 0.25" in line, line
+    # And it lands at the end, so it can override anything named above it.
+    assert line.rstrip().endswith("--texture_seam_smoothness 0.25"), line

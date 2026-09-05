@@ -120,6 +120,38 @@ class Config:
     # TSDF fusion returns a closed surface, so it invents the underside and the
     # unvisited back of the subject. See examples/extract_mesh.py.
     cull_unobserved: bool = False
+    # Split the atlas across this many pages (--texture_mode atlas only).
+    texture_pages: int = 1
+    # Size the atlas from the evidence instead of --texture_size: texels per
+    # source pixel covering the surface. See examples/extract_mesh.py.
+    texture_texels_per_pixel: Optional[float] = None
+    # Robust multi-view fusion: discard observations this many standard
+    # deviations from a point's own mean colour. 0 disables it.
+    texture_outlier_sigma: float = 0.0
+    # Decimate to a cloud-to-mesh fit target, in units of the reference cloud's
+    # own k-NN spacing, rather than to a triangle count.
+    target_fit_ratio: Optional[float] = None
+    # Decimate to roughly this many triangles. Mutually exclusive with
+    # --target_fit_ratio.
+    target_triangles: Optional[int] = None
+    # Bake the pre-decimation mesh's normals into a normal map on the shipped
+    # mesh's atlas. Requires --texture_mode atlas.
+    normal_map: bool = False
+    # Bits per channel in the normal map. 8 cannot resolve a normal deviation
+    # finer than 2/255; 16 drops that floor to 3.1e-5.
+    normal_map_bits: Literal[8, 16] = 8
+    # Bake an ambient-occlusion map onto the same atlas. Requires atlas mode.
+    ao_map: bool = False
+    # Extra flags appended verbatim to the extract_mesh stage's command, for
+    # options this runner does not name. Each stage's own CLI stays the source
+    # of truth for its options (see the module docstring), so this is the
+    # escape hatch that keeps a new extract_mesh flag from being unreachable
+    # here until someone remembers to mirror it.
+    #
+    # Bind the FIRST element with "=", or the parser reads the leading "--" as
+    # a new option of its own and rejects it:
+    #     --extract_mesh_extra_args=--texture_seam_smoothness 0.25
+    extract_mesh_extra_args: List[str] = field(default_factory=list)
     # Torch device for the GPU stages.
     device: str = "cuda"
     # Print each stage's command without running anything.
@@ -407,6 +439,28 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                     cmd += ["--texture_view_selection"]
                 if cfg.cull_unobserved:
                     cmd += ["--cull_unobserved"]
+                if cfg.texture_pages > 1:
+                    cmd += ["--texture_pages", str(cfg.texture_pages)]
+                if cfg.texture_texels_per_pixel is not None:
+                    cmd += [
+                        "--texture_texels_per_pixel",
+                        str(cfg.texture_texels_per_pixel),
+                    ]
+                if cfg.texture_outlier_sigma > 0:
+                    cmd += ["--texture_outlier_sigma", str(cfg.texture_outlier_sigma)]
+                if cfg.target_fit_ratio is not None:
+                    cmd += ["--target_fit_ratio", str(cfg.target_fit_ratio)]
+                if cfg.target_triangles is not None:
+                    cmd += ["--target_triangles", str(cfg.target_triangles)]
+                if cfg.normal_map:
+                    cmd += [
+                        "--normal_map",
+                        "--normal_map_bits",
+                        str(cfg.normal_map_bits),
+                    ]
+                if cfg.ao_map:
+                    cmd += ["--ao_map"]
+                cmd += list(cfg.extract_mesh_extra_args)
                 _run(cmd, cfg.dry_run)
                 if not cfg.dry_run:
                     mesh_stats = (

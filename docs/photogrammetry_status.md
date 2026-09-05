@@ -22,7 +22,7 @@
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
        tests/test_texturing.py tests/test_extract_mesh_io.py -q
    ```
-   Expect **150 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **153 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Before touching the texturing code**, read
    [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md). All
@@ -246,10 +246,10 @@ that surfaced them is (sixth §2.4, seventh §2.2, eighth/ninth §2.3, tenth
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
 | `tests/test_colmap_dataset.py` | 13 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 14 | Geometry metrics against known analytic ground truth, plus `atlas_sharpness` (detail ordering, chart-border exclusion, empty/uint8 handling) |
-| `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
+| `tests/test_photogrammetry_pipeline.py` | 36 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
 | `tests/test_extract_mesh_io.py` | 5 | Texture-map writing: the 16-bit RGB PNG round trip (and the BGR channel reversal it depends on), and that 16 bits recovers normal detail 8 bits cannot |
 | `tests/test_texturing.py` | 42 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12; and seam levelling — the conjugate-gradient solver against a dense solve, shared-edge recovery, and that levelling closes the exposure steps without introducing a colour cast |
-| **Total** | **150** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| **Total** | **153** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -388,6 +388,42 @@ a test. Seam discontinuity on the shipped asset: 0.262 → 0.090.
 **Reviewed only:** the `--texture_view_selection` /
 `--texture_seam_smoothness` CLI guards and warnings, which need a real
 checkpoint to reach.
+
+### 2.19 The one-command path had drifted out of reach of half the pipeline
+
+Worth recording as a process finding rather than a feature. `run_pipeline.py`
+forwarded only `--texture_mode`, `--texture_size`, `--texture_view_selection`
+and `--cull_unobserved` to the mesh stage. Every other delivery option added
+over the last several sessions — decimation (`--target_fit_ratio`,
+`--target_triangles`), the extra maps (`--normal_map`, `--normal_map_bits`,
+`--ao_map`), `--texture_pages`, `--texture_texels_per_pixel`,
+`--texture_outlier_sigma` — was **unreachable from the documented one-command
+path**. The PR's headline claim is that the whole pipeline runs from one
+command; for a while that command could produce only a raw TSDF mesh with an
+albedo on it.
+
+Found by diffing the two CLIs' field lists against what the runner emits.
+That diff is now two tests:
+
+- **Every long option the runner forwards must be one `extract_mesh.Config`
+  actually accepts.** A renamed or mistyped flag is otherwise invisible until
+  the subprocess exits non-zero — hours into a real run, with the GPU work
+  already paid for. Mutation-checked with a deliberate typo.
+- **The delivery flags must appear in the dry-run command**, so the gap cannot
+  silently reopen.
+
+The structural fix is `--extract_mesh_extra_args`, appended verbatim. The
+module docstring already says each stage's own CLI is the source of truth for
+its options; naming a subset here is a convenience, and without an escape hatch
+every new stage flag is blocked until someone remembers to mirror it — which is
+exactly how this happened. One sharp edge, documented in the field's own help
+because the natural spelling fails: the first element must be bound with `=`
+(`--extract_mesh_extra_args=--texture_seam_smoothness 0.25`), or tyro reads the
+leading `--` as a new option and rejects the call.
+
+**Executed:** the full suite, 153 passed; three mutations checked (forward a
+flag `extract_mesh` does not accept, stop forwarding the delivery flags, drop
+the escape hatch) — each fails a test.
 
 ### 2.18 Multi-page atlases
 

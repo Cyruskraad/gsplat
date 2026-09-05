@@ -107,13 +107,28 @@ python examples/extract_mesh.py \
     --texture_mode atlas --texture_size 4096
 ```
 
-`run_pipeline.py` takes the same two flags and forwards them to this stage,
-so the one-command path can produce an atlas too:
+`run_pipeline.py` reaches the whole delivery path, not just the texture:
+`--cull_unobserved`, `--target_fit_ratio`/`--target_triangles`, `--normal_map`
+(with `--normal_map_bits`), `--ao_map`, `--texture_pages`,
+`--texture_texels_per_pixel` and `--texture_outlier_sigma` are all forwarded to
+this stage.
 
 ```bash
 python examples/run_pipeline.py \
     --data_dir data/360_v2/garden --result_dir results/garden_pipeline \
-    --texture_mode atlas --texture_size 4096
+    --texture_mode atlas --texture_size 4096 \
+    --cull_unobserved --target_fit_ratio 1.0 --normal_map --ao_map
+```
+
+Anything the runner does not name goes through `--extract_mesh_extra_args`,
+appended verbatim — each stage's own CLI is the source of truth for its
+options, and without an escape hatch every new stage flag is unreachable here
+until someone mirrors it. **Bind the first element with `=`**, or the parser
+reads its leading `--` as an option of its own and rejects the call:
+
+```bash
+python examples/run_pipeline.py --data_dir ... --result_dir ... \
+    --extract_mesh_extra_args=--texture_seam_smoothness 0.25
 ```
 
 This writes `mesh.obj`, `mesh.mtl` and `mesh_0.png` (instead of `mesh.ply`,
