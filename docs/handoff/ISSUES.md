@@ -1,0 +1,183 @@
+# Issues, blockers and traps
+
+**This is the highest-value file in the directory.** Most entries are things a
+reasonable person would get wrong on first attempt, and several are
+measurements that *invert the obvious intuition*.
+
+---
+
+## 1. Blockers — what is stopping this from being finished
+
+All three have held for the entire life of the branch. Re-verify them at the
+start of a session rather than assuming; the check is seconds.
+
+| Blocker | How to check | Consequence |
+|---|---|---|
+| **GitHub Actions disabled at the repo level** | `list_workflows` returns `total_count: 0` despite `.github/workflows/*.yml` existing | No CI has ever run. Manual validation stands in for it. The repo owner has said they lack access to enable it. |
+| **No GPU / CUDA / compiled extension** | `nvidia-smi`; `torch.cuda.is_available()` | `train`, `extract_mesh` and `dense_mvs` have never run end to end. All texturing is verified against analytic ground truth instead of a real capture. |
+| **No CUDA `colmap` binary** | `command -v colmap` | Dense MVS cannot run. |
+| **No model weights fetchable** | Network policy allows package registries, 403s other hosts | Neither AI-prior recipe has been run against a real model. |
+
+**The single highest-value action available to a human is enabling Actions**, or
+one GPU run against a real capture. Nothing in the code is waiting on more code.
+
+## 2. Open state on the PR
+
+- PR [#3](https://github.com/Cyruskraad/gsplat/pull/3) is an **open draft**,
+  mergeable clean, with **no reviews and no comments**. It needs a human.
+- **The PR body is stale.** It was last refreshed at `92554d9` and is 4 commits
+  behind: it says "130 tests" (it is 153) and does not mention culling,
+  evidence-based atlas sizing, multi-page atlases, or the one-command
+  forwarding fix. `docs/photogrammetry_status.md` and this directory *are*
+  current. Refreshing means rebuilding from the live body via
+  `pull_request_read` — a saved draft in the scratchpad has drifted from it.
+
+## 3. Known limitations (deliberate, documented, not bugs)
+
+- **View selection cannot be combined with multi-page atlases.**
+  `bake_mesh_texture` raises rather than half-supporting it: the MRF labels
+  faces across the whole mesh and its seam levelling would have to run across
+  page boundaries. This is the most substantial remaining feature gap.
+- **View selection is a genuine tradeoff, not a strict win** — sharper but
+  pointwise less accurate. It is off by default and must stay that way unless a
+  real capture says otherwise.
+- **`seam_discontinuity` never reaches zero.** Two samples either side of a
+  border are different surface points, so the texture's own detail sets a
+  floor. Read the before/after pair, never the absolute.
+- **The ICM optimiser has no optimality bound** where alpha-expansion (graph
+  cut) is within a known factor. Graph cut needs a max-flow solver, which would
+  be a new hard dependency. The interface is kept optimiser-agnostic so one can
+  be dropped in.
+- **Non-square atlases and multi-material chart grouping** are unimplemented.
+- **Appearance-embedding checkpoints** are out of scope for mesh extraction.
+
+## 4. Traps — measured facts that contradict the obvious guess
+
+Each of these cost real time to discover. Do not re-derive them.
+
+### Texturing quality
+
+1. **Sharpness/contrast is the success metric for view selection — *not* error
+   against ground truth.** Pointwise L1 goes the *other* way (0.171 blended vs
+   0.199 view-selected at 45′). Blending *attenuates* detail; single-view
+   sampling *displaces* it, and a displaced-but-sharp texture scores worse
+   pointwise while looking far better. A test asserting "view selection has
+   lower L1" **would fail** and make the feature look worthless. The existing
+   test asserts the tradeoff in the opposite direction on purpose.
+2. **The premise is frequency-dependent.** Against the repo's default
+   `_surface_pattern` (wavelength ≈ half the sphere) blending loses *nothing* —
+   98–100% gradient retention out to 90′ — and view selection looks pointless.
+   The effect only exists where detail sits near the misregistration scale.
+   `tests/test_texturing.py::_high_frequency_pattern` exists for this.
+3. **Seam levelling must average colour *along the shared edge*, not compare at
+   the shared vertex.** Two views of one vertex disagree by **0.288** from pixel
+   quantisation and silhouette bleed alone, where the exposure difference being
+   corrected is 0.26 — the solve then fits noise larger than the signal and
+   makes the atlas *worse* (0.184 → 0.221 on a scene with no exposure
+   differences at all).
+4. **`seam_discontinuity`'s inset must be in texels, not a fraction of the
+   face.** A fractional inset reads **0.087 on a seam-free ground-truth atlas** —
+   it measures the texture's own spatial variation as a seam.
+
+### Geometry and sampling
+
+5. **`face_visibility` is not `face_view_quality() > 0`.** Quality is *gradient
+   energy*, so a face on a flat untextured surface scores zero however plainly
+   it is in view. Measured on a flat-shaded sphere: 215 of 653 visible
+   (face, view) pairs score exactly zero, and **12 of 224 faces score zero from
+   every view while every camera sees them**. Culling on quality deletes surface
+   out of the middle of an observed object.
+6. **Evidence is the *maximum* over views, not the sum.** Photographing a wall
+   twenty times is not more detail than photographing it twice from the same
+   distance. Summing makes the recommended atlas grow with the shutter count.
+7. **Round atlas sizes to the *nearest* power of two, not the next one up.**
+   Rounding up quadruples the atlas for an arbitrarily small overshoot: exact
+   518.1 → 1024 baked **3.88x** more texels than there were pixels to fill them.
+8. **UV packing efficiency has no defensible constant** — 42.7%–73.2% across
+   test meshes, non-monotonically in density. It *is* stable per mesh (≤2.8%
+   over repeats), so measure it with a probe unwrap.
+
+### open3d specifics
+
+9. **`compute_uvatlas` SEGFAULTS (exit 139) on non-manifold input.** It does not
+   raise. Manifoldness is checked up front; do not remove that check.
+10. **`compute_uvatlas` is not deterministic.** Four unwraps of one mesh give
+    four layouts. `_unwrap_and_rasterize` reuses existing `triangle_uvs` for
+    this reason — every map must ride the same layout.
+11. **open3d cannot write textured glTF/GLB.** It warns and produces a corrupt
+    file. OBJ + MTL + PNG is the delivery format.
+12. **`cast_rays`' barycentric convention is `(1-u-v, u, v)`** — pinned
+    empirically, not assumed.
+
+### Tooling
+
+13. **Pillow cannot write 16-bit RGB PNG at all** (only 16-bit greyscale); it
+    raises `TypeError: Cannot handle this data type`. Those go through OpenCV,
+    which is **BGR** — a normal map written without reversing the channels loads
+    fine and shades wrong.
+14. **`py_compile` does not catch a `NameError` in a `tyro` dataclass's
+    annotations.** It compiles without executing. You must additionally
+    `import` each changed example script. This let a real break through once.
+15. **tyro stops consuming a `List[str]` at the next `--`-prefixed token.** Bind
+    the first element with `=`:
+    `--extract_mesh_extra_args=--texture_seam_smoothness 0.25`.
+16. **A convex test shape cannot test an occlusion guard.** On a sphere the bake
+    is byte-identical with and without the occluder, because every face the
+    cameras should not see is also facing away and back-face rejection already
+    removes it. Use `tests/test_texturing.py::_two_quads`.
+
+## 5. The recurring testing failure — read this before writing tests
+
+**Four times on this branch, a test proved a *mechanism* worked while the
+*call site* went unpinned.** Each time the mutation passed the entire suite:
+
+| Mutation that escaped | Why the existing test missed it | What closed it |
+|---|---|---|
+| Cull on `quality > 0` instead of visibility | The nested-spheres scene is textured, so the two agree there | A flat-scene culling test |
+| Sum projected areas instead of max | Every scaling test uses *ratios*, and a consistent over-count cancels out of a ratio | A test pinning absolute evidence against view count |
+| `bake_texture_atlas_pages(occluder=None)` | The occlusion test supplies its own occluder either way | A test driving the page bake itself |
+| Return an unmeasured decimation result | The first attempt produced the same mesh by coincidence | A stronger mutation (return an over-decimated mesh) |
+
+**The lesson: after mutation-checking a mechanism, mutate the *caller* too.** If
+the suite stays green, the wiring is untested no matter how good the unit test
+looks.
+
+Two more testing notes from experience here:
+
+- **Assert your own premise, with a measured number.** Several tests would
+  otherwise be vacuously satisfied. Where a premise assertion failed, the fix
+  was usually that *the prediction* was wrong, not the code — e.g. the disc law
+  predicted an evidence-vs-distance ratio of 2.07 where it measures 2.27,
+  because the disc law describes a silhouette while the code sums each face's
+  *best* view (bounded above by the head-on law at 2.40). The test now asserts
+  that bracket, with both ends derived.
+- **Do not trust a script's "ok" if you did not see it.** A doc-edit heredoc
+  once failed silently because its output went to a backgrounded task file and
+  only the pytest tail was read. `grep` for the text afterwards.
+
+## 6. What to do next
+
+Ordered by value. Everything unblocked has been done; be honest about that
+rather than inventing work.
+
+**Blocked on a human or hardware** (the real critical path):
+
+1. **Enable GitHub Actions**, then confirm `core_tests.yml` actually runs the
+   suite. Highest value by a distance.
+2. **Get PR #3 reviewed**, or feedback on scope/direction.
+3. **One GPU run on a real capture.** This settles the open question the metrics
+   were built to answer: *is view selection worth enabling on real data?*
+   `atlas_sharpness` and `seam_discontinuity` exist to answer it.
+4. Run either AI-prior recipe against a real model, with weights.
+
+**Unblocked, if you want more code** (all genuinely optional):
+
+5. **View selection combined with multi-page atlases** — currently refused. The
+   MRF already labels mesh-wide; the work is making seam levelling run across
+   page boundaries and the page bake honour labels. The most substantial
+   remaining feature.
+6. Non-square atlases; multi-material chart grouping.
+7. **Refresh the PR body** (see §2).
+8. Tuning the defaults — `--texture_size` 2048, dilation 4 texels, normal-map
+   cage 2% of the bbox diagonal. None has been tuned against a real scene, so
+   this really wants #3 first.

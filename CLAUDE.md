@@ -3,23 +3,28 @@
 ## Active work: photogrammetry pipeline (PR #3)
 
 Ongoing work on this fork adds a `gsplat.photogrammetry` subpackage — SfM ->
-bundle adjustment -> dense MVS -> Gaussian-splat training -> mesh extraction,
-with AI-assisted priors and per-stage automatic quality metrics.
+bundle adjustment -> dense MVS -> Gaussian-splat training -> mesh extraction ->
+cull -> decimate -> texture -> normal/AO maps, with AI-assisted priors and
+per-stage automatic quality metrics.
 
-**Before continuing that work, read [`docs/photogrammetry_status.md`](docs/photogrammetry_status.md).**
-It is the handoff document: what has been built, what was actually executed
-versus verified by code review only, what's blocked, and what to do next. Its
-"START HERE" section says exactly how to pick it up.
+**Before continuing that work, read [`docs/handoff/README.md`](docs/handoff/README.md).**
+It indexes four short documents that together are the complete picture — scope,
+scaffolding, progress (including what was *executed* versus only *reviewed*),
+and the current issues. A new session should be able to read only those and
+continue immediately.
 
-There is active in-progress work with an approved plan:
-[`docs/photogrammetry_texturing_plan.md`](docs/photogrammetry_texturing_plan.md)
-— per-face view selection + seam levelling for sharp texturing. Its status
-table says which steps are landed and which to start from. **Read its
-"Premise, measured" section before writing any test for it**: the obvious
-success metric is the wrong one, and the naive test fails.
+**[`docs/handoff/ISSUES.md`](docs/handoff/ISSUES.md) is the one to read
+carefully.** Several of its entries are measurements that invert the obvious
+intuition — the success metric for per-face view selection is contrast, not
+error against ground truth, and the naive test fails. It also records a
+recurring testing failure worth knowing before you write a test here: four
+times, a test proved a mechanism worked while its call site went unpinned.
 
-Feature documentation (how to *use* the pipeline) lives separately in
-[`docs/photogrammetry.md`](docs/photogrammetry.md).
+Longer-form background, for depth rather than orientation:
+[`docs/photogrammetry.md`](docs/photogrammetry.md) (how to *use* the pipeline),
+[`docs/photogrammetry_status.md`](docs/photogrammetry_status.md) (the running
+log), [`docs/photogrammetry_texturing_plan.md`](docs/photogrammetry_texturing_plan.md)
+(the texturing design record).
 
 ## Conventions this repo already follows
 
@@ -27,7 +32,13 @@ Feature documentation (how to *use* the pipeline) lives separately in
   `python -m black --check --required-version 22.3.0 <files>` on anything you
   touch. `lint/format-code.sh` wraps the repo-wide pass.
 - **Tests:** `pytest` from the repo root (`pytest.ini` sets `pythonpath = .`
-  and requires the `pytest-check` plugin).
+  and requires the `pytest-check` plugin). There is **no CI on this fork** —
+  Actions is disabled at the repo level — so validate by hand.
+- **`py_compile` is not enough for `examples/*.py`:** it compiles without
+  executing, so it misses a `NameError` in a `tyro` dataclass's annotations
+  that breaks the script on import. Also run
+  `cd examples && PYTHONPATH=<repo> python -c "import <script>"` for each
+  example script you touch.
 - **No bundled model-running code.** gsplat consumes precomputed output from
   external AI models (depth estimators, segmenters, neural SfM) via files
   rather than shipping code that runs them — see
