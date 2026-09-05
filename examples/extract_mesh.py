@@ -827,8 +827,28 @@ def main(cfg: Config) -> None:
                         RuntimeWarning,
                     )
 
+    # A runtime fallback the up-front guard cannot foresee: --normal_map and
+    # --ao_map were checked against --texture_mode at the top, but the atlas
+    # bake can still *fall back* to per-vertex colours at run time -- most
+    # often because --cull_unobserved left the mesh non-manifold, which
+    # removing faces can do whenever it disconnects two patches that met at a
+    # single vertex. There are then no UVs to bake a map into, and both bakers
+    # would raise from inside `_unwrap_and_rasterize`. Losing the extra maps is
+    # the right outcome; losing the whole run, after the albedo has already
+    # been baked, is not.
+    if texture is None and (cfg.normal_map or cfg.ao_map):
+        warnings.warn(
+            "Skipping --normal_map/--ao_map: the UV-atlas bake fell back to "
+            "per-vertex colours, so there is no atlas to bake them into. The "
+            "usual cause is a mesh that cannot be unwrapped -- "
+            "--cull_unobserved can leave one non-manifold by disconnecting "
+            "patches that shared a vertex. The mesh and its per-vertex colours "
+            "are still written.",
+            RuntimeWarning,
+        )
+
     normal_map_stats = None
-    if cfg.normal_map:
+    if cfg.normal_map and texture is not None:
         # Runs after the color atlas so it reuses those UVs -- open3d's
         # unwrapper is non-deterministic, so a second unwrap would give the
         # normal map a different layout from the albedo.
@@ -853,7 +873,7 @@ def main(cfg: Config) -> None:
             )
 
     ao_stats = None
-    if cfg.ao_map:
+    if cfg.ao_map and texture is not None:
         # Self-occlusion on the mesh that ships, unlike the normal map's
         # dense-vs-decimated bake. Casting against the dense mesh would need a
         # cage large enough to clear the decimation gap (most of a simplified

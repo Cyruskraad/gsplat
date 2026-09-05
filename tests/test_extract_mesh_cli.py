@@ -498,6 +498,87 @@ def test_mesh_refinement_runs_from_the_cli_and_moves_the_geometry(
         assert key in refinement, key
 
 
+def test_extra_maps_are_skipped_when_the_atlas_bake_falls_back(capture, tmp_path):
+    """Losing the extra maps is right; losing the whole run is not.
+
+    `--normal_map`/`--ao_map` are checked against `--texture_mode` up front, but
+    the atlas bake can still *fall back* to per-vertex colours at run time --
+    most often because `--cull_unobserved` left the mesh non-manifold, which
+    removing faces does whenever it disconnects two patches that met at a
+    single vertex. Measured on this fixture: culling alone takes a
+    vertex-manifold mesh to a non-manifold one.
+
+    There are then no UVs to bake a map into, and both bakers raised from
+    inside `_unwrap_and_rasterize` -- *after* the albedo had already been
+    baked, so the run died at the last step with all its work done. Found by
+    running the CLI end to end, which is the only way it could have been.
+    """
+    _examples_on_path()
+    import open3d as o3d
+
+    import extract_mesh
+
+    # Two tetrahedra joined at a single shared vertex: edge-manifold, but not
+    # vertex-manifold, which is exactly the shape culling produces when it
+    # disconnects two patches. Built explicitly rather than by culling, so the
+    # test pins the *fallback* rather than depending on this fixture's culling
+    # happening to leave a non-manifold mesh.
+    vertices = np.array(
+        [
+            [0.0, 0.0, 0.0],  # the shared apex
+            [0.1, 0.0, 0.0],
+            [0.0, 0.1, 0.0],
+            [0.0, 0.0, 0.1],
+            [-0.1, 0.0, 0.0],
+            [0.0, -0.1, 0.0],
+            [0.0, 0.0, -0.1],
+        ]
+    )
+    triangles = np.array(
+        [
+            [0, 2, 1],
+            [0, 3, 2],
+            [0, 1, 3],
+            [1, 2, 3],
+            [0, 4, 5],
+            [0, 5, 6],
+            [0, 6, 4],
+            [4, 6, 5],
+        ]
+    )
+    pinched = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices),
+        o3d.utility.Vector3iVector(triangles),
+    )
+    assert pinched.is_edge_manifold()
+    assert not pinched.is_vertex_manifold(), "the fixture is not the shape it claims"
+    mesh_path = tmp_path / "pinched.ply"
+    o3d.io.write_triangle_mesh(str(mesh_path), pinched)
+
+    cfg = _config(
+        capture,
+        tmp_path,
+        mesh_path=str(mesh_path),
+        texture_mode="atlas",
+        texture_size=64,
+        normal_map=True,
+        ao_map=True,
+        ao_samples=4,
+    )
+    with pytest.warns(RuntimeWarning, match="Skipping --normal_map"):
+        extract_mesh.main(cfg)
+
+    out = Path(cfg.result_dir)
+    # A .ply, because there is no atlas to hang off a .obj -- and no orphan
+    # map files claiming otherwise.
+    assert (out / "mesh.ply").exists()
+    assert not (out / "mesh_normal.png").exists()
+    assert not (out / "mesh_ao.png").exists()
+    mesh = o3d.io.read_triangle_mesh(str(out / "mesh.ply"))
+    assert len(mesh.triangles) > 0
+    assert mesh.has_vertex_colors()
+
+
 # ---------------------------------------------------------------------------
 # The checkpoint-free entry itself
 # ---------------------------------------------------------------------------

@@ -41,8 +41,8 @@ test had ever called that script's `main()`.
 | Branch | `claude/gsplat-photogrammetry-next-0tdvws`, branched from `claude/photogrammetry-techniques-plan-jb0pod` |
 | Head | `ea9dce7` (39 commits against `main`; 5 of them this session, +5071 / −43 against `jb0pod`) |
 | PRs | [#3](https://github.com/Cyruskraad/gsplat/pull/3) (`jb0pod` → `main`) and [#4](https://github.com/Cyruskraad/gsplat/pull/4) (this session, → `jb0pod`) — both **open drafts**, **no reviews, no comments, no CI** |
-| Tests | **194 passing** across 10 files |
-| Bugs found and fixed | 18, each mutation-checked |
+| Tests | **195 passing** across 10 files |
+| Bugs found and fixed | 19, each mutation-checked |
 | Blocking | GitHub Actions disabled at repo level; no GPU/CUDA/`colmap`; no model weights |
 
 ---
@@ -59,7 +59,7 @@ python -m pytest tests/test_bundle_adjustment.py tests/test_mesh_extraction.py \
     tests/test_extract_mesh_cli.py tests/test_photometric_alignment.py -q
 ```
 
-Expect **194 passed** (~3m10s). Needs `torch`, `pycolmap`, `open3d`,
+Expect **195 passed** (~3m10s). Needs `torch`, `pycolmap`, `open3d`,
 `scikit-learn`, `opencv-python-headless`, `imageio`, `piexif`, `pytest-check`.
 
 **Run the whole set, not one file.** One test in this suite already failed

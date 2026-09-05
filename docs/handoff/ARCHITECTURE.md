@@ -35,7 +35,7 @@ Also modified: `examples/simple_trainer_2dgs.py` (`--extract_mesh`,
 (`mono_depth_dir`, `mask_dir`), `.github/workflows/core_tests.yml` (installs
 the suite's deps).
 
-### Tests — 194 across 10 files
+### Tests — 195 across 10 files
 
 | File | Tests | Lines |
 |---|---:|---:|
@@ -44,7 +44,7 @@ the suite's deps).
 | `tests/test_photogrammetry_pipeline.py` | 36 | 966 |
 | `tests/test_photogrammetry_metrics.py` | 14 | 228 |
 | `tests/test_colmap_dataset.py` | 13 | 568 |
-| `tests/test_extract_mesh_cli.py` | 13 | 718 |
+| `tests/test_extract_mesh_cli.py` | 14 | 790 |
 | `tests/test_extract_mesh_io.py` | 5 | 152 |
 | `tests/test_photometric_alignment.py` | 5 | 440 |
 | `tests/test_neural_sfm.py` | 4 | 243 |

@@ -9,7 +9,7 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **194 tests pass** (153 before this session). Every guard
+- **195 tests pass** (153 before this session). Every guard
   mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
@@ -117,7 +117,7 @@ docstring too.
 
 ---
 
-## The 18 bugs found and fixed
+## The 19 bugs found and fixed
 
 Each was confirmed by reverting the fix and showing a test genuinely fails.
 
@@ -206,6 +206,19 @@ Each was confirmed by reverting the fix and showing a test genuinely fails.
     Laplacian regulariser collapsed a correct sphere to radius 0.944; and
     `np.argmin`'s first-minimum tie-break resolved every tie toward the most
     inward offset. All three are in `ISSUES.md` § 4.26–28 with their numbers.
+
+19. **`--normal_map`/`--ao_map` crashed when the atlas bake fell back.** Both
+    are checked against `--texture_mode` up front, but the atlas bake can still
+    fall back to per-vertex colours *at run time* — most often because
+    `--cull_unobserved` left the mesh non-manifold, which removing faces does
+    whenever it disconnects two patches that met at a single vertex (measured:
+    culling alone takes a vertex-manifold mesh to a non-manifold one). There
+    are then no UVs to bake into, and both bakers raised from inside
+    `_unwrap_and_rasterize` — *after* the albedo had been baked, so the run
+    died at the last step with all its work already done. Same class as bug 14:
+    a guard present on one path and missing on the neighbouring one. **Found by
+    the mandated end-to-end CLI run after the last task**, which is the only
+    thing that could have found it.
 
 Two sharp edges are **guarded rather than fixed**, because they are upstream:
 `compute_uvatlas` segfaults (exit 139) on non-manifold input, so manifoldness is
