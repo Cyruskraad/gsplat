@@ -9,7 +9,8 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **153 tests pass.** Every guard mutation-checked — the fix reverted, a test
+- **195 tests pass** (153 before this session). Every guard
+  mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
   perturbed points: removed **96.5%** of the reprojection error.
@@ -23,18 +24,79 @@ looks right.
     byte-identical;
   - every sizing decision measured: 6960 faces → cull 3480 → fit-decimate 592 →
     atlas 512 chosen from the evidence.
+- **`examples/extract_mesh.py`'s `main()` itself**, against a synthetic capture
+  written to disk by the new `examples/make_synthetic_capture.py` — with the
+  full delivery flag set (`--cull_unobserved --texture_mode atlas
+  --texture_view_selection --texture_seam_smoothness --target_fit_ratio
+  --normal_map --normal_map_bits 16 --ao_map`), reading the OBJ/MTL/PNGs back.
+  This is what converts the "reviewed only" block below from ~ten guards to
+  two, and it is the pin that reproduces bug 14: reverted, it fails with the
+  original `TypeError`.
+- **`run_pipeline.py` non-dry-run**, delivering a textured mesh through the
+  `extract_mesh` stage with no checkpoint and no GPU.
+- **Photometric camera refinement** (Zhou & Koltun 2014), on views ray-cast
+  from the same mesh it refines against, at 45' of injected pose error:
+  photometric residual **0.145 → 0.041** (3.5x), pairwise pose disagreement
+  **55.9' → 24.8'** (2.3x). Its effect on texturing, on the larger fixture:
+  blending's contrast retention **59.1% → 92.5%** against a
+  perfectly-registered ceiling of 92.9%, atlas L1 **0.180 → 0.057**, and
+  view selection's L1 **0.229 → 0.053** — which *flips the L1 ranking* to the
+  one exact poses produce. The headline tradeoff is a symptom of
+  misregistration, and this is it going away, measured.
+- **Multi-view super-resolution** (Goldlücke et al. 2014) as a MAP
+  deconvolution on the atlas, solved with the existing hand-rolled
+  `_conjugate_gradient` and an IRLS Huber prior, no scipy. Against blending it
+  is a clean win on *both* axes — contrast **63.6% → 90.8%** of ground truth,
+  L1 **0.1081 → 0.0759** — which nothing else in the module manages. Against
+  view selection it is reliably sharper but pointwise a coin flip
+  (`ISSUES.md` § 4.22 tabulates four regimes), so **it stays opt-in and the
+  test asserts "comparable", not "better"**. The pitch was that it would be
+  strictly better than both; it is not.
+- **The CPU half of splat-to-surface level-set extraction** (the approach
+  Gaussian Opacity Fields takes), against an analytic field: marching
+  tetrahedra over a Kuhn-decomposed grid recovers `f(x) = |x| − r` **watertight
+  and edge-manifold** at every resolution tested, with vertices on the sphere
+  to **0.007 of a cell**, and the error falling **~4x per halving of the cell**
+  — second order, not the linear halving the obvious guess predicts.
+- **Photometric mesh refinement** (Vu et al. 2012, OpenMVS's `RefineMesh`) —
+  the first thing in this package that moves a vertex to fit the photographs.
+  On a sphere perturbed by 0.03, measured against the *analytic* surface:
+  mean radial error **0.0244 → 0.0125** (1.95x), photoconsistency
+  **0.0985 → 0.0251**, cloud-to-mesh **0.0207 → 0.0094**. Its noise floor is
+  ~0.0068 of radial error, stated in `ISSUES.md` § 4.30 rather than hidden.
+- **The last absolute scene-unit constants, now derived**:
+  `voxel_size`/`sdf_trunc`/`depth_trunc` from the depth actually being fused,
+  and Poisson's normal radius from the cloud's own spacing. Verified
+  scale-equivariant: scale the cloud tenfold and every derived length scales
+  exactly tenfold. The old fixed `radius=0.1` returns normals **no better than
+  chance** on a cloud ten times larger (mean |n·truth| **0.507**, against
+  **0.9999** derived — 0.5 is what random directions give). `--depth_trunc`
+  was not even exposed before, so a capture larger than ten scene units
+  silently lost its far geometry.
+- **Three claims this session set out to confirm and instead falsified**, each
+  recorded in `ISSUES.md` § 4 rather than quietly dropped: open3d's shipped
+  implementation of the same algorithm (worse in every configuration, including
+  on exact poses); "single-scale will not recover 45'" (false at equal work);
+  and "blending retains >= 95% after refinement" (above the ceiling — exact
+  poses reach ~93%).
 - `black --check --required-version 22.3.0`, `py_compile`, and an `import` of
   every changed example script.
 
 ### Reviewed by code inspection only
 
-- **Every CLI guard and warning in `extract_mesh.py`** — `--normal_map`/`--ao_map`,
-  `--texture_view_selection`, `--texture_seam_smoothness`, `--cull_unobserved`
-  and its histogram warning, `--texture_texels_per_pixel` and its clamp warning,
-  `--texture_pages`, and the `--target_fit_ratio`/`--target_triangles` mutual
-  exclusion. **All of them sit after an `assert cfg.ckpt`, so reaching any of
-  them needs a real checkpoint.** They are mutually consistent and modelled on
-  the already-shipped `--normal_map` guard, but none has been executed.
+- **`gaussian_density_field` has never run.** It needs a GPU and the compiled
+  CUDA extension, and it is the *only* part of the level-set path that does.
+  Everything downstream of it — the Kuhn decomposition, the
+  marching-tetrahedra table, the shared-vertex identification, the cleanup —
+  is measured against analytic ground truth (see above). Its one
+  CPU-reachable guard, the appearance-embedding refusal, *is* tested. The
+  field evaluation itself, and therefore the claim that this extracts a
+  surface from a real Gaussian field, is **unverified**.
+- The GPU-only half of `extract_mesh.py`: `--method tsdf` (which renders depth
+  maps from a checkpoint) and the `--texture_texels_per_pixel` clamp warning,
+  which needs an atlas larger than the cap. Everything else in that script now
+  runs in `tests/test_extract_mesh_cli.py` — see the executed list above; the
+  `assert cfg.ckpt` that used to gate all of it is gone.
 - The GPU stages themselves: `train`, `extract_mesh`, `dense_mvs` end to end.
 - Both AI-prior recipes against a *real* model. The Mask R-CNN recipe's full API
   path was executed with a randomly-initialised model and its output loaded
@@ -55,7 +117,7 @@ docstring too.
 
 ---
 
-## The 13 bugs found and fixed
+## The 19 bugs found and fixed
 
 Each was confirmed by reverting the fix and showing a test genuinely fails.
 
@@ -102,6 +164,61 @@ Each was confirmed by reverting the fix and showing a test genuinely fails.
     four-corner cancellation. That reaches `-log()` as `NaN`, and `np.argmin`
     returns a `NaN`'s index in preference to every real cost — so the face
     would be textured from the one view that *cannot see it*.
+14. **The delivery CLI could not run at all.** `examples/extract_mesh.py`
+    passed `seam_smoothness=` to `bake_mesh_texture()`, which had no such
+    parameter and no `**kwargs`. `bake_texture_` defaults to `True` and the
+    kwarg went unconditionally, so **every texture-baking run of
+    `extract_mesh.py` — and therefore `run_pipeline.py`'s whole delivery stage —
+    died with `TypeError`.** Seam levelling was reachable from the library but
+    not from the CLI. It shipped in `fa70683` and nothing caught it because **no
+    test had ever called `extract_mesh.main()`**: the script opened with an
+    `assert cfg.ckpt` that ran *before* the method dispatch, so no test could
+    reach `main()` without a trained GPU checkpoint. Fifth instance of the
+    failure mode in `ISSUES.md` § 5, and the first that was a hard crash.
+15. **Geometry read off disk was never mapped into the dataset's frame.**
+    `extract_mesh.py` builds its `Parser` with `normalize=True`, which rescales
+    and reorients the world and hands out every pose in *that* frame; the
+    `--method poisson` path read `--dense_points` with `o3d.io.read_point_cloud`
+    and used it raw. `Parser` applies exactly this transform to its own
+    `dense_points_path`, so the two disagreed. Measured on the synthetic
+    capture the frames differ by ~3.4x in scale plus a rotation, which puts
+    every camera *inside* the reconstructed mesh. Pre-existing, and found only
+    by running the path.
+
+16. **A rotation delta that does not carry its translation moves the camera
+    centre.** `bundle_adjustment._optimize`'s `R = exp(δ)·R₀`, `t = t₀ + Δt`
+    is fine there — reprojection BA's translation is always free to compensate
+    — but reused as-is for a photometric solve it swings the optical centre by
+    |t₀|·δ, which at |t₀| ≈ 3.5 and 45' is 0.046 world units: a third of the
+    texture's wavelength. The solve then made registration **worse**
+    (62' → 155'). Fixed by rotating `t₀` with the delta. Found by measuring the
+    outcome rather than the objective — the residual fell throughout.
+
+17. **The super-resolution prior entered the normal equations with the wrong
+    sign**, making the operator indefinite and the deconvolution divergent —
+    an atlas at **464% of the ground truth's contrast**, which
+    `atlas_sharpness` reads as a triumph. Caught by the L1 and by
+    non-monotonicity in the regularization weight, not by the sharpness metric.
+
+18. **Three faults in the mesh-refinement search, each of which looked like
+    convergence.** Visibility re-tested at the candidate position rejected
+    *every* candidate (the surface occludes its own offsets); an unprojected
+    Laplacian regulariser collapsed a correct sphere to radius 0.944; and
+    `np.argmin`'s first-minimum tie-break resolved every tie toward the most
+    inward offset. All three are in `ISSUES.md` § 4.26–28 with their numbers.
+
+19. **`--normal_map`/`--ao_map` crashed when the atlas bake fell back.** Both
+    are checked against `--texture_mode` up front, but the atlas bake can still
+    fall back to per-vertex colours *at run time* — most often because
+    `--cull_unobserved` left the mesh non-manifold, which removing faces does
+    whenever it disconnects two patches that met at a single vertex (measured:
+    culling alone takes a vertex-manifold mesh to a non-manifold one). There
+    are then no UVs to bake into, and both bakers raised from inside
+    `_unwrap_and_rasterize` — *after* the albedo had been baked, so the run
+    died at the last step with all its work already done. Same class as bug 14:
+    a guard present on one path and missing on the neighbouring one. **Found by
+    the mandated end-to-end CLI run after the last task**, which is the only
+    thing that could have found it.
 
 Two sharp edges are **guarded rather than fixed**, because they are upstream:
 `compute_uvatlas` segfaults (exit 139) on non-manifold input, so manifoldness is

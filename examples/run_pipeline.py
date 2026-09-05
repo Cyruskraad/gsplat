@@ -116,6 +116,33 @@ class Config:
     # view that sees it -- sharper, but pointwise less accurate, and it
     # requires --texture_mode atlas. See examples/extract_mesh.py.
     texture_view_selection: bool = False
+    # Move each vertex along its normal to fit the photographs before
+    # texturing (Vu et al., TPAMI 2012). Needs no GPU. Composes with
+    # --photometric_align: cameras first, then the surface.
+    # See examples/extract_mesh.py.
+    refine_mesh: bool = False
+    # Maximum depth to integrate during TSDF fusion, in scene units. Unset
+    # derives it from the scene's own extent (it was hardcoded at 10.0 and not
+    # reachable at all). See examples/extract_mesh.py.
+    depth_trunc: Optional[float] = None
+    # Solve for the texture whose reprojection best explains every view (a
+    # MAP deconvolution modelling the camera PSF) instead of blending them.
+    # Requires --texture_mode atlas. See examples/extract_mesh.py.
+    texture_super_resolve: bool = False
+    # Deliver an existing mesh instead of reconstructing one: cull, decimate,
+    # texture and map the .obj/.ply at this path. The extract_mesh stage then
+    # needs no checkpoint and no GPU, so the delivery half of the pipeline runs
+    # on a machine that cannot train. See examples/extract_mesh.py.
+    mesh_path: Optional[str] = None
+    # Refine the camera poses photometrically against the extracted mesh
+    # before texturing (Zhou & Koltun, SIGGRAPH 2014). Addresses the *cause* of
+    # the blur/ghosting the texturing options work around. Needs no GPU.
+    # See examples/extract_mesh.py.
+    photometric_align: bool = False
+    # Image-pyramid levels for --photometric_align.
+    photometric_align_levels: int = 3
+    # Optimiser steps per bake/optimise round for --photometric_align.
+    photometric_align_iters: int = 60
     # Remove faces no training camera ever saw before decimating and texturing.
     # TSDF fusion returns a closed surface, so it invents the underside and the
     # unvisited back of the subject. See examples/extract_mesh.py.
@@ -405,7 +432,14 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
     # -- Stage: mesh extraction ------------------------------------------
     if "extract_mesh" in selected:
         ckpt = _latest_checkpoint(cfg.result_dir)
-        if ckpt is None and not cfg.strict and not cfg.dry_run:
+        # --mesh_path replaces the reconstruction, so this stage no longer
+        # depends on the train stage having produced anything.
+        if (
+            ckpt is None
+            and cfg.mesh_path is None
+            and not cfg.strict
+            and not cfg.dry_run
+        ):
             record_skipped(
                 report,
                 "extract_mesh",
@@ -416,8 +450,14 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                 cmd = [
                     sys.executable,
                     os.path.join(EXAMPLES_DIR, "extract_mesh.py"),
-                    "--ckpt",
-                    ckpt or "<checkpoint>",
+                ]
+                if cfg.mesh_path is not None:
+                    # --ckpt and --mesh_path are two different surfaces, and
+                    # extract_mesh.py refuses both at once.
+                    cmd += ["--mesh_path", cfg.mesh_path]
+                else:
+                    cmd += ["--ckpt", ckpt or "<checkpoint>"]
+                cmd += [
                     "--data_dir",
                     cfg.data_dir,
                     "--data_factor",
@@ -437,6 +477,20 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                 ]
                 if cfg.texture_view_selection:
                     cmd += ["--texture_view_selection"]
+                if cfg.refine_mesh:
+                    cmd += ["--refine_mesh"]
+                if cfg.depth_trunc is not None:
+                    cmd += ["--depth_trunc", str(cfg.depth_trunc)]
+                if cfg.texture_super_resolve:
+                    cmd += ["--texture_super_resolve"]
+                if cfg.photometric_align:
+                    cmd += [
+                        "--photometric_align",
+                        "--photometric_align_levels",
+                        str(cfg.photometric_align_levels),
+                        "--photometric_align_iters",
+                        str(cfg.photometric_align_iters),
+                    ]
                 if cfg.cull_unobserved:
                     cmd += ["--cull_unobserved"]
                 if cfg.texture_pages > 1:

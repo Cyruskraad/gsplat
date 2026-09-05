@@ -631,6 +631,74 @@ def test_bake_mesh_texture_dispatches_to_view_selection_and_reports_it():
     assert blended_stats == {}
 
 
+def test_bake_mesh_texture_forwards_seam_smoothness_to_the_levelling():
+    """The dispatcher must *carry* --texture_seam_smoothness, not just accept it.
+
+    This pins the call site that shipped broken. ``bake_mesh_texture`` had no
+    ``seam_smoothness`` parameter at all while ``examples/extract_mesh.py``
+    passed one unconditionally, so every texture-baking run of that script --
+    and therefore ``run_pipeline.py``'s whole delivery stage -- died with
+    ``TypeError: bake_mesh_texture() got an unexpected keyword argument
+    'seam_smoothness'``. Seam levelling was reachable from the library but not
+    from the CLI, and nothing noticed because nothing drove either.
+
+    Accepting the argument is not enough: silently dropping it would make the
+    crash go away while leaving ``None`` (levelling off) indistinguishable from
+    ``0.1`` (levelling on), because the callee supplies its own default. So the
+    assertion is on the *effect* -- ``None`` must reach
+    :func:`bake_texture_atlas_view_selected` and suppress the levelling stats
+    that any other value produces.
+    """
+    from gsplat.photogrammetry.texturing import bake_mesh_texture
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    # Exposure drift is what levelling exists to remove; without it the solve
+    # has almost nothing to do and the stats are less clearly attributable.
+    dataset = _SphereDataset(num_views=8, exposure=0.15)
+
+    levelled: dict = {}
+    bake_mesh_texture(
+        _unit_sphere_mesh(resolution=8),
+        dataset,
+        mode="atlas",
+        texture_size=128,
+        view_selection=True,
+        seam_smoothness=0.1,
+        stats_out=levelled,
+    )
+    assert "seam_levelling" in levelled
+    assert levelled["seam_levelling"]["num_seam_edges"] > 0
+
+    unlevelled: dict = {}
+    bake_mesh_texture(
+        _unit_sphere_mesh(resolution=8),
+        dataset,
+        mode="atlas",
+        texture_size=128,
+        view_selection=True,
+        seam_smoothness=None,
+        stats_out=unlevelled,
+    )
+    # Dropped on the floor instead of forwarded, this key would be present:
+    # the callee's own default (0.1) would have levelled anyway.
+    assert "seam_levelling" not in unlevelled
+
+    # And it is accepted-and-ignored without view selection, the same contract
+    # mrf_smoothness already has -- raising here would resurrect the crash on
+    # the default blended path, which is what the CLI actually runs.
+    blended: dict = {}
+    _, texture = bake_mesh_texture(
+        _unit_sphere_mesh(resolution=8),
+        dataset,
+        mode="atlas",
+        texture_size=128,
+        seam_smoothness=0.1,
+        stats_out=blended,
+    )
+    assert texture.shape == (128, 128, 3)
+    assert blended == {}
+
+
 # ---------------------------------------------------------------------------
 # Seam levelling
 # ---------------------------------------------------------------------------
@@ -1485,3 +1553,254 @@ def test_page_bake_uses_the_whole_mesh_as_the_occluder():
     # Measured: [0, 0, 0] correct, [0.898, 0.102, 0.102] with the occluder
     # dropped.
     assert not (hidden[0] > 0.5 and hidden[1] < 0.3), hidden
+
+
+# ---------------------------------------------------------------------------
+# Multi-view super-resolution
+# ---------------------------------------------------------------------------
+
+
+def _mesh_rendered_views(mesh, num_views=10, width=48, pose_error_arcmin=0.0):
+    """Views ray-cast from `mesh` itself, so geometry is not a confound.
+
+    `_SphereDataset` renders the *analytic* sphere while `_unit_sphere_mesh` is
+    a polyhedron inscribed in it, and the gap between them is a sizeable
+    fraction of `_high_frequency_pattern`'s wavelength. A deconvolution is
+    exactly the wrong thing to measure through that gap: it would be charged
+    for tessellation error it cannot fix. See
+    `tests/test_photometric_alignment.py`, which learned this the hard way.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    from test_photometric_alignment import _MeshViews
+
+    return _MeshViews(
+        mesh,
+        num_views=num_views,
+        width=width,
+        pose_error_arcmin=pose_error_arcmin,
+    )
+
+
+def test_super_resolution_beats_blending_on_both_sharpness_and_error():
+    """The one claim that holds unambiguously, and the reason this exists.
+
+    Blending averages every view that sees a texel, which low-passes the result.
+    Super-resolution instead models how the texture *became* each photograph --
+    projected and blurred by the camera's PSF -- and solves for the texture
+    whose reprojection explains all of them. Against blending that is a strict
+    win on both axes at once, which nothing else in this module manages:
+    view selection buys sharpness with pointwise accuracy (ISSUES.md § 4.1).
+
+    Measured: contrast 63.6% -> 90.8% of the ground truth's, L1 0.1081 ->
+    0.0759.
+    """
+    _, _unit_sphere_mesh = _sphere_fixtures()
+    from gsplat.photogrammetry.metrics import atlas_sharpness
+    from gsplat.photogrammetry.texturing import (
+        bake_texture_atlas,
+        bake_texture_atlas_super_resolved,
+    )
+
+    size = 128
+    mesh = _unit_sphere_mesh(resolution=16)
+    dataset = _mesh_rendered_views(mesh)
+
+    _, blended = bake_texture_atlas(mesh, dataset, texture_size=size)
+    _, resolved, stats = bake_texture_atlas_super_resolved(
+        mesh, dataset, texture_size=size
+    )
+    truth, covered = _ground_truth_atlas(mesh, size, _high_frequency_pattern)
+
+    truth_grad = atlas_sharpness(truth, covered)["mean_gradient"]
+    truth_flat = truth[covered] / 255.0
+    blended_grad = atlas_sharpness(blended, covered)["mean_gradient"] / truth_grad
+    resolved_grad = atlas_sharpness(resolved, covered)["mean_gradient"] / truth_grad
+    blended_l1 = np.abs(blended[covered] / 255.0 - truth_flat).mean()
+    resolved_l1 = np.abs(resolved[covered] / 255.0 - truth_flat).mean()
+
+    # Premise: blending must actually be losing detail here.
+    assert blended_grad < 0.75, blended_grad
+    # Sharper *and* closer -- the whole point.
+    assert resolved_grad > 1.25 * blended_grad, (resolved_grad, blended_grad)
+    assert resolved_l1 < 0.85 * blended_l1, (resolved_l1, blended_l1)
+
+    # The solve reports the same verdict from its own stats, so a caller need
+    # not build a ground-truth atlas to see it.
+    assert (
+        stats["atlas_sharpness"]["mean_gradient"]
+        > stats["blended_atlas_sharpness"]["mean_gradient"]
+    )
+    assert stats["solver"]["converged"], stats["solver"]
+
+
+def test_super_resolution_is_sharper_than_view_selection_but_not_strictly_better():
+    """The claim that does **not** hold, pinned so it is not quietly assumed.
+
+    The pitch for this method is that it should be strictly better than both
+    alternatives rather than another tradeoff. Against blending it is (above).
+    Against view selection it is not: it is reliably sharper, but pointwise it
+    wins in some regimes and loses in others. Measured against the same
+    ground-truth atlas:
+
+    ======================================  ==============  ==============
+    Regime                                  view selection  super-resolved
+    ======================================  ==============  ==============
+    128 atlas, 48 px views (sigma 0.61 tx)  0.0785          0.0759
+    192 atlas, 48 px views (sigma 0.89 tx)  0.0787          0.0784
+    256 atlas, 64 px views (sigma 0.89 tx)  0.0770          0.0788
+    384 atlas, 64 px views (sigma 1.54 tx)  0.0400          0.0493
+    ======================================  ==============  ==============
+
+    The reason is structural and worth keeping in mind before tuning it away:
+    single-view sampling reads the source pixels with *no forward model at
+    all*, while this one approximates the PSF as a per-view Gaussian in atlas
+    space. Every approximation in that model shows up as pointwise error, and
+    at wide PSFs it costs more than the deconvolution recovers.
+
+    So the assertion here is the honest one -- sharper, and *comparable*
+    pointwise -- and the feature stays opt-in. If a real capture ever shows a
+    strict win, tighten this; do not tighten it on synthetic data alone.
+    """
+    _, _unit_sphere_mesh = _sphere_fixtures()
+    from gsplat.photogrammetry.metrics import atlas_sharpness
+    from gsplat.photogrammetry.texturing import (
+        bake_texture_atlas_super_resolved,
+        bake_texture_atlas_view_selected,
+    )
+
+    size = 128
+    mesh = _unit_sphere_mesh(resolution=16)
+    dataset = _mesh_rendered_views(mesh)
+
+    _, selected, _ = bake_texture_atlas_view_selected(mesh, dataset, texture_size=size)
+    _, resolved, _ = bake_texture_atlas_super_resolved(mesh, dataset, texture_size=size)
+    truth, covered = _ground_truth_atlas(mesh, size, _high_frequency_pattern)
+
+    truth_grad = atlas_sharpness(truth, covered)["mean_gradient"]
+    truth_flat = truth[covered] / 255.0
+    selected_grad = atlas_sharpness(selected, covered)["mean_gradient"] / truth_grad
+    resolved_grad = atlas_sharpness(resolved, covered)["mean_gradient"] / truth_grad
+    selected_l1 = np.abs(selected[covered] / 255.0 - truth_flat).mean()
+    resolved_l1 = np.abs(resolved[covered] / 255.0 - truth_flat).mean()
+
+    # Reliably sharper. Measured 90.8% against 77.0%.
+    assert resolved_grad > 1.1 * selected_grad, (resolved_grad, selected_grad)
+    # And pointwise comparable, in *either* direction -- deliberately not
+    # asserted as a win. A one-sided assertion here would be a claim the
+    # measurements above do not support.
+    assert 0.75 < resolved_l1 / selected_l1 < 1.35, (resolved_l1, selected_l1)
+
+
+def test_the_deconvolution_stays_bounded_instead_of_ringing():
+    """The prior enters the normal equations with a **plus**, and this pins it.
+
+    `_laplacian` returns the positive semi-definite graph Laplacian, so the
+    normal equations of ``||S T - c||^2 + lambda T^T L T`` are
+    ``(S^T W S + lambda L) T = S^T W c``. Subtracting it instead -- an easy slip,
+    and the one made first here -- leaves the operator *indefinite*: conjugate
+    gradient has no descent direction to find and the "deconvolution" diverges.
+
+    The tell is not a crash. It is an atlas that looks spectacularly sharp:
+    measured **464% of the ground truth's contrast**, with L1 five times worse,
+    and non-monotonic in ``regularization`` (0.02 -> 464%, 0.1 -> 168%,
+    0.5 -> 375%), which is what finally gave it away. `atlas_sharpness` alone
+    would have called that a triumph, so this asserts an upper bound too.
+    """
+    _, _unit_sphere_mesh = _sphere_fixtures()
+    from gsplat.photogrammetry.metrics import atlas_sharpness
+    from gsplat.photogrammetry.texturing import bake_texture_atlas_super_resolved
+
+    size = 128
+    mesh = _unit_sphere_mesh(resolution=16)
+    dataset = _mesh_rendered_views(mesh)
+
+    # Bake once before building the ground truth, so both ride the same UV
+    # layout -- `compute_uvatlas` is non-deterministic (ISSUES.md #10).
+    grads = []
+    for regularization in (0.05, 0.2, 0.8):
+        _, resolved, _ = bake_texture_atlas_super_resolved(
+            mesh, dataset, texture_size=size, regularization=regularization
+        )
+        grads.append((regularization, resolved))
+    truth, covered = _ground_truth_atlas(mesh, size, _high_frequency_pattern)
+    truth_grad = atlas_sharpness(truth, covered)["mean_gradient"]
+
+    measured = []
+    for regularization, resolved in grads:
+        grad = atlas_sharpness(resolved, covered)["mean_gradient"] / truth_grad
+        # Recovering a little more gradient energy than the truth is normal
+        # (sampling noise is high-frequency); 464% is divergence.
+        assert grad < 1.5, (regularization, grad)
+        measured.append(grad)
+
+    # More smoothing must move it monotonically back toward the blend. Note
+    # this is asserted on *contrast*, not on L1: L1 against the truth is
+    # U-shaped in `regularization` (it bottoms out near 0.1 and rises on both
+    # sides), so a monotonicity assertion on L1 is simply false. Contrast falls
+    # monotonically -- 108% -> 91% -> 78% -> 47% -> 13% across two decades --
+    # and the indefinite operator's 464% -> 168% -> 375% does not.
+    assert measured == sorted(measured, reverse=True), measured
+
+
+def test_the_psf_width_is_measured_from_the_capture():
+    """sigma is derived, not tuned: a finer atlas means a wider PSF in texels.
+
+    The whole mechanism is that a view's *footprint* -- how much surface one of
+    its pixels covers -- decides how much it can say about a texel, and the
+    existing blend weight (``clamp(n.-d, 0, 1) / dist``) has no notion of it.
+    Doubling the atlas halves the world size of a texel, so one source pixel
+    spans twice as many of them and sigma must double.
+    """
+    _, _unit_sphere_mesh = _sphere_fixtures()
+    from gsplat.photogrammetry.texturing import bake_texture_atlas_super_resolved
+
+    mesh = _unit_sphere_mesh(resolution=16)
+    dataset = _mesh_rendered_views(mesh)
+
+    measured = {}
+    # Both sizes must sit above the sigma floor (0.35 texels, below which a
+    # Gaussian is indistinguishable from the identity on this grid and the
+    # value is clamped). At 64 texels it clamps, and a clamped sigma no longer
+    # carries the footprint -- which is what made the first version of this
+    # assertion fail by 18%.
+    for size in (128, 192):
+        # sigma is derived before the solve runs, so the solve is cut short
+        # here: this test is about the rule, not about deconvolution quality.
+        _, _, stats = bake_texture_atlas_super_resolved(
+            _unit_sphere_mesh(resolution=16),
+            dataset,
+            texture_size=size,
+            cg_iterations=4,
+            irls_iterations=1,
+        )
+        measured[size] = stats
+        assert stats["texel_world_size"] > 0.0
+        assert stats["mean_psf_sigma_texels"] > 0.36, (size, stats)
+
+    # A finer atlas means smaller texels, so one source pixel spans more of
+    # them: sigma must rise as `texel_world_size` falls.
+    assert (
+        measured[192]["texel_world_size"] < measured[128]["texel_world_size"]
+    ), measured
+    assert (
+        measured[192]["mean_psf_sigma_texels"] > measured[128]["mean_psf_sigma_texels"]
+    ), measured
+
+    # And the rule exactly: sigma is the source pixel's footprint divided by a
+    # texel's, so `sigma * texel_world_size` is the footprint itself and does
+    # not depend on the atlas at all.
+    #
+    # Asserted this way rather than as "doubling the atlas doubles sigma",
+    # which is only true if both unwraps pack the charts equally tightly.
+    # `compute_uvatlas` is non-deterministic (ISSUES.md #10) *and* seeded from
+    # open3d's global RNG, which other tests in the suite set -- so the naive
+    # form passed alone and failed in a full run, which is the worst way for a
+    # test to be wrong.
+    footprints = {
+        size: stats["mean_psf_sigma_texels"] * stats["texel_world_size"]
+        for size, stats in measured.items()
+    }
+    assert footprints[128] == pytest.approx(footprints[192], rel=0.05), footprints

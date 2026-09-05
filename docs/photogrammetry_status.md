@@ -1,9 +1,57 @@
 # gsplat Photogrammetry Pipeline — Project Status
 
 **Repo:** `Cyruskraad/gsplat` (fork of `nerfstudio-project/gsplat`)
-**Branch:** `claude/photogrammetry-techniques-plan-jb0pod`
-**PR:** [#3 — Add state-of-the-art photogrammetry pipeline](https://github.com/Cyruskraad/gsplat/pull/3) (open, draft)
-**Diff size:** 29 files changed, +8,396 / −10 lines, 18 commits since branching from `main`
+**Branch:** `claude/gsplat-photogrammetry-next-0tdvws` (branched from
+`claude/photogrammetry-techniques-plan-jb0pod`)
+**PRs:** [#3](https://github.com/Cyruskraad/gsplat/pull/3) (`jb0pod` → `main`)
+and [#4](https://github.com/Cyruskraad/gsplat/pull/4) (this work → `jb0pod`),
+both open drafts
+**Diff size:** 39 commits against `main`; the latest 5 are +5,071 / −43 over
+`jb0pod`
+
+> **This long-form log is kept for detail. For orientation, read
+> [`handoff/`](handoff/) instead** — five files written to be the only thing a
+> new session needs. `handoff/ISSUES.md` in particular is the highest-value
+> file in the repository for this work.
+
+---
+
+## Latest session (5 commits) — fixing causes, not symptoms
+
+1. **The delivery CLI was dead and nobody knew.** `extract_mesh.py` passed
+   `seam_smoothness=` to a `bake_mesh_texture()` that had no such parameter, so
+   *every* texture-baking run — and `run_pipeline.py`'s whole delivery stage —
+   died with `TypeError`. It shipped in `fa70683` and survived because **no
+   test had ever called `extract_mesh.main()`**: a blanket `assert cfg.ckpt`
+   before the method dispatch made a trained GPU checkpoint the price of
+   reaching it. Fixed, and closed as a class: `--mesh_path` and
+   `--method poisson` now run with no checkpoint and no GPU,
+   `examples/make_synthetic_capture.py` writes a complete capture to disk, and
+   `tests/test_extract_mesh_cli.py` drives the whole delivery flag set.
+   A second, pre-existing bug surfaced immediately: geometry read off disk was
+   never mapped into the dataset's normalized frame (~3.4× scale plus a
+   rotation, enough to put every camera *inside* the mesh).
+2. **Photometric camera refinement** (Zhou & Koltun 2014) —
+   `gsplat/photogrammetry/photometric_alignment.py`. At 45' of injected error:
+   residual 3.5×, pairwise pose disagreement 2.3×, and blending's retained
+   contrast 59% → 92% against a 93% ceiling, with the L1 ranking flipping to
+   the one exact poses produce.
+3. **Multi-view texture super-resolution** (Goldlücke et al. 2014) — a MAP
+   deconvolution on the atlas, using the existing hand-rolled CG solver and an
+   IRLS Huber prior, no scipy. Beats blending on both axes; **does not** beat
+   view selection pointwise, which is reported rather than buried.
+4. **Photometric mesh refinement** (Vu et al. 2012) and **derived
+   reconstruction parameters** — the last absolute scene-unit constants
+   (`voxel_size`, `sdf_trunc`, `depth_trunc`, Poisson's normal radius) now come
+   from the evidence, verified scale-equivariant.
+5. **A CPU-testable level-set extractor** — marching tetrahedra verified
+   watertight against an analytic field, with the Gaussian field evaluation
+   isolated in one function that has **never run**.
+
+Three received wisdoms were tested and failed: open3d's own colour-map
+optimiser (worse in every configuration, including on exact poses), and
+"coarse-to-fine is not optional" — twice. All of it is in
+[`handoff/ISSUES.md`](handoff/ISSUES.md) § 4.
 
 ---
 

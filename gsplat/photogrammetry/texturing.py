@@ -825,7 +825,10 @@ def bake_mesh_texture(
     outlier_iterations: int = 3,
     allow_atlas_fallback: bool = True,
     view_selection: bool = False,
+    super_resolve: bool = False,
+    super_resolve_regularization: float = 0.1,
     mrf_smoothness: float = 1.0,
+    seam_smoothness: Optional[float] = 0.1,
     stats_out: Optional[dict] = None,
     num_pages: int = 1,
 ):
@@ -854,7 +857,30 @@ def bake_mesh_texture(
             chosen view rather than blending -- see
             :func:`bake_texture_atlas_view_selected` for the tradeoff this
             makes. Ignored in ``"vertex"`` mode, which has no faces to label.
+        super_resolve: In ``"atlas"`` mode, solve for the texture whose
+            reprojection best explains every view rather than blending or
+            picking -- see :func:`bake_texture_atlas_super_resolved`. Strictly
+            better than blending on both sharpness and pointwise error;
+            sharper than view selection but *not* strictly better than it, so
+            it is opt-in. Not combinable with ``view_selection`` (they are two
+            answers to the same question) or with ``num_pages > 1``.
+        super_resolve_regularization: Gradient-prior weight, for
+            ``super_resolve``.
         mrf_smoothness: Seam penalty, for ``view_selection``.
+        seam_smoothness: Levelling strength, for ``view_selection`` -- see
+            :func:`level_seams`. ``None`` skips levelling.
+
+            **Ignored unless ``view_selection`` is on**, which is the same
+            contract ``mrf_smoothness`` above already has: both configure a
+            stage that only the view-selected bake runs, and this function is a
+            dispatcher whose options are per-mode. Rejecting the combination
+            was the alternative and is worse here -- the CLI passes this
+            unconditionally at its default, so raising would turn every plain
+            blended run into an error. That is precisely the failure this
+            parameter exists to fix: it was accepted by the CLI and passed to a
+            function that had no such argument, so *every* texture-baking run
+            of ``examples/extract_mesh.py`` died with ``TypeError``. The CLI
+            warns instead when the flag was set explicitly and can do nothing.
         num_pages: In ``"atlas"`` mode, split the surface across this many
             atlas pages (see :func:`bake_texture_atlas_pages`). Above 1 the
             returned ``texture`` is the *first* page; the rest are on the mesh,
@@ -887,6 +913,21 @@ def bake_mesh_texture(
             f"Unknown texture mode {mode!r}, expected 'vertex' or 'atlas'."
         )
 
+    if super_resolve and view_selection:
+        raise ValueError(
+            "view_selection and super_resolve are two different answers to "
+            "the same question -- which view (or combination) should colour a "
+            "texel -- and cannot both be applied. View selection is sharper "
+            "than blending but pointwise worse; super-resolution is better "
+            "than blending on both counts. Pick one."
+        )
+    if num_pages > 1 and super_resolve:
+        raise ValueError(
+            "num_pages > 1 and super_resolve cannot be combined yet: the "
+            "deconvolution's PSF is a blur in atlas space, and splitting the "
+            "surface across pages puts a texel's neighbours on another image "
+            "where the blur cannot reach them. Pick one."
+        )
     if num_pages > 1 and view_selection:
         raise ValueError(
             "num_pages > 1 and view_selection cannot be combined yet: view "
@@ -909,6 +950,19 @@ def bake_mesh_texture(
             if stats_out is not None:
                 stats_out.update(stats)
             return mesh, textures[0]
+        if super_resolve:
+            mesh, texture, stats = bake_texture_atlas_super_resolved(
+                mesh,
+                dataset,
+                texture_size=texture_size,
+                max_views=max_views,
+                regularization=super_resolve_regularization,
+                outlier_sigma=outlier_sigma,
+                outlier_iterations=outlier_iterations,
+            )
+            if stats_out is not None:
+                stats_out.update(stats)
+            return mesh, texture
         if view_selection:
             mesh, texture, stats = bake_texture_atlas_view_selected(
                 mesh,
@@ -916,6 +970,7 @@ def bake_mesh_texture(
                 texture_size=texture_size,
                 max_views=max_views,
                 mrf_smoothness=mrf_smoothness,
+                seam_smoothness=seam_smoothness,
                 outlier_sigma=outlier_sigma,
                 outlier_iterations=outlier_iterations,
             )
@@ -2549,3 +2604,357 @@ def level_seams(
     stats["mean_correction"] = float(magnitude.mean())
     stats["max_correction"] = float(magnitude.max())
     return _SeamCorrection(corner_pairs, correction, stats)
+
+
+def _gaussian_kernel(sigma: float) -> np.ndarray:
+    """A normalised 1-D Gaussian, truncated at three standard deviations."""
+    radius = max(1, int(np.ceil(3.0 * sigma)))
+    offsets = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel = np.exp(-0.5 * (offsets / max(sigma, 1e-6)) ** 2)
+    return kernel / kernel.sum()
+
+
+def _separable_blur(image: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    """Convolve ``(H, W, C)`` with a separable kernel, zero outside the border.
+
+    Zero padding rather than edge replication, because the atlas *is* mostly
+    empty: the region outside a chart carries no surface and must contribute
+    nothing. The masked operator below divides that attenuation back out where
+    it matters.
+    """
+    pad = len(kernel) // 2
+    padded = np.pad(image, ((pad, pad), (0, 0), (0, 0)))
+    rows = np.zeros_like(image)
+    for i, weight in enumerate(kernel):
+        rows += weight * padded[i : i + image.shape[0]]
+    padded = np.pad(rows, ((0, 0), (pad, pad), (0, 0)))
+    out = np.zeros_like(image)
+    for i, weight in enumerate(kernel):
+        out += weight * padded[:, i : i + image.shape[1]]
+    return out
+
+
+class _SurfaceBlur:
+    """A symmetric, mask-respecting blur on the atlas -- the camera's PSF.
+
+    ``S = D^-1/2 M K M D^-1/2``, with ``M`` the covered-texel mask, ``K`` a
+    separable Gaussian and ``D`` the diagonal of ``K`` applied to the mask.
+    Written that way for one reason: **conjugate gradient needs a symmetric
+    operator**, and the obvious normalised blur (``blur(M x) / blur(M)``) is
+    not symmetric, so CG on it silently solves a different problem. The
+    symmetric split-normalisation keeps the interior behaviour of a normalised
+    blur while staying its own transpose.
+
+    Known limitation: a blur in *atlas* space only approximates a blur on the
+    surface. Inside a chart the two agree; across a chart border the atlas puts
+    unrelated surface next to each other. The gutter and margin keep borders a
+    small fraction of the covered texels, and the mask stops the blur reaching
+    outside the charts at all, but two charts packed close together can bleed.
+    """
+
+    def __init__(self, mask: np.ndarray, sigma: float):
+        self.kernel = _gaussian_kernel(sigma)
+        self.mask = mask[:, :, None].astype(np.float64)
+        norm = _separable_blur(self.mask, self.kernel)
+        # Where a texel's neighbourhood is nearly all empty the normalisation
+        # is tiny and dividing by it amplifies noise; clamp rather than let a
+        # boundary texel dominate the solve.
+        self.inv_sqrt = np.where(
+            norm > 1e-6, 1.0 / np.sqrt(np.maximum(norm, 1e-6)), 0.0
+        )
+
+    def __call__(self, image: np.ndarray) -> np.ndarray:
+        scaled = self.mask * (self.inv_sqrt * image)
+        return self.mask * (self.inv_sqrt * _separable_blur(scaled, self.kernel))
+
+
+def _huber_edge_weights(image, mask, delta):
+    """IRLS weights for a Huber prior on the texture gradient.
+
+    Returns ``(right, down)`` per-edge weights. A Huber penalty is not
+    quadratic, so it cannot go straight into a linear solve; iteratively
+    reweighted least squares turns it into a sequence of quadratic ones whose
+    edge weights are recomputed from the current estimate. Weight 1 below the
+    knee (smooth regions get full smoothing) falling as ``delta / |grad|``
+    above it, which is what stops the prior from planing off real texture edges
+    the way a plain Laplacian would.
+    """
+
+    def weights(diff, valid):
+        magnitude = np.sqrt((diff**2).sum(axis=-1))
+        w = np.where(magnitude <= delta, 1.0, delta / np.maximum(magnitude, 1e-12))
+        return w * valid
+
+    right = weights(
+        image[:, 1:] - image[:, :-1], (mask[:, 1:] & mask[:, :-1]).astype(np.float64)
+    )
+    down = weights(
+        image[1:, :] - image[:-1, :], (mask[1:, :] & mask[:-1, :]).astype(np.float64)
+    )
+    return right, down
+
+
+def _laplacian(image, right, down):
+    """Apply the weighted graph Laplacian whose edges are ``right``/``down``."""
+    out = np.zeros_like(image)
+    diff = (image[:, 1:] - image[:, :-1]) * right[:, :, None]
+    out[:, 1:] += diff
+    out[:, :-1] -= diff
+    diff = (image[1:, :] - image[:-1, :]) * down[:, :, None]
+    out[1:, :] += diff
+    out[:-1, :] -= diff
+    return out
+
+
+def bake_texture_atlas_super_resolved(
+    mesh,
+    dataset,
+    texture_size: int = 2048,
+    max_views: Optional[int] = None,
+    psf_scale: float = 0.5,
+    regularization: float = 0.1,
+    huber_delta: float = 0.05,
+    irls_iterations: int = 3,
+    cg_iterations: int = 60,
+    unwrap_size: Optional[int] = None,
+    gutter: float = 1.0,
+    margin: float = 2.0,
+    max_stretch: float = 1.0 / 6.0,
+    dilation: int = 4,
+    outlier_sigma: Optional[float] = None,
+    outlier_iterations: int = 3,
+):
+    """Bake an atlas by *deconvolving* every view at once, rather than averaging.
+
+    Blending and view selection are both the wrong question. Averaging the views
+    that see a texel low-passes the result; picking one throws the others away.
+    The right operator is neither: model how the texture *became* each
+    photograph -- projected onto the sensor and blurred by the camera's point
+    spread function -- and solve for the texture whose reprojection best
+    explains all of them at once. Detail that no single view resolves can then
+    be recovered from the sub-texel offsets between views.
+
+    Method: Goldlücke, Aubry, Kolev & Cremers, *A Super-Resolution Framework for
+    High-Accuracy Multiview Reconstruction*, IJCV 2014, as a MAP estimate:
+
+    .. math::
+        \\min_T \; \\sum_i \\| W_i (S_i T - c_i) \\|^2 + \\lambda \\, \\rho(\\nabla T)
+
+    ``S_i`` is view *i*'s PSF on the surface (:class:`_SurfaceBlur`), ``c_i`` its
+    observed colour per texel, ``W_i`` the same view/normal-alignment weight
+    every other bake in this module uses. The normal equations are symmetric
+    positive semi-definite, so they go through the hand-rolled
+    :func:`_conjugate_gradient` already here -- the forward operator and its
+    adjoint are one matvec, exactly the matrix-free shape :func:`level_seams`
+    uses, and no scipy dependency appears.
+
+    ``\\rho`` is a Huber prior on the texture gradient, applied by iteratively
+    reweighted least squares: a Huber penalty is not quadratic, so each outer
+    round recomputes per-edge weights from the current estimate and CG solves
+    the quadratic that results. Full smoothing below the knee, falling off
+    above it, so the prior suppresses deconvolution ringing without planing off
+    real texture edges.
+
+    **The PSF width is measured, not assumed.** Each view's ``sigma`` is the
+    size of one of its source pixels expressed in texels -- its mean projected
+    distance over focal length, divided by the world size of a texel -- times
+    ``psf_scale``. A view that sees the surface up close has a narrow PSF and
+    contributes sharp information; a distant one has a wide PSF and contributes
+    mostly low frequencies. That difference is the entire mechanism, and it is
+    the term the existing blend weight (``clamp(n·-d, 0, 1) / dist``) does not
+    model: it weights views by geometry but has no notion of their *footprint*.
+
+    The solve is for a **correction to the blended atlas**, not for the texture
+    from scratch. CG stopped early then degrades toward blending rather than
+    toward zero, which makes the worst case "no better than the default" instead
+    of "a black atlas".
+
+    **This amplifies misregistration.** Deconvolution sharpens whatever is
+    consistent between views; where the views disagree because the cameras are
+    wrong, it sharpens the disagreement. Run
+    :func:`gsplat.photogrammetry.photometric_alignment.refine_camera_poses_photometric`
+    first. On unrefined poses this is expected to be *worse* than blending, and
+    that is a property of the method, not a bug in it.
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``. Must be manifold.
+        dataset: An ``examples.datasets.colmap.Dataset``-like object.
+        texture_size: Width/height of the (square) texture, in texels.
+        max_views: If given, only the first ``max_views`` images are used.
+        psf_scale: PSF standard deviation as a fraction of a source pixel's
+            footprint. 0.5 is the usual approximation of a box sensor pixel by
+            a Gaussian.
+        regularization: Weight on the gradient prior. Too small and the
+            deconvolution rings; too large and it reproduces the blend.
+        huber_delta: Gradient magnitude (in [0, 1] colour units) above which
+            the prior stops smoothing.
+        irls_iterations: Outer reweighting rounds for the Huber prior.
+        cg_iterations: Conjugate-gradient iterations per round.
+        outlier_sigma: Robust fusion for the blended starting point -- see
+            :func:`_bake_points_from_views`.
+
+    Returns:
+        ``(mesh, texture, stats)``. ``stats`` reports the per-view ``psf_sigma``
+        values in texels, the solver's ``iterations``/``residual``/``converged``,
+        and ``atlas_sharpness`` for this atlas and for the blend it started
+        from, measured over the same covered texels so they are comparable.
+
+    Raises:
+        ValueError: If ``mesh`` has no triangles, ``texture_size`` is not
+            positive, or ``mesh`` is non-manifold.
+    """
+    from .metrics import atlas_sharpness
+
+    o3d = _require_open3d()
+
+    atlas = _unwrap_and_rasterize(
+        mesh,
+        texture_size,
+        unwrap_size=unwrap_size,
+        gutter=gutter,
+        margin=margin,
+        max_stretch=max_stretch,
+    )
+    rows, cols = atlas.rows, atlas.cols
+    positions, normals = atlas.positions, atlas.normals
+
+    mask = np.zeros((texture_size, texture_size), dtype=bool)
+    mask[rows, cols] = True
+
+    # The blended atlas: both the starting point and the fallback.
+    color_accum, weight_accum = _bake_points_from_views(
+        mesh,
+        dataset,
+        positions,
+        normals,
+        max_views=max_views,
+        outlier_sigma=outlier_sigma,
+        outlier_iterations=outlier_iterations,
+    )
+    seen = weight_accum > 0
+    blended = np.zeros((texture_size, texture_size, 3), dtype=np.float64)
+    blended[rows[seen], cols[seen]] = color_accum[seen] / weight_accum[seen, None]
+
+    # How big is a texel, in world units? The mesh's area spread over the
+    # texels that actually carry it. This is what turns a PSF measured in
+    # pixels into one measured in texels, and it is why the result is
+    # resolution-aware rather than tuned.
+    surface_area = float(mesh.get_surface_area())
+    covered = max(int(mask.sum()), 1)
+    texel_world = np.sqrt(max(surface_area, 1e-12) / covered)
+
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+
+    # One pass: per view, the observed colour and weight at each texel, plus
+    # the mean projected distance that sets its PSF width.
+    observations = {}
+    num_views = len(dataset) if max_views is None else min(max_views, len(dataset))
+    focals = []
+    for i in range(num_views):
+        focals.append(float(np.asarray(dataset[i]["K"].numpy())[0, 0]))
+    for chunk, sampled, weight, view in _view_samples(
+        scene, o3d, dataset, positions, normals, max_views, 1 << 20
+    ):
+        entry = observations.setdefault(
+            view,
+            {
+                "color": np.zeros((texture_size, texture_size, 3)),
+                "weight": np.zeros((texture_size, texture_size)),
+                "distance": [],
+            },
+        )
+        entry["color"][rows[chunk], cols[chunk]] = sampled
+        entry["weight"][rows[chunk], cols[chunk]] = weight
+        # `_view_samples` folds distance into its weight as 1/dist, and the
+        # cosine term multiplies it; recovering the distance from the weight
+        # would be ambiguous, so measure it directly here.
+        cam_pos = np.asarray(dataset[view]["camtoworld"].numpy())[:3, 3]
+        entry["distance"].append(
+            np.linalg.norm(positions[chunk] - cam_pos[None, :], axis=1)
+        )
+
+    if not observations:
+        raise ValueError(
+            "No view can see any texel of this mesh, so there is nothing to "
+            "super-resolve. Check that the mesh and the cameras are in the "
+            "same coordinate frame."
+        )
+
+    blurs, weights, colors, sigmas = [], [], [], {}
+    for view, entry in sorted(observations.items()):
+        distance = float(np.concatenate(entry["distance"]).mean())
+        pixel_world = distance / max(focals[view], 1e-9)
+        sigma = psf_scale * pixel_world / texel_world
+        # Below about a third of a texel a Gaussian is indistinguishable from
+        # the identity on this grid, and a kernel that narrow just costs time.
+        sigma = float(np.clip(sigma, 0.35, 8.0))
+        sigmas[int(view)] = sigma
+        blurs.append(_SurfaceBlur(mask, sigma))
+        weights.append(entry["weight"][:, :, None])
+        colors.append(entry["color"])
+
+    # Right-hand side and the data term of the normal equations.
+    rhs_data = np.zeros_like(blended)
+    for blur, weight, color in zip(blurs, weights, colors):
+        rhs_data += blur(weight * color)
+
+    def data_matvec(x):
+        out = np.zeros_like(x)
+        for blur, weight in zip(blurs, weights):
+            out += blur(weight * blur(x))
+        return out
+
+    texture = blended.copy()
+    solver_stats = {"iterations": 0, "residual": 0.0, "converged": True}
+    for _ in range(max(irls_iterations, 1)):
+        right, down = _huber_edge_weights(texture, mask, huber_delta)
+
+        def matvec(x, right=right, down=down):
+            # PLUS the Laplacian. `_laplacian` returns the positive
+            # semi-definite graph Laplacian (x^T L x is a sum of squared edge
+            # differences), so the normal equations of
+            # ||S x - c||^2 + lambda x^T L x are (S^T W S + lambda L) x.
+            # Subtracting it instead makes the operator indefinite, CG has no
+            # descent direction to find, and the "deconvolution" diverges into
+            # ringing -- measured at 464% of the ground truth's contrast, and
+            # non-monotonic in lambda, which is the tell.
+            return data_matvec(x) + regularization * _laplacian(x, right, down)
+
+        # Solve for the correction to the current estimate, so an early stop
+        # falls back to the blend rather than to zero.
+        residual_rhs = rhs_data - matvec(texture)
+        correction, solver_stats = _conjugate_gradient(
+            matvec, residual_rhs, max_iterations=cg_iterations
+        )
+        texture = texture + correction
+
+    texture = np.clip(texture, 0.0, 1.0)
+    texture[~mask] = 0.0
+
+    filled = mask.copy()
+    blended_u8 = (np.clip(blended, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+    stats = {
+        "psf_sigma_texels": sigmas,
+        "mean_psf_sigma_texels": float(np.mean(list(sigmas.values()))),
+        "texel_world_size": float(texel_world),
+        "num_texels": int(rows.size),
+        "num_views_used": len(sigmas),
+        "solver": solver_stats,
+        "regularization": float(regularization),
+    }
+    texture_u8 = (texture * 255.0).round().astype(np.uint8)
+    stats["atlas_sharpness"] = atlas_sharpness(texture_u8, mask)
+    stats["blended_atlas_sharpness"] = atlas_sharpness(blended_u8, mask)
+
+    texture_u8 = _fill_texture_holes(
+        texture_u8.astype(np.float64) / 255.0, filled, dilation
+    )
+    texture_u8 = (np.clip(texture_u8, 0.0, 1.0) * 255.0).round().astype(np.uint8)
+
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(atlas.triangle_uvs)
+    mesh.textures = [o3d.geometry.Image(texture_u8)]
+    mesh.triangle_material_ids = o3d.utility.IntVector(
+        np.zeros(len(mesh.triangles), dtype=np.int32)
+    )
+    return mesh, texture_u8, stats

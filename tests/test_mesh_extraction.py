@@ -1366,3 +1366,592 @@ def test_cull_keeps_observed_faces_on_a_flat_untextured_surface():
     assert stats["num_culled"] == 0, (stats, at_risk)
     assert stats["observation_histogram"][0] == 0
     assert len(culled.triangles) == len(mesh.triangles)
+
+
+# ---------------------------------------------------------------------------
+# Derived reconstruction parameters
+# ---------------------------------------------------------------------------
+
+
+def _scaled_views(views, factor):
+    """The same capture, with the whole world (and cameras) scaled by `factor`."""
+    scaled = []
+    for view in views:
+        extrinsic = view["extrinsic"].copy()
+        extrinsic[:3, 3] *= factor
+        scaled.append(
+            {
+                "color": view["color"],
+                "depth": (view["depth"] * factor).astype(np.float32),
+                "K": view["K"],
+                "extrinsic": extrinsic,
+            }
+        )
+    return scaled
+
+
+def test_derived_parameters_are_scale_equivariant():
+    """The property that makes them derivations rather than new magic numbers.
+
+    `voxel_size=0.01`, `sdf_trunc=0.04`, `depth_trunc=10.0` and
+    `estimate_normals(radius=0.1)` were absolute scene-unit constants on a
+    pipeline whose stated design goal is that a number in scene units means
+    nothing on its own. 0.01 is a fifth of a millimetre on a coin and a
+    centimetre on a cathedral: one of those reconstructions is impossible and
+    the other discards most of what was captured.
+
+    So the test is not "is the number right" -- there is no right number -- but
+    "does it follow the scene". Scale the cloud tenfold and every derived
+    length must scale exactly tenfold, while the *ratios* between them stay
+    put.
+    """
+    from gsplat.photogrammetry.mesh_extraction import derive_reconstruction_parameters
+
+    rng = np.random.default_rng(0)
+    cloud = rng.normal(size=(4000, 3))
+    cloud /= np.linalg.norm(cloud, axis=1, keepdims=True)
+
+    small = derive_reconstruction_parameters(cloud)
+    large = derive_reconstruction_parameters(cloud * 10.0)
+
+    for key in (
+        "point_spacing",
+        "diagonal",
+        "voxel_size",
+        "sdf_trunc",
+        "depth_trunc",
+        "normal_radius",
+    ):
+        # rtol at float32's precision, not float64's: `_point_spacing` runs
+        # its neighbour search in float32, so the equivariance is exact only to
+        # about seven digits.
+        assert np.isclose(large[key], 10.0 * small[key], rtol=1e-6), (
+            key,
+            small[key],
+            large[key],
+        )
+
+    # The ratios the old constants encoded, now held by construction rather
+    # than by whoever remembers to change both numbers together.
+    assert np.isclose(small["sdf_trunc"], 4.0 * small["voxel_size"])
+    assert np.isclose(small["normal_radius"], 3.0 * small["point_spacing"])
+    assert not small["clamped"]
+
+
+def test_the_voxel_grid_is_clamped_before_it_exhausts_memory():
+    """A cloud far denser than its extent must not ask for an unbounded grid.
+
+    One voxel per sample is the right rule right up until the samples are a
+    millionth of the scene apart, at which point the honest answer is a grid
+    that does not fit in memory. Clamping trades resolution for finishing, and
+    says so rather than silently.
+    """
+    from gsplat.photogrammetry.mesh_extraction import derive_reconstruction_parameters
+
+    rng = np.random.default_rng(1)
+    # A tight cluster (tiny spacing) plus two far-apart outliers (huge extent).
+    cloud = np.concatenate(
+        [
+            rng.normal(scale=1e-4, size=(2000, 3)),
+            np.array([[-500.0, 0.0, 0.0], [500.0, 0.0, 0.0]]),
+        ]
+    )
+    derived = derive_reconstruction_parameters(cloud, max_grid=512)
+
+    assert derived["clamped"] is True
+    assert derived["voxel_size"] > derived["point_spacing"]
+    assert np.isclose(derived["voxel_size"], derived["diagonal"] / 512.0)
+    # And the truncation follows the clamped voxel, not the raw spacing.
+    assert np.isclose(derived["sdf_trunc"], 4.0 * derived["voxel_size"])
+
+
+def test_derivation_refuses_a_degenerate_cloud():
+    from gsplat.photogrammetry.mesh_extraction import derive_reconstruction_parameters
+
+    with pytest.raises(ValueError, match="degenerate"):
+        derive_reconstruction_parameters(np.zeros((100, 3)))
+
+
+def test_tsdf_fusion_derives_its_own_scale_from_the_depth_it_is_fusing():
+    """The call site, on the CPU side of the seam so it can actually be run.
+
+    `extract_mesh_tsdf` needs a GPU, so the derivation deliberately lives in
+    `_tsdf_fuse` -- the pure open3d/numpy half that was split out precisely so
+    the fusion could be exercised without one. `extract_mesh_tsdf` only passes
+    its arguments through.
+
+    The mutation this is written against is hardcoding the old defaults back:
+    at ten times the scale, `voxel_size=0.01` on a 20-unit sphere is a grid
+    2000 voxels across per axis and `depth_trunc=10.0` rejects every pixel of
+    a subject 30 units away, so the reconstruction returns nothing at all.
+    """
+    from gsplat.photogrammetry.mesh_extraction import _tsdf_fuse
+
+    for factor in (1.0, 10.0):
+        views = _scaled_views(_make_sphere_views(), factor)
+        stats: dict = {}
+        mesh = _tsdf_fuse(views, stats_out=stats)
+
+        assert set(stats["derived"]) == {"voxel_size", "sdf_trunc", "depth_trunc"}
+        # Derived from the back-projected depth, so it tracks the scene. A
+        # unit sphere's bounding box is 2 on a side, so its diagonal is
+        # 2*sqrt(3); the cameras do not quite cover the whole surface, so the
+        # measured box comes in slightly under that.
+        assert np.isclose(
+            stats["diagonal"], 2.0 * np.sqrt(3.0) * factor, rtol=0.15
+        ), stats
+        assert stats["depth_trunc"] > 2.0 * factor
+
+        vertices = np.asarray(mesh.vertices)
+        assert len(vertices) > 50, factor
+        radii = np.linalg.norm(vertices, axis=1)
+        # Still a sphere of the right radius, at either scale.
+        assert np.mean(np.abs(radii - factor)) < 0.1 * factor, factor
+
+    # An explicit value still wins, and is reported as not derived.
+    stats = {}
+    _tsdf_fuse(_make_sphere_views(), voxel_size=0.05, stats_out=stats)
+    assert "voxel_size" not in stats["derived"]
+
+
+def test_poisson_derives_its_normal_radius_from_the_cloud():
+    """The old fixed 0.1 finds no neighbours on a cloud ten times larger.
+
+    A radius in scene units is a guess about scale; three point spacings is a
+    measurement of it. This asserts the reconstruction survives a tenfold scale
+    change, which the constant does not.
+    """
+    rng = np.random.default_rng(2)
+    cloud = rng.normal(size=(6000, 3))
+    cloud /= np.linalg.norm(cloud, axis=1, keepdims=True)
+
+    for factor in (1.0, 10.0):
+        stats: dict = {}
+        mesh = extract_mesh_poisson(cloud * factor, depth=6, stats_out=stats)
+        assert stats["derived"] == ["normal_radius"]
+        assert np.isclose(
+            stats["normal_radius"], 3.0 * stats["point_spacing"], rtol=1e-9
+        )
+        vertices = np.asarray(mesh.vertices)
+        assert len(vertices) > 50, factor
+        radii = np.linalg.norm(vertices, axis=1)
+        assert np.mean(np.abs(radii - factor)) < 0.15 * factor, factor
+
+
+def test_a_fixed_normal_radius_returns_noise_on_a_rescaled_cloud():
+    """Why the radius has to be derived, measured against the analytic normal.
+
+    The reconstruction itself is a weak detector here: Poisson at a modest
+    octree depth, followed by
+    `orient_normals_consistent_tangent_plane`, still produces a plausible
+    sphere from badly-estimated normals -- a mutation restoring the hardcoded
+    `radius=0.1` passed the reconstruction test. So this measures the normals
+    directly, against the closed form the sphere provides.
+
+    At the original scale a fixed 0.1 is fine (mean |n . truth| = 0.9999). Ten
+    times larger, where the cloud's spacing is 0.459, it finds nothing inside
+    its radius and returns **0.507** -- which is chance, since the mean of
+    |cos| over random directions is 0.5. The derived radius holds 0.9999 at
+    both.
+    """
+    from gsplat.photogrammetry.mesh_extraction import derive_reconstruction_parameters
+
+    o3d = pytest.importorskip("open3d")
+
+    rng = np.random.default_rng(2)
+    cloud = rng.normal(size=(6000, 3))
+    cloud /= np.linalg.norm(cloud, axis=1, keepdims=True)
+
+    def alignment(points, radius):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30)
+        )
+        normals = np.asarray(pcd.normals)
+        truth = points / np.linalg.norm(points, axis=1, keepdims=True)
+        # Absolute, because normal estimation has no consistent orientation.
+        return float(np.abs((normals * truth).sum(axis=1)).mean())
+
+    scaled = cloud * 10.0
+    derived_radius = derive_reconstruction_parameters(scaled)["normal_radius"]
+
+    # Premise: at the scale the constant was chosen for, it is fine -- so this
+    # is about scale, not about 0.1 being a bad number.
+    assert alignment(cloud, 0.1) > 0.99
+    # Ten times larger, it is indistinguishable from guessing.
+    assert alignment(scaled, 0.1) < 0.6
+    # The derived radius is unaffected.
+    assert alignment(scaled, derived_radius) > 0.99
+
+
+# ---------------------------------------------------------------------------
+# Photometric mesh refinement
+# ---------------------------------------------------------------------------
+
+
+def _mesh_views(mesh, num_views=10, width=96):
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for path in (str(root / "examples"), str(root / "tests")):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    from test_photometric_alignment import _MeshViews
+
+    return _MeshViews(mesh, num_views=num_views, width=width)
+
+
+def _radially_perturbed(scale, resolution=16, seed=0):
+    """A sphere whose vertices are pushed off radius 1 by known noise."""
+    o3d = pytest.importorskip("open3d")
+
+    rng = np.random.default_rng(seed)
+    mesh = _unit_sphere_mesh(resolution=resolution)
+    vertices = np.asarray(mesh.vertices).copy()
+    outward = vertices / np.linalg.norm(vertices, axis=1, keepdims=True)
+    noise = rng.normal(scale=scale, size=len(vertices))
+    mesh.vertices = o3d.utility.Vector3dVector(vertices + noise[:, None] * outward)
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def _mean_radial_error(mesh):
+    """Distance from radius 1, against the analytic sphere -- not a reference
+    implementation."""
+    vertices = np.asarray(mesh.vertices)
+    return float(np.abs(np.linalg.norm(vertices, axis=1) - 1.0).mean())
+
+
+def test_refinement_pulls_perturbed_vertices_back_toward_the_true_surface():
+    """Nothing else in this package moves a vertex to fit the photographs.
+
+    Every other geometry lever is upstream (bundle adjustment, dense MVS, 2DGS
+    depth) or subtractive (culling, decimation). This is the refinement stage
+    OpenMVS ships as `RefineMesh`.
+
+    Measured against the *analytic* sphere: mean radial error 0.0244 -> 0.0125,
+    photoconsistency 0.0985 -> 0.0251, and the cloud-to-mesh fit against the
+    unperturbed vertices 0.0207 -> 0.0094.
+    """
+    from gsplat.photogrammetry.mesh_extraction import refine_mesh_photometric
+
+    truth = _unit_sphere_mesh(resolution=16)
+    dataset = _mesh_views(truth)
+    perturbed = _radially_perturbed(0.03)
+
+    before = _mean_radial_error(perturbed)
+    # Premise: the injected noise has to be measurable, or this is vacuous.
+    assert before > 0.015, before
+
+    refined, stats = refine_mesh_photometric(
+        perturbed, dataset, reference_points=np.asarray(truth.vertices)
+    )
+
+    after = _mean_radial_error(refined)
+    # Measured 1.95x. Deciding visibility per candidate instead of once at the
+    # surface degrades this to 1.55x, so the margin is what detects it.
+    assert after < before / 1.7, (before, after)
+    assert (
+        stats["mean_photoconsistency_after"]
+        < 0.5 * stats["mean_photoconsistency_before"]
+    )
+    assert (
+        stats["point_to_mesh_after"]["mean"] < stats["point_to_mesh_before"]["mean"]
+    ), (stats["point_to_mesh_before"], stats["point_to_mesh_after"])
+
+
+def test_the_regulariser_does_not_shrink_a_correct_sphere():
+    """The guard the prompt for this work asked for, and it is not academic.
+
+    A Laplacian smoothing term moves every vertex toward the average of its
+    neighbours, and on any convex surface that average lies *inside* it. Left
+    unprojected it collapses a correct sphere: measured, ten rounds at strength
+    0.3 take the mean radius from 1.0 to **0.9444**, and a refinement reporting
+    "converged" would be reporting a slow implosion.
+
+    Projecting the smoothing onto each vertex's tangent plane lets it
+    redistribute vertices *over* the surface without moving the surface. The
+    photometric term already owns the normal direction, so the two never fight.
+    Same ten rounds: 1.00017.
+    """
+    from gsplat.photogrammetry.mesh_extraction import (
+        _tangential_smoothing,
+        _vertex_neighbours,
+    )
+
+    mesh = _unit_sphere_mesh(resolution=16)
+    mesh.compute_vertex_normals()
+    vertices = np.asarray(mesh.vertices).copy()
+    normals = np.asarray(mesh.vertex_normals).copy()
+    starts, counts, neighbours = _vertex_neighbours(
+        np.asarray(mesh.triangles), len(vertices)
+    )
+
+    plain = vertices.copy()
+    tangential = vertices.copy()
+    for _ in range(10):
+        sums = np.zeros_like(plain)
+        for axis in range(3):
+            sums[:, axis] = np.add.reduceat(plain[neighbours, axis], starts, axis=0)
+        plain = plain + 0.3 * (sums / counts[:, None] - plain)
+        tangential = _tangential_smoothing(
+            tangential, normals, starts, counts, neighbours, 0.3
+        )
+
+    plain_radius = float(np.linalg.norm(plain, axis=1).mean())
+    tangential_radius = float(np.linalg.norm(tangential, axis=1).mean())
+
+    # Premise: the unprojected version really does collapse, so the projection
+    # is load-bearing rather than decorative.
+    assert plain_radius < 0.96, plain_radius
+    assert abs(tangential_radius - 1.0) < 0.01, tangential_radius
+
+
+def test_refinement_leaves_an_already_correct_sphere_alone():
+    """Do no harm -- within the method's own noise floor, which is stated.
+
+    A refinement that merely wanders until the objective looks better passes
+    the recovery test and fails this one.
+
+    It is not asserted that nothing moves. Sampling a texture through a finite
+    number of finite-resolution views has a floor: on this fixture the method
+    leaves ~0.0068 of radial error on a mesh that started at exactly zero,
+    against the 0.0125 it gets a 0.0244 error down to. So it cannot improve a
+    surface already better than its floor, and will add up to that much noise
+    -- a real limitation, stated rather than hidden behind a loose tolerance.
+    What must *not* happen is a systematic collapse, which is what the earlier
+    unprojected regulariser and the coarse pyramid levels both produced.
+    """
+    from gsplat.photogrammetry.mesh_extraction import refine_mesh_photometric
+
+    truth = _unit_sphere_mesh(resolution=16)
+    dataset = _mesh_views(truth)
+    refined, _stats = refine_mesh_photometric(_unit_sphere_mesh(resolution=16), dataset)
+
+    radii = np.linalg.norm(np.asarray(refined.vertices), axis=1)
+    # No systematic shrink: three levels of pyramid took this to 0.983, and an
+    # unprojected Laplacian to 0.944.
+    assert abs(float(radii.mean()) - 1.0) < 0.005, float(radii.mean())
+    # And the scatter stays inside the noise floor, well under what it corrects.
+    assert _mean_radial_error(refined) < 0.010, _mean_radial_error(refined)
+
+
+def test_displaced_candidates_are_invisible_to_the_visibility_hub():
+    """Why visibility is decided at the surface and reused, not re-tested.
+
+    `_view_samples` ray-casts every sample against the mesh, so a point
+    displaced off the surface is occluded *by the surface it came from*. Asking
+    it about candidate positions directly rejected **all 482 candidates at
+    every nonzero offset** on a correct sphere: the search had nothing to
+    choose between and the mesh moved on noise alone.
+
+    This asserts the trap itself, rather than trying to catch it through
+    convergence. The refinement's own default step (0.5 vertex spacings, about
+    0.077 here) is already twice the ray-cast tolerance (~0.036 at this camera
+    distance), so the recovery test above is only possible *because* visibility
+    is decoupled from the candidate position -- which makes this the assertion
+    that explains it.
+    """
+    from gsplat.photogrammetry.mesh_extraction import _point_spacing
+    from gsplat.photogrammetry.texturing import _view_samples
+
+    o3d = pytest.importorskip("open3d")
+
+    mesh = _unit_sphere_mesh(resolution=16)
+    mesh.compute_vertex_normals()
+    dataset = _mesh_views(mesh)
+    vertices = np.asarray(mesh.vertices).copy()
+    normals = np.asarray(mesh.vertex_normals).copy()
+    step = 0.5 * _point_spacing(vertices)
+
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+
+    def measurable(points):
+        seen = np.zeros(len(points), dtype=np.int64)
+        for chunk, _c, _w, _v in _view_samples(
+            scene, o3d, dataset, points, normals, None, 1 << 20
+        ):
+            seen[chunk] += 1
+        return int((seen >= 2).sum())
+
+    total = len(vertices)
+    # On the surface, essentially every vertex is measurable.
+    assert measurable(vertices) > 0.95 * total, measurable(vertices)
+    # One default step off it, in either direction, essentially none is.
+    assert measurable(vertices + step * normals) < 0.05 * total
+    assert measurable(vertices - step * normals) < 0.05 * total
+
+
+def test_refinement_rejects_geometry_it_cannot_search():
+    from gsplat.photogrammetry.mesh_extraction import refine_mesh_photometric
+
+    o3d = pytest.importorskip("open3d")
+
+    truth = _unit_sphere_mesh(resolution=16)
+    dataset = _mesh_views(truth, num_views=4, width=48)
+    with pytest.raises(ValueError, match="no geometry"):
+        refine_mesh_photometric(o3d.geometry.TriangleMesh(), dataset)
+    with pytest.raises(ValueError, match="num_offsets"):
+        refine_mesh_photometric(_unit_sphere_mesh(resolution=8), dataset, num_offsets=0)
+
+
+# ---------------------------------------------------------------------------
+# Level-set extraction (the CPU half of the splat-to-surface path)
+# ---------------------------------------------------------------------------
+
+
+def _analytic_sphere(radius=1.0, centre=(0.0, 0.0, 0.0)):
+    """f(x) = |x - c| - r: negative inside, zero exactly on the surface."""
+    centre = np.asarray(centre, dtype=np.float64)
+
+    def field(points):
+        return np.linalg.norm(np.asarray(points) - centre, axis=1) - radius
+
+    return field
+
+
+def test_level_set_extraction_recovers_an_analytic_sphere():
+    """The CPU half, against a field whose answer is known in closed form.
+
+    Nothing here needs a Gaussian. Evaluating a Gaussian field needs a GPU and
+    the compiled CUDA extension, so the field evaluation is isolated in
+    `gaussian_density_field` and *everything else* -- the Kuhn decomposition,
+    the marching-tetrahedra table, the shared-vertex identification, the
+    cleanup -- is exercised here against `f(x) = |x| - r`. Same seam
+    `_tsdf_fuse` already established.
+    """
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    mesh, stats = extract_level_set(
+        _analytic_sphere(1.0), ((-1.5, -1.5, -1.5), (1.5, 1.5, 1.5)), resolution=32
+    )
+
+    vertices = np.asarray(mesh.vertices)
+    assert len(vertices) > 1000
+    radial = np.abs(np.linalg.norm(vertices, axis=1) - 1.0)
+    # Every vertex sits on the sphere to well within a cell. Measured mean
+    # 0.007 cells, max well under one.
+    assert radial.max() < stats["cell_size"], (radial.max(), stats["cell_size"])
+    assert radial.mean() < 0.05 * stats["cell_size"], radial.mean()
+
+
+def test_the_extracted_surface_is_watertight():
+    """Shared vertices, not a triangle soup that merely looks like a surface.
+
+    Each intersection is named by the **grid edge** it lies on, so the two
+    tetrahedra either side of a face produce the same vertex. Without that they
+    produce two coincident ones and the mesh has a boundary everywhere while
+    rendering identically. It also matters downstream: `compute_uvatlas`
+    *segfaults* on non-manifold input rather than raising
+    (`docs/handoff/ISSUES.md`), so a mesh that is quietly non-manifold takes
+    the whole texturing stage out with exit 139.
+    """
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    for resolution in (16, 32):
+        mesh, _stats = extract_level_set(
+            _analytic_sphere(1.0),
+            ((-1.5, -1.5, -1.5), (1.5, 1.5, 1.5)),
+            resolution=resolution,
+        )
+        assert mesh.is_edge_manifold(), resolution
+        assert mesh.is_vertex_manifold(), resolution
+        assert mesh.is_watertight(), resolution
+
+
+def test_halving_the_cell_size_quarters_the_error():
+    """Convergence, measured -- and it is second order, not first.
+
+    The obvious expectation is that halving the cell halves the error. It does
+    not: measured mean radial error goes 0.002855 -> 0.000685 -> 0.000175 as
+    the resolution doubles from 16 to 64, a factor of **~4 each time**. Linear
+    interpolation along an edge places the crossing to second order for a
+    smooth field, so the error falls with the square of the cell size.
+
+    Asserting the wrong law would be worse than asserting nothing: a first-order
+    bound is satisfied by a second-order method, so the test would pass while
+    silently tolerating a real regression to linear convergence.
+    """
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    field = _analytic_sphere(1.0)
+    bounds = ((-1.5, -1.5, -1.5), (1.5, 1.5, 1.5))
+
+    errors = []
+    for resolution in (16, 32, 64):
+        mesh, _stats = extract_level_set(field, bounds, resolution=resolution)
+        vertices = np.asarray(mesh.vertices)
+        errors.append(float(np.abs(np.linalg.norm(vertices, axis=1) - 1.0).mean()))
+
+    for coarse, fine in zip(errors, errors[1:]):
+        ratio = coarse / fine
+        assert 3.0 < ratio < 5.5, (errors, ratio)
+
+
+def test_level_set_handles_an_off_centre_box_and_a_non_cubic_one():
+    """The grid is not assumed to be centred, cubic, or aligned with the shape."""
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    centre = (0.3, -0.7, 0.2)
+    mesh, stats = extract_level_set(
+        _analytic_sphere(0.5, centre),
+        ((-0.4, -1.4, -0.5), (1.1, 0.1, 0.9)),
+        resolution=24,
+    )
+    vertices = np.asarray(mesh.vertices)
+    assert len(vertices) > 200
+    radial = np.linalg.norm(vertices - np.asarray(centre), axis=1)
+    assert np.abs(radial - 0.5).max() < stats["cell_size"]
+    # A box longer in one axis gets more cells there, not stretched ones.
+    assert stats["grid_shape"][0] >= stats["grid_shape"][2]
+
+
+def test_level_set_rejects_degenerate_input():
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    with pytest.raises(ValueError, match="resolution"):
+        extract_level_set(_analytic_sphere(), ((0, 0, 0), (1, 1, 1)), resolution=0)
+    with pytest.raises(ValueError, match="Degenerate bounds"):
+        extract_level_set(_analytic_sphere(), ((0, 0, 0), (0, 0, 0)))
+
+
+def test_an_empty_field_yields_an_empty_mesh_rather_than_failing():
+    """A level nothing crosses is a legitimate answer, not an error."""
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    mesh, stats = extract_level_set(
+        lambda points: np.ones(len(points)),
+        ((-1, -1, -1), (1, 1, 1)),
+        resolution=8,
+    )
+    assert len(mesh.triangles) == 0
+    assert stats["num_triangles"] == 0
+    assert stats["num_points_evaluated"] > 0
+
+
+def test_the_gaussian_field_keeps_the_appearance_embedding_refusal():
+    """The GPU half is untested here, but its one CPU-reachable guard is not.
+
+    `gaussian_density_field` needs a GPU to evaluate, and this environment has
+    none. The appearance-embedding refusal, though, happens before any device
+    is touched -- and it has to stay, for the reason `SCOPE.md` gives:
+    per-image appearance variation does not map onto one canonical surface.
+    """
+    from gsplat.photogrammetry.mesh_extraction import gaussian_density_field
+
+    torch = pytest.importorskip("torch")
+
+    splats = {
+        "means": torch.zeros(4, 3),
+        "quats": torch.zeros(4, 4),
+        "scales": torch.zeros(4, 3),
+        "opacities": torch.zeros(4),
+        # An appearance-embedding checkpoint: 'features'/'colors', no SH.
+        "features": torch.zeros(4, 32),
+        "colors": torch.zeros(4, 3),
+    }
+    with pytest.raises(ValueError, match="appearance-embedding"):
+        gaussian_density_field(splats, device="cuda")
