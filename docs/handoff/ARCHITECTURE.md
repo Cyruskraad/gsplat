@@ -16,6 +16,7 @@ Everything below is new on this branch unless marked *(modified)*.
 | `neural_sfm.py` | 299 | Adapter for externally-run DUSt3R/MASt3R/VGGT-style tools |
 | `__init__.py` | 146 | Re-exports; 41 public names |
 | `dense_mvs.py` | 138 | Shells out to the `colmap` CLI for patch-match stereo + fusion |
+| `mesh_refinement.py` | 330 | Slides vertices along normals onto the photoconsistent surface (patch NCC) |
 | `photometric_alignment.py` | 400 | **Not exported.** A retained negative result — see `ISSUES.md` §5b |
 | `_open3d.py` | 31 | The shared `_require_open3d()` guard, so extraction and texturing need not depend on each other |
 
@@ -35,7 +36,7 @@ Also modified: `examples/simple_trainer_2dgs.py` (`--extract_mesh`,
 (`mono_depth_dir`, `mask_dir`), `.github/workflows/core_tests.yml` (installs
 the suite's deps).
 
-### Tests — 163 across 10 files
+### Tests — 174 across 11 files
 
 | File | Tests | Lines |
 |---|---:|---:|
@@ -47,6 +48,7 @@ the suite's deps).
 | `tests/test_extract_mesh_io.py` | 5 | 152 |
 | `tests/test_extract_mesh_cli.py` | 8 | 420 |
 | `tests/test_photometric_alignment.py` | 2 | 180 |
+| `tests/test_mesh_refinement.py` | 5 | 250 |
 | `tests/test_neural_sfm.py` | 4 | 243 |
 | `tests/test_bundle_adjustment.py` | 3 | 166 |
 
@@ -134,17 +136,21 @@ are now derived from the capture itself:
 | How big an atlas | `--texture_size` | `--texture_texels_per_pixel` — sum the source pixels covering the surface; measure this mesh's UV packing with a probe unwrap |
 | Which faces to keep | (all) | `--cull_unobserved` — `face_visibility` over the training cameras |
 | Which view textures a face | (blend all) | `--texture_view_selection` — MRF over face adjacency, then seam levelling |
+| How big a TSDF voxel | `--voxel_size 0.01` | derived: the world size of one source pixel at the depth it observes |
+| Poisson's normal radius | `radius=0.1` | derived: 5x the cloud's own k-NN spacing, the measured knee |
+| Where the surface is | (wherever fusion put it) | `--refine_mesh` — vertices slide along normals onto the photoconsistent surface |
 
 ---
 
-## Public API — 41 names
+## Public API — 42 names
 
 ```
 Reconstruction   refine_reconstruction  run_dense_mvs
                  merge_point_maps_to_tracks  write_colmap_reconstruction
 
-Surface          extract_mesh_tsdf  extract_mesh_poisson
+Surface          extract_mesh_tsdf  extract_mesh_poisson  derive_tsdf_parameters
                  cull_unobserved_faces  simplify_mesh  simplify_mesh_to_error
+                 refine_mesh_photometric
 
 Texturing        bake_texture  bake_texture_atlas  bake_texture_atlas_view_selected
                  bake_texture_atlas_pages  bake_mesh_texture

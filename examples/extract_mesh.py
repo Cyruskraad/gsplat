@@ -56,6 +56,7 @@ from gsplat.photogrammetry.mesh_extraction import (
     simplify_mesh,
     simplify_mesh_to_error,
 )
+from gsplat.photogrammetry.mesh_refinement import refine_mesh_photometric
 from gsplat.photogrammetry.metrics import mesh_quality_stats, point_to_mesh_distance
 
 
@@ -128,6 +129,16 @@ class Config:
     # past the depths the maps actually contain, so it rejects outliers
     # without cropping real geometry.
     depth_trunc: Optional[float] = None
+    # Slide mesh vertices along their normals onto the photoconsistent
+    # surface (Vu et al., TPAMI 2012) before culling and decimating. Worth it
+    # above roughly a third of a source pixel of surface error and not below,
+    # where it adds about 0.15 px of noise instead -- see
+    # gsplat.photogrammetry.mesh_refinement. Off by default.
+    refine_mesh: bool = False
+    # Laplacian weight for --refine_mesh.
+    refine_smoothness: float = 1.0
+    # Visibility/tangent-frame recomputations for --refine_mesh.
+    refine_rounds: int = 6
     # Neighbourhood radius for Poisson normal estimation, in scene units.
     # Left unset it is 5x the cloud's own k-nearest-neighbour spacing, the
     # measured knee past which open3d's neighbour cap binds anyway.
@@ -349,6 +360,38 @@ def main(cfg: Config) -> None:
             f"{extraction_stats['normal_radius']:.5g} scene units "
             f"({extraction_stats['point_spacing']:.5g} point spacing)"
         )
+
+    refine_stats = None
+    if cfg.refine_mesh:
+        # Before culling and decimating: both spend a budget based on where the
+        # surface is, so moving it first means they are not spent on the wrong
+        # geometry.
+        mesh, refine_stats = refine_mesh_photometric(
+            mesh,
+            dataset,
+            smoothness=cfg.refine_smoothness,
+            outer_rounds=cfg.refine_rounds,
+        )
+        print(
+            "[extract_mesh] photometric refinement moved vertices by "
+            f"{refine_stats['mean_abs_displacement']:.5g} scene units on "
+            f"average ({refine_stats['mean_abs_displacement'] / refine_stats['pixel_world_size']:.2f} "
+            "source pixels); cross-view disagreement "
+            f"{refine_stats['photoconsistency_before']:.5f} -> "
+            f"{refine_stats['photoconsistency_after']:.5f}"
+        )
+        if (
+            refine_stats["photoconsistency_after"]
+            >= refine_stats["photoconsistency_before"]
+        ):
+            warnings.warn(
+                "Photometric refinement did not reduce cross-view "
+                "disagreement, so it moved the surface without improving the "
+                "fit. That usually means the mesh was already within about a "
+                "third of a source pixel, where this costs accuracy rather "
+                "than buying it -- consider dropping --refine_mesh.",
+                RuntimeWarning,
+            )
 
     if (cfg.normal_map or cfg.ao_map) and cfg.texture_mode != "atlas":
         raise ValueError(
@@ -670,6 +713,8 @@ def main(cfg: Config) -> None:
     stats = mesh_quality_stats(mesh)
     if extraction_stats:
         stats["extraction"] = extraction_stats
+    if refine_stats is not None:
+        stats["refinement"] = refine_stats
     if texture_size_stats is not None:
         stats["texture_size"] = texture_size_stats
     if cull_stats is not None:

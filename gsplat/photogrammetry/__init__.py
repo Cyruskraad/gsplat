@@ -54,6 +54,7 @@ requires the ``colmap`` command-line tool (built with CUDA support) on
 
 from .bundle_adjustment import refine_reconstruction
 from .dense_mvs import run_dense_mvs
+from .mesh_refinement import refine_mesh_photometric
 from .mesh_extraction import (
     cull_unobserved_faces,
     extract_mesh_poisson,
@@ -123,6 +124,7 @@ __all__ = [
     "bake_ambient_occlusion",
     "simplify_mesh",
     "simplify_mesh_to_error",
+    "refine_mesh_photometric",
     "cull_unobserved_faces",
     "merge_point_maps_to_tracks",
     "write_colmap_reconstruction",

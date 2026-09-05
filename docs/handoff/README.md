@@ -35,7 +35,7 @@ CPU.
 | Branch | `claude/photogrammetry-techniques-plan-jb0pod` |
 | Head | `b342d5d` (33 commits, 34 files, +15024 / −10 against `main`) |
 | PR | [#3](https://github.com/Cyruskraad/gsplat/pull/3) — **open draft**, mergeable clean, **no reviews, no comments, no CI** |
-| Tests | **163 passing** across 10 files |
+| Tests | **174 passing** across 11 files |
 | Bugs found and fixed | 15, each mutation-checked |
 | Blocking | GitHub Actions disabled at repo level; no GPU/CUDA/`colmap`; no model weights |
 
@@ -50,10 +50,11 @@ python -m pytest tests/test_bundle_adjustment.py tests/test_mesh_extraction.py \
     tests/test_neural_sfm.py tests/test_colmap_dataset.py \
     tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
     tests/test_texturing.py tests/test_extract_mesh_io.py \
-    tests/test_extract_mesh_cli.py tests/test_photometric_alignment.py -q
+    tests/test_extract_mesh_cli.py tests/test_photometric_alignment.py \
+    tests/test_mesh_refinement.py -q
 ```
 
-Expect **163 passed** (~1m20s). Needs `pycolmap`, `open3d`, `scikit-learn`,
+Expect **174 passed** (~1m40s). Needs `pycolmap`, `open3d`, `scikit-learn`,
 `opencv-python-headless`, `imageio`, `piexif`, `pytest-check`.
 
 **2. Check whether any blocker has lifted** — this decides what is worth doing:

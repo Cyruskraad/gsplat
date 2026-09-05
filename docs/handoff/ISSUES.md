@@ -231,6 +231,40 @@ that first and revisit this after.
 `tests/test_photometric_alignment.py` pins both claims, so a future fix fails
 the tests loudly instead of the finding rotting into folklore.
 
+## 5c. Photometric mesh refinement works, modestly — know its break-even
+
+`refine_mesh_photometric` (Vu et al., TPAMI 2012) **is** exported and on the
+CLI as `--refine_mesh`, unlike the alignment above. It is worth understanding
+why one shipped and the other did not, because the objectives look similar:
+
+- The alignment compares each view against **one fused colour**, so a view that
+  is simply brighter looks like a view whose geometry is wrong.
+- The refinement compares **z-normalised patches between views**, which is a
+  correlation, so a per-view gain and offset cancel exactly.
+
+Three numbers to know before using it:
+
+- **Break-even is about a third of a source pixel.** Input against output
+  surface error, both in source pixels: `0.00 -> 0.15`, `0.24 -> 0.28`,
+  `0.48 -> 0.39`, `0.95 -> 0.70`, `1.91 -> 1.50`. The correction scales with
+  the error; the cost is a roughly fixed ~0.15 px of added noise. It is not a
+  limitation in practice — §"Measured, not guessed" now sizes a TSDF voxel at
+  one source pixel, so a TSDF surface starts around a pixel out.
+- **It needs about ten views, and the cliff is sharp.** Recovering the same
+  0.95 px error: 8 views recovers 4–12%, 10 views 26.7%, 12 views 24.3%.
+- **The patch must stay near one source pixel between samples.** A flat tangent
+  patch is a chord of a curved surface, so an over-large patch fits best
+  slightly *inside* a convex object: the objective's minimum moves from 0.000
+  at a 3.6 px patch to −0.010 at 9 px and −0.020 at 18 px. Enlarging the patch
+  "for robustness" would silently shrink every convex object.
+
+**The method worked because the objective was validated before the optimiser
+was written** — the reverse of §5b, and the cheapest lesson on this branch.
+
+`tests/test_mesh_refinement.py` pins all of it, including a separate capture
+*with* per-view exposure variation: without it, removing the z-normalisation —
+the one decision that distinguishes this from §5b — passes every other test.
+
 ## 6. What to do next
 
 Ordered by value.
