@@ -826,6 +826,7 @@ def bake_mesh_texture(
     allow_atlas_fallback: bool = True,
     view_selection: bool = False,
     mrf_smoothness: float = 1.0,
+    seam_smoothness: Optional[float] = 0.1,
     stats_out: Optional[dict] = None,
     num_pages: int = 1,
 ):
@@ -855,6 +856,10 @@ def bake_mesh_texture(
             :func:`bake_texture_atlas_view_selected` for the tradeoff this
             makes. Ignored in ``"vertex"`` mode, which has no faces to label.
         mrf_smoothness: Seam penalty, for ``view_selection``.
+        seam_smoothness: Strength of the seam levelling applied after
+            ``view_selection`` -- see :func:`level_seams`. ``None`` skips
+            levelling. Ignored without ``view_selection``, which produces no
+            label boundaries to level, exactly as ``mrf_smoothness`` is.
         num_pages: In ``"atlas"`` mode, split the surface across this many
             atlas pages (see :func:`bake_texture_atlas_pages`). Above 1 the
             returned ``texture`` is the *first* page; the rest are on the mesh,
@@ -918,6 +923,7 @@ def bake_mesh_texture(
                 mrf_smoothness=mrf_smoothness,
                 outlier_sigma=outlier_sigma,
                 outlier_iterations=outlier_iterations,
+                seam_smoothness=seam_smoothness,
             )
             if stats_out is not None:
                 stats_out.update(stats)
