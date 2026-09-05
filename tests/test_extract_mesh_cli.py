@@ -190,3 +190,266 @@ def test_bake_mesh_texture_ignores_seam_smoothness_without_view_selection():
     assert baseline.max() > 0, "the blended atlas came back empty"
     assert np.array_equal(baseline, bake(seam_smoothness=None))
     assert np.array_equal(baseline, bake())
+
+
+def _capture(tmp_path, **overrides):
+    """Write a small synthetic capture and return its build() result."""
+    from make_synthetic_capture import Config, build
+
+    settings = dict(
+        out_dir=str(tmp_path / "capture"),
+        num_views=10,
+        width=96,
+        height=96,
+        focal=130.0,
+        num_points=250,
+        num_dense_points=6000,
+        mesh_resolution=12,
+    )
+    settings.update(overrides)
+    return build(Config(**settings))
+
+
+def _run(tmp_path, capture, **overrides):
+    import extract_mesh
+
+    settings = dict(
+        method="mesh",
+        mesh_path=capture["mesh_path"],
+        data_dir=capture["data_dir"],
+        data_factor=1,
+        test_every=10_000,
+        result_dir=str(tmp_path / "out"),
+        device="cpu",
+        texture_mode="atlas",
+        texture_size=128,
+    )
+    settings.update(overrides)
+    cfg = extract_mesh.Config(**settings)
+    extract_mesh.main(cfg)
+    return settings["result_dir"]
+
+
+def test_the_whole_delivery_path_runs_from_the_cli(tmp_path):
+    """Run `extract_mesh.main()` itself, with every delivery option on.
+
+    This is the test the crash in `fa70683` needed and did not have. Until a
+    checkpoint-free entry existed, `main()` could not be reached without a GPU,
+    so roughly ten CLI guards were 'reviewed, never executed' -- and one of them
+    raised `TypeError` on every run.
+
+    It asserts the artifacts rather than any quality number: the point is that
+    the wiring executes end to end and the files a DCC tool needs land on disk.
+    """
+    import json
+
+    cv2 = pytest.importorskip("cv2", reason="opencv not installed")
+
+    capture = _capture(tmp_path)
+    result_dir = _run(
+        tmp_path,
+        capture,
+        cull_unobserved=True,
+        texture_view_selection=True,
+        texture_seam_smoothness=0.1,
+        texture_outlier_sigma=2.0,
+        target_fit_ratio=0.25,
+        normal_map=True,
+        normal_map_bits=16,
+        ao_map=True,
+        ao_samples=8,
+    )
+
+    # A UV atlas means .obj (a .ply cannot carry UVs), plus its material and maps.
+    for name in (
+        "mesh.obj",
+        "mesh.mtl",
+        "mesh_0.png",
+        "mesh_normal.png",
+        "mesh_ao.png",
+    ):
+        path = os.path.join(result_dir, name)
+        assert os.path.exists(path), f"{name} was not written"
+        assert os.path.getsize(path) > 0, f"{name} is empty"
+
+    # The 16-bit normal map must be 16-bit *on disk*. It has to be read with
+    # OpenCV to check that: imageio's Pillow backend cannot write a 16-bit RGB
+    # PNG and silently down-converts one to uint8 on *read* too, so reading it
+    # back through imageio reports uint8 for a file that is genuinely uint16.
+    normal = cv2.imread(
+        os.path.join(result_dir, "mesh_normal.png"), cv2.IMREAD_UNCHANGED
+    )
+    assert normal is not None, "OpenCV could not read the normal map back"
+    assert (
+        normal.dtype == np.uint16
+    ), f"normal map is {normal.dtype} on disk, not uint16"
+
+    mesh = o3d.io.read_triangle_mesh(os.path.join(result_dir, "mesh.obj"))
+    assert len(mesh.triangles) > 0
+    assert mesh.has_triangle_uvs()
+
+    # Every stage that was asked for must have recorded its own stats. This is
+    # what makes the test a check that each stage *ran*, rather than only that
+    # the script exited zero.
+    metrics = json.load(open(os.path.join(result_dir, "mesh_metrics.json")))
+    for key in (
+        "culling",
+        "decimation",
+        "view_selection",
+        "normal_map",
+        "ambient_occlusion",
+        "point_to_mesh",
+    ):
+        assert key in metrics, (
+            f"mesh_metrics.json is missing {key!r}, so that stage did not run: "
+            f"{sorted(metrics)}"
+        )
+    assert metrics["is_watertight"] is True
+    assert metrics["num_triangles"] > 0
+    assert metrics["point_to_mesh"]["mean"] is not None
+
+
+def test_a_colmap_frame_mesh_is_transformed_into_the_camera_frame(tmp_path):
+    """`Parser(normalize=True)` moves the cameras; the mesh must follow.
+
+    A mesh or dense cloud read straight off disk is in the sparse model's raw
+    frame, but `extract_mesh.py` builds its `Parser` with `normalize=True`, so
+    `dataset`'s cameras are not. Nothing raises when they disagree -- the mesh
+    is simply textured from cameras that do not line up with it, which is the
+    worst kind of bug this pipeline can have, since it ships a plausible-looking
+    asset. `Parser` applies the same transform to its own `dense_points_path`
+    for exactly this reason.
+
+    Driven through `main()` rather than by re-deriving the transform here: a
+    test that reimplements the mechanism proves the mechanism and leaves the
+    call site unpinned, which is how the five bugs in docs/handoff/ISSUES.md
+    section 5 got in. `--mesh_frame normalized` is the switch that skips the
+    transform, so it reproduces the old behaviour exactly.
+    """
+    import json
+
+    capture = _capture(tmp_path)
+
+    def culled_fraction(mesh_frame):
+        result_dir = _run(
+            tmp_path / mesh_frame,
+            capture,
+            mesh_frame=mesh_frame,
+            cull_unobserved=True,
+            result_dir=str(tmp_path / mesh_frame / "out"),
+        )
+        stats = json.load(open(os.path.join(result_dir, "mesh_metrics.json")))
+        culling = stats["culling"]
+        return culling["num_culled"] / culling["num_faces_before"]
+
+    # Premise: this capture surrounds the subject, so with the frames agreeing
+    # essentially nothing is unobserved. Without that the comparison is empty.
+    correct = culled_fraction("colmap")
+    assert correct < 0.05, (
+        f"{correct:.1%} of faces unobserved even in the right frame -- the "
+        "capture does not surround the subject, so this test proves nothing"
+    )
+
+    untransformed = culled_fraction("normalized")
+    assert untransformed > 0.5, (
+        "skipping the normalization transform left the mesh visible anyway "
+        f"({untransformed:.1%} culled), so this scene cannot detect the bug"
+    )
+
+
+def test_an_unreadable_mesh_path_says_so(tmp_path):
+    """A mesh that loads no triangles must name the likely cause.
+
+    open3d's readers do not raise on a path it cannot parse -- they return an
+    empty mesh -- so without this the run continues and fails much later,
+    somewhere inside texturing, with nothing pointing at the input.
+    """
+    import extract_mesh
+
+    capture = _capture(tmp_path, num_views=4, num_points=60, write_dense=False)
+    empty = tmp_path / "empty.ply"
+    empty.write_text("not a mesh at all\n")
+
+    with pytest.raises(ValueError, match="no triangles"):
+        extract_mesh.main(
+            extract_mesh.Config(
+                method="mesh",
+                mesh_path=str(empty),
+                data_dir=capture["data_dir"],
+                data_factor=1,
+                test_every=10_000,
+                result_dir=str(tmp_path / "out"),
+                device="cpu",
+            )
+        )
+
+
+def test_a_dense_cloud_is_transformed_into_the_camera_frame(tmp_path):
+    """The same frame guard, on the Poisson path -- where the bug was found.
+
+    A dense MVS cloud comes out of `colmap` in the sparse model's raw frame,
+    and `extract_mesh.py` read it straight off disk while normalizing the
+    cameras. Kept as its own test because the mesh path's guard does not cover
+    it: dropping the transform here alone left the whole suite green.
+    """
+    import json
+
+    capture = _capture(tmp_path)
+    result_dir = _run(
+        tmp_path,
+        capture,
+        method="poisson",
+        mesh_path=None,
+        dense_points=capture["dense_path"],
+        poisson_depth=6,
+        cull_unobserved=True,
+        bake_texture_=True,
+    )
+    stats = json.load(open(os.path.join(result_dir, "mesh_metrics.json")))
+    culling = stats["culling"]
+    culled = culling["num_culled"] / culling["num_faces_before"]
+
+    # The capture surrounds the subject, so a correctly-framed Poisson surface
+    # is almost entirely observed. Untransformed it is mostly invisible.
+    assert culled < 0.2, (
+        f"{culled:.1%} of the Poisson mesh's faces were unobserved -- the "
+        "cloud and the cameras are probably in different frames"
+    )
+
+
+def test_each_method_requires_its_own_input(tmp_path):
+    """The input check must be per-method, not a blanket `assert cfg.ckpt`.
+
+    The blanket assert made `--method poisson` demand a checkpoint it never
+    opens, and made `main()` unreachable without a GPU at all -- which is how
+    the `TypeError` above went unnoticed for five commits.
+    """
+    import extract_mesh
+
+    capture = _capture(tmp_path, num_views=4, num_points=60, write_dense=False)
+    common = dict(
+        data_dir=capture["data_dir"],
+        data_factor=1,
+        test_every=10_000,
+        result_dir=str(tmp_path / "out"),
+        device="cpu",
+    )
+
+    for method, flag in (
+        ("tsdf", "--ckpt"),
+        ("poisson", "--dense_points"),
+        ("mesh", "--mesh_path"),
+    ):
+        with pytest.raises(ValueError, match=flag.lstrip("-")):
+            extract_mesh.main(extract_mesh.Config(method=method, **common))
+
+    # And a checkpoint is *not* required once another source is given.
+    extract_mesh.main(
+        extract_mesh.Config(
+            method="mesh",
+            mesh_path=capture["mesh_path"],
+            bake_texture_=False,
+            **common,
+        )
+    )
+    assert os.path.exists(os.path.join(common["result_dir"], "mesh.ply"))

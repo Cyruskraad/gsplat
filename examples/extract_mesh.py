@@ -43,6 +43,7 @@ import open3d as o3d
 import torch
 import tyro
 from datasets.colmap import Dataset, Parser
+from datasets.normalize import transform_points
 
 from gsplat.photogrammetry.mesh_extraction import (
     bake_ambient_occlusion,
@@ -94,13 +95,27 @@ class Config:
     # Every N images there is a test image; use a large value (e.g. 10_000) to
     # put ~all images in the "train" split used for mesh extraction/baking.
     test_every: int = 8
-    # Reconstruction method.
-    method: Literal["tsdf", "poisson"] = "tsdf"
+    # Reconstruction method. "tsdf" fuses depth maps rendered from --ckpt;
+    # "poisson" reconstructs from --dense_points; "mesh" skips reconstruction
+    # and loads --mesh_path, so an existing mesh can be culled, decimated,
+    # textured and mapped without a checkpoint or a GPU.
+    method: Literal["tsdf", "poisson", "mesh"] = "tsdf"
     # Renderer used to produce depth maps for TSDF fusion.
     renderer: Literal["2dgs", "3dgs"] = "2dgs"
     # Path to a dense MVS point cloud (see examples/dense_mvs.py). Required
     # for --method poisson; optional fallback source for TSDF is unused.
     dense_points: Optional[str] = None
+    # Path to an existing mesh (.ply/.obj) to texture and deliver as-is.
+    # Required for --method mesh. The cloud-to-mesh fit reference is
+    # --dense_points when given, otherwise the sparse SfM cloud.
+    mesh_path: Optional[str] = None
+    # Which world frame --mesh_path is in. "colmap" is the raw frame of the
+    # sparse model (what an external MVS tool or `colmap` itself produces);
+    # "normalized" is the frame this script's own TSDF output is already in,
+    # since it is built from a checkpoint trained through Parser(normalize=True).
+    # Getting this wrong does not fail loudly -- it silently textures the mesh
+    # from cameras that do not line up with it.
+    mesh_frame: Literal["colmap", "normalized"] = "colmap"
     # TSDF voxel size, in scene units.
     voxel_size: float = 0.01
     # TSDF truncation distance, in scene units.
@@ -218,7 +233,26 @@ class Config:
 
 
 def main(cfg: Config) -> None:
-    assert cfg.ckpt, "--ckpt is required."
+    # Each method needs a different input, and the check has to be per-method:
+    # a blanket `assert cfg.ckpt` made --method poisson demand a checkpoint it
+    # never opens, and made main() unreachable without a GPU -- which is how a
+    # TypeError in the texture call survived five commits (see
+    # docs/handoff/ISSUES.md section 5).
+    required = {
+        "tsdf": ("ckpt", cfg.ckpt),
+        "poisson": ("dense_points", cfg.dense_points),
+        "mesh": ("mesh_path", cfg.mesh_path),
+    }
+    if cfg.method not in required:
+        raise ValueError(f"Unknown method: {cfg.method!r}")
+    flag, value = required[cfg.method]
+    if not value:
+        raise ValueError(
+            f"--method {cfg.method} requires --{flag}. The three input sources "
+            "are --ckpt (--method tsdf), --dense_points (--method poisson) and "
+            "--mesh_path (--method mesh)."
+        )
+
     parser = Parser(
         data_dir=cfg.data_dir,
         factor=cfg.data_factor,
@@ -242,14 +276,40 @@ def main(cfg: Config) -> None:
         # cloud as the cloud-to-mesh fit reference.
         reference_points = parser.points
     elif cfg.method == "poisson":
-        assert cfg.dense_points, "--dense_points is required for --method poisson."
         pcd = o3d.io.read_point_cloud(cfg.dense_points)
-        points_xyz = np.asarray(pcd.points)
+        # A dense MVS cloud is in the sparse model's raw frame, but `Parser`
+        # was asked to normalize, so `dataset`'s cameras are not. Reconstructing
+        # without this transform yields a mesh that does not line up with the
+        # cameras that must texture it -- silently, since nothing raises.
+        # `Parser` applies exactly this transform to its own `dense_points_path`
+        # for the same reason.
+        points_xyz = transform_points(parser.transform, np.asarray(pcd.points))
         points_rgb = np.asarray(pcd.colors) if pcd.has_colors() else None
         mesh = extract_mesh_poisson(points_xyz, points_rgb, depth=cfg.poisson_depth)
         reference_points = points_xyz
     else:
-        raise ValueError(f"Unknown method: {cfg.method!r}")
+        mesh = o3d.io.read_triangle_mesh(cfg.mesh_path)
+        if len(mesh.triangles) == 0:
+            raise ValueError(
+                f"--mesh_path {cfg.mesh_path!r} loaded no triangles. Check the "
+                "path and that open3d can read the format (.ply/.obj)."
+            )
+        if cfg.mesh_frame == "colmap":
+            mesh.vertices = o3d.utility.Vector3dVector(
+                transform_points(parser.transform, np.asarray(mesh.vertices))
+            )
+        mesh.compute_vertex_normals()
+        # No reconstruction happened, so there is no cloud of its own. Prefer a
+        # dense cloud if one was given; otherwise the sparse SfM points are the
+        # only evidence available to measure fit against. Both end up in the
+        # same frame as the mesh above.
+        if cfg.dense_points:
+            reference_points = transform_points(
+                parser.transform,
+                np.asarray(o3d.io.read_point_cloud(cfg.dense_points).points),
+            )
+        else:
+            reference_points = parser.points
 
     print(
         f"[extract_mesh] extracted mesh with {len(mesh.vertices)} vertices, "
