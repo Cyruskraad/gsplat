@@ -9,7 +9,7 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **161 tests pass.** Every guard mutation-checked — the fix reverted, a test
+- **196 tests pass.** Every guard mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
   perturbed points: removed **96.5%** of the reprojection error.
@@ -70,7 +70,7 @@ docstring too.
 
 ---
 
-## The 13 bugs found and fixed
+## The 15 bugs found and fixed
 
 Each was confirmed by reverting the fix and showing a test genuinely fails.
 
@@ -117,6 +117,29 @@ Each was confirmed by reverting the fix and showing a test genuinely fails.
     four-corner cancellation. That reaches `-log()` as `NaN`, and `np.argmin`
     returns a `NaN`'s index in preference to every real cost — so the face
     would be textured from the one view that *cannot see it*.
+14. **`extract_mesh.py` crashed on every texture-baking run**, from `fa70683`
+    to `181a786`. It passed `seam_smoothness=` to `bake_mesh_texture()`, which
+    has no such parameter and no `**kwargs`; `bake_texture_` defaults to True
+    and the keyword went unconditionally, so the whole delivery stage — and
+    `run_pipeline.py`'s — raised `TypeError`. `--texture_seam_smoothness 0` did
+    not help. Seam levelling was reachable from the library but from neither
+    CLI. It survived because **no test had ever called `extract_mesh.main()`**.
+15. **The Poisson path reconstructed in the raw COLMAP frame while the cameras
+    were normalized.** `Parser` is built with `normalize=True`, which moves the
+    cameras, but the dense cloud was read straight off disk. Nothing raises —
+    the mesh is simply textured from cameras that do not line up with it.
+    Measured: reading raw, **14.6%** of (vertex, view) pairs land in frame;
+    through `parser.transform`, **100%**. With the transform skipped,
+    `--cull_unobserved` discards **68.6%** of faces and the script's own "the
+    poses or the scale are wrong" warning fires — written for exactly this and
+    never once seen, because `main()` could not run. `Parser` applies the same
+    transform to its own `dense_points_path` and says why in a comment; the CLI
+    did not. TSDF was unaffected: its splats come from a checkpoint trained
+    through the same normalization.
+
+    Bug 15 is the worse *kind*: 14 crashes, 15 ships a plausible-looking wrong
+    asset. Both were found within minutes of making `main()` runnable, which is
+    the argument for doing that before anything else.
 
 Two sharp edges are **guarded rather than fixed**, because they are upstream:
 `compute_uvatlas` segfaults (exit 139) on non-manifold input, so manifoldness is

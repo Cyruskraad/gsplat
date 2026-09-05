@@ -3,14 +3,21 @@
 **Repo:** `Cyruskraad/gsplat` (fork of `nerfstudio-project/gsplat`)
 **Branch:** `claude/photogrammetry-techniques-plan-jb0pod`
 **PR:** [#3 — Add state-of-the-art photogrammetry pipeline](https://github.com/Cyruskraad/gsplat/pull/3) (open, draft)
-**Diff size:** 29 files changed, +8,396 / −10 lines, 18 commits since branching from `main`
+**Diff size:** 47 files changed, +19,921 / −10 lines, 42 commits since branching from `main`
 
 ---
 
 ## START HERE — picking this up in a new session
 
-1. **Read this file top to bottom.** It is the complete state of the work:
-   what exists (§2), what was never actually executed (§3), what's blocked
+> **Read [`handoff/README.md`](handoff/README.md) instead of this file.** That
+> directory is five short documents written to be the *only* orientation a new
+> session needs, and it is kept current. This file is the long-form running log
+> behind them — useful for the history of a specific decision, not for finding
+> out where things stand. Sections below that predate `docs/handoff/` are left
+> as written; where they disagree with `handoff/`, `handoff/` is right.
+
+1. **Read this file top to bottom** only if you want the narrative: what
+   exists (§2), what was never actually executed (§3), what's blocked
    (§4), and what to do next (§5).
 2. **Check the live state of the PR** — it may have moved since this was
    written: `gh pr view 3 --repo Cyruskraad/gsplat` (or open the URL above)
@@ -20,9 +27,11 @@
    python -m pytest tests/test_bundle_adjustment.py tests/test_mesh_extraction.py \
        tests/test_neural_sfm.py tests/test_colmap_dataset.py \
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
-       tests/test_texturing.py tests/test_extract_mesh_io.py -q
+       tests/test_texturing.py tests/test_extract_mesh_io.py \
+       tests/test_extract_mesh_cli.py tests/test_photometric_alignment.py \
+       tests/test_mesh_refinement.py tests/test_level_set.py -q
    ```
-   Expect **153 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **196 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Before touching the texturing code**, read
    [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md). All
@@ -30,10 +39,13 @@
    record of what was measured and why the tests are shaped as they are. Its
    "Premise, measured" section and the step 2/3 findings each document a
    plausible-looking measurement that turned out to measure the wrong thing.
-5. **Otherwise start from §5.1.** As of the latest session all three §5.1 items
-   are still blocked (re-verified, see §4) — Actions is still off, the PR is
-   still an unreviewed draft, and the sandbox still has no GPU/CUDA/`colmap`/
-   capture data. Re-check them first anyway, then continue down §5.2.
+5. **Otherwise start from [`handoff/ISSUES.md`](handoff/ISSUES.md) §6**, which
+   supersedes §5 below. The three §5.1 blockers are unchanged — Actions is
+   still off, the PR is still an unreviewed draft, and the sandbox still has no
+   GPU/CUDA/`colmap`/capture data — but §5.2's list is stale: most of it has
+   landed, and two bugs found since (a `TypeError` that crashed every
+   texture-baking run, and a silent coordinate-frame mismatch on the Poisson
+   path) disproved the claim that everything unblocked was done.
 
 **Ground rules carried over from the work so far:**
 
@@ -214,7 +226,7 @@ conventions.
 Because GitHub Actions is disabled at the repository level on this fork (and
 neither the repo owner nor this session has access to flip that), every
 round of work was followed by a **manual self code-review pass** in place of
-CI. **Thirteen** real bugs have been found and fixed this way so far, **each
+CI. **Fifteen** real bugs have been found and fixed this way so far, **each
 verified by reverting the fix and confirming a test genuinely fails without
 it** (not just re-asserting the buggy behavior). The first five were found in
 the initial pass and are listed here; the rest are described where the work
@@ -930,6 +942,45 @@ Actions). The atlas correctness tests use analytic ground truth — a unit
 sphere shaded by a known position-dependent function, viewed from 24
 ray-traced cameras — and check the atlas *as addressed by the mesh's own
 `triangle_uvs`*, which pins the OBJ v-up convention external tools rely on.
+
+### 2.20 Everything since `docs/handoff/` (summary only)
+
+Eight commits, `181a786`..`be9231e`. Kept short deliberately: the detail lives
+in [`handoff/PROGRESS.md`](handoff/PROGRESS.md) and
+[`handoff/ISSUES.md`](handoff/ISSUES.md), which are maintained, and in the
+commit messages, which carry the measurements.
+
+- **Two live bugs, both found by making an unreachable path runnable.** A
+  `TypeError` that crashed *every* texture-baking run for five commits, and a
+  silent coordinate-frame mismatch that had the Poisson path reconstructing in
+  the raw COLMAP frame while the cameras were normalized. `handoff/PROGRESS.md`
+  bugs 14 and 15.
+- **`extract_mesh.main()` now runs on CPU**, via `--method mesh --mesh_path`,
+  `--method poisson` without a checkpoint, and
+  `examples/make_synthetic_capture.py`, which writes a multi-view-consistent
+  capture to disk. This converted the largest reviewed-not-executed block in
+  the project into executed, and is what surfaced both bugs above.
+- **The last scene-unit constants are derived** — TSDF voxel/truncation/depth
+  cutoff and Poisson's normal radius. Scale-invariant where the constants were
+  not: the old `0.01` gives an empty mesh at 10x scale and 4.9x the error at
+  0.1x.
+- **`refine_mesh_photometric`** (Vu et al., TPAMI 2012) — vertices slide onto
+  the photoconsistent surface. Shipped opt-in with a measured break-even of
+  about a third of a source pixel and a ten-view floor.
+- **`level_set.py`** — GOF-style extraction. The extractor is measured against
+  analytic fields and the field adapter's arithmetic against closed form, both
+  on CPU; CUDA and a real checkpoint are not.
+- **`photometric_alignment.py` — a negative result, deliberately not shipped.**
+  Zhou & Koltun colour-map optimisation converges to an attractor regardless of
+  the starting error. The objective's minimum is measurably in the wrong place
+  (0.038 at the converged pose against 0.061 at ground truth), because one
+  colour per surface point cannot express how views legitimately differ. Two
+  tests pin the diagnosis so a future fix announces itself.
+
+**Executed:** 196 tests (153 at the start of these commits); every measurement
+quoted in `handoff/`; `extract_mesh.main()` end to end with the full delivery
+flag set, on the Poisson path, with `--refine_mesh`, and `--level_set_selftest`;
+`black --check`, `py_compile`, and an import of all three example scripts.
 
 ## 3. What has **not** been verified (sandbox limitations)
 

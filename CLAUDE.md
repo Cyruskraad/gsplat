@@ -4,11 +4,12 @@
 
 Ongoing work on this fork adds a `gsplat.photogrammetry` subpackage — SfM ->
 bundle adjustment -> dense MVS -> Gaussian-splat training -> mesh extraction ->
-cull -> decimate -> texture -> normal/AO maps, with AI-assisted priors and
-per-stage automatic quality metrics.
+photometric refinement -> cull -> decimate -> texture -> normal/AO maps, with
+AI-assisted priors, GOF-style level-set extraction, and per-stage automatic
+quality metrics.
 
 **Before continuing that work, read [`docs/handoff/README.md`](docs/handoff/README.md).**
-It indexes four short documents that together are the complete picture — scope,
+It indexes five short documents that together are the complete picture — scope,
 scaffolding, progress (including what was *executed* versus only *reviewed*),
 and the current issues. A new session should be able to read only those and
 continue immediately.
@@ -17,8 +18,11 @@ continue immediately.
 carefully.** Several of its entries are measurements that invert the obvious
 intuition — the success metric for per-face view selection is contrast, not
 error against ground truth, and the naive test fails. It also records a
-recurring testing failure worth knowing before you write a test here: four
-times, a test proved a mechanism worked while its call site went unpinned.
+recurring testing failure worth knowing before you write a test here: **six
+times**, a test proved a mechanism worked while its call site went unpinned —
+twice while building the most recent work, and both times the mechanism looked
+thoroughly tested. §5b-§5d also record three methods evaluated on measurement
+rather than expectation, one of which is deliberately *not* shipped.
 
 Longer-form background, for depth rather than orientation:
 [`docs/photogrammetry.md`](docs/photogrammetry.md) (how to *use* the pipeline),

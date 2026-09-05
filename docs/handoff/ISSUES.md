@@ -346,8 +346,16 @@ not just read it.
    MRF already labels mesh-wide; the work is making seam levelling run across
    page boundaries and the page bake honour labels. The most substantial
    remaining feature.
-6. Non-square atlases; multi-material chart grouping.
-7. **Refresh the PR body** (see §2).
-8. Tuning the defaults — `--texture_size` 2048, dilation 4 texels, normal-map
+6. **An optimality bound for the view-selection MRF.** ICM has none, and
+   alpha-expansion needs a max-flow solver `gsplat[mesh]` deliberately lacks.
+   TRW-S (Kolmogorov, TPAMI 2006) is pure NumPy and yields a *lower bound*, so
+   the pipeline could report an optimality gap instead of hoping.
+7. **A per-view appearance model** — per-view exposure/gain, and a
+   footprint-aware target (the surface colour convolved with *that view's*
+   pixel footprint rather than one point sample shared by all). This is the
+   gap that sank photometric camera alignment (§5b) and the same gap multi-view
+   super-resolution exists to close, so it would likely revive both at once.
+8. Non-square atlases; multi-material chart grouping.
+9. Tuning the defaults — `--texture_size` 2048, dilation 4 texels, normal-map
    cage 2% of the bbox diagonal. None has been tuned against a real scene, so
    this really wants #3 first.

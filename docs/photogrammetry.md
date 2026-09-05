@@ -555,6 +555,116 @@ point cloud of its own to reconstruct from. It writes mesh quality stats to
 `results/garden_2dgs/stats/mesh_step<step>.json`, next to `eval()`'s own
 `stats/val_step<step>.json` render-quality reports.
 
+### Texturing a mesh you already have (no GPU, no checkpoint)
+
+Only one step of the delivery path needs a GPU: rendering the depth maps TSDF
+fuses. Culling, decimation, texturing, normal and AO baking, and every metric
+are pure CPU. So `extract_mesh.py` takes three different inputs, and only the
+first needs a checkpoint:
+
+```bash
+# From a trained scene (GPU: renders depth, then fuses).
+python examples/extract_mesh.py --method tsdf --ckpt ckpt.pt --data_dir <data>
+
+# From a dense MVS cloud (CPU).
+python examples/extract_mesh.py --method poisson \
+    --dense_points <data>/dense/dense.ply --data_dir <data>
+
+# From a mesh you already have -- cull, decimate, texture and map it (CPU).
+python examples/extract_mesh.py --method mesh --mesh_path mine.ply \
+    --data_dir <data> --texture_mode atlas --cull_unobserved
+```
+
+**`--mesh_frame` matters and cannot be guessed.** A mesh from an external MVS
+tool is in the sparse model's raw COLMAP frame (`--mesh_frame colmap`, the
+default); a mesh this script produced itself from a checkpoint is already in
+the normalized frame the trainer used (`--mesh_frame normalized`). Getting it
+wrong does not fail loudly -- it textures the mesh from cameras that do not
+line up with it. If `--cull_unobserved` reports that most faces were seen by no
+view, that is what has happened.
+
+### A synthetic capture, for trying any of this without data
+
+`examples/make_synthetic_capture.py` writes a complete, multi-view-consistent
+`<data_dir>` to disk: `images/`, a real `sparse/0/` COLMAP model, a dense
+`.ply`, and the ground-truth mesh. The surface colour is a closed-form function
+of the 3D point, so every view agrees and a correct bake reproduces it exactly.
+
+```bash
+python examples/make_synthetic_capture.py --out_dir /tmp/capture
+python examples/extract_mesh.py --method mesh --mesh_path /tmp/capture/mesh_gt.ply \
+    --data_dir /tmp/capture --data_factor 1 --test_every 10000 \
+    --result_dir /tmp/out --texture_mode atlas --device cpu
+```
+
+`--pose_error_arcmin` perturbs the *reported* poses while leaving the renders
+untouched (exactly what residual SfM error looks like) and `--exposure` gives
+each view a constant offset, so the texturing options below can be exercised
+against the failure modes they exist for.
+
+### Reconstruction parameters are derived, not guessed
+
+`--voxel_size`, `--sdf_trunc`, `--depth_trunc` and `--poisson_normal_radius`
+are all optional. Left unset:
+
+- **A TSDF voxel becomes the world size of one source pixel at the depth it
+  observes.** Reconstructing finer invents detail no image supports; coarser
+  discards detail that was measured. `--sdf_trunc` becomes 4 voxels and
+  `--depth_trunc` is set just past the depths the maps actually contain.
+- **Poisson's normal radius becomes 5x the cloud's own k-nearest-neighbour
+  spacing** -- the measured knee past which open3d's neighbour cap binds anyway.
+
+A fixed value in scene units only ever suits one scene scale. Measured on an
+analytic sphere, the previous default of `0.01` gives the same fit as the
+derived value at the scale it was tuned for, an **empty mesh** at 10x that
+scale, and 4.9x the error at 0.1x. The chosen values are printed and recorded
+under `extraction` in `mesh_metrics.json`.
+
+### Refining the surface against the photographs
+
+TSDF and Poisson both put the surface wherever fusion put it. `--refine_mesh`
+slides each vertex along its normal onto the surface the photographs agree on
+(Vu et al., TPAMI 2012 -- what OpenMVS ships as `RefineMesh`), regularised by a
+Laplacian term. It runs before culling and decimation, so neither spends its
+budget on geometry that is about to move.
+
+It is **off by default**, and two numbers say when to turn it on:
+
+- **It pays above roughly a third of a source pixel of surface error, and
+  costs accuracy below that.** Input against output error, in source pixels:
+  `0.00 -> 0.15`, `0.24 -> 0.28`, `0.48 -> 0.39`, `0.95 -> 0.70`,
+  `1.91 -> 1.50`. The correction scales with the error; the cost is a roughly
+  fixed 0.15 px. Since a TSDF voxel is now one source pixel, a TSDF surface
+  starts out comfortably inside the regime where this pays.
+- **It wants about ten views, and the cliff is sharp**: recovering the same
+  0.95 px error, 8 views recovers 4-12%, 10 recovers 26.7%.
+
+The CLI reports the displacement it applied and the cross-view disagreement
+before and after, and warns if the disagreement failed to fall -- which means
+the surface moved without improving the fit.
+
+### Level-set extraction from the Gaussian field (experimental, GPU)
+
+`--method level_set` takes an iso-surface of the Gaussian opacity field
+directly (GOF-style; Yu et al., 2024) instead of fusing rendered depth.
+
+**This has never been run against a real checkpoint.** The extractor itself is
+measured against analytic fields -- watertight, correct area and volume,
+second-order convergence -- and the field adapter's arithmetic is verified on
+CPU against closed form, but neither has seen a real scene. Treat any result as
+unverified, and start here:
+
+```bash
+# Needs no GPU and no checkpoint. If this fails, the bug is in gsplat.
+python examples/extract_mesh.py --level_set_selftest
+```
+
+Then, on a real scene, read the residual it reports: it re-evaluates the field
+at the extracted surface's own vertices, so it says how faithful the mesh is to
+the field **without needing any ground truth**. Below one cell is expected.
+`--level_set_debug_dir` dumps the sampled field, coloured either side of the
+level, and the raw surface, for when something looks wrong.
+
 ### One-command end-to-end pipeline
 
 Steps 1-4 above (plus a baseline stats pass on the input SfM model, and
