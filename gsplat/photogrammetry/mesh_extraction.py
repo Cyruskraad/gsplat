@@ -369,6 +369,136 @@ def simplify_mesh(
     return simplified
 
 
+def _geometry_only_copy(mesh):
+    """A geometry-only copy, without vertex colours or UVs.
+
+    ``remove_triangles_by_mask`` mutates in place, so the caller's mesh has to
+    be left alone; and re-indexing vertices would silently invalidate any
+    ``triangle_uvs`` the mesh carried, so those are dropped rather than
+    quietly corrupted.
+    """
+    o3d = _require_open3d()
+
+    return o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(np.asarray(mesh.vertices).copy()),
+        o3d.utility.Vector3iVector(np.asarray(mesh.triangles).copy()),
+    )
+
+
+def cull_unobserved_faces(
+    mesh,
+    dataset,
+    max_views: Optional[int] = None,
+    min_views: int = 1,
+    clean: bool = True,
+):
+    """Remove faces no camera in ``dataset`` ever saw.
+
+    TSDF fusion returns a *closed* surface. That is what makes it watertight
+    and easy to work with, and it also means it invents geometry: the
+    underside of anything resting on the ground, the back of an object the
+    capture only circled halfway, the inner shell of a volume sealed off from
+    every camera. None of it was observed, so none of it can be textured --
+    those faces end up carrying the seam-dilation fill colour -- and all of it
+    is paid for in triangles, atlas area and file size.
+
+    Visibility comes from
+    :func:`gsplat.photogrammetry.texturing.face_visibility`, the same
+    projection-plus-occlusion test every bake uses. **Not** from
+    :func:`~gsplat.photogrammetry.texturing.face_view_quality` being zero:
+    quality is gradient energy, so a perfectly visible face on a flat
+    untextured surface also scores ~0, and culling on that would delete
+    observed geometry.
+
+    Run this **before** decimating and texturing: decimation should spend its
+    triangle budget on surface that will actually be seen, and the UV atlas
+    should not reserve area for faces that will never carry a colour. It is
+    also why this drops any existing vertex colours or UVs rather than trying
+    to carry them across the re-indexing -- at that point in the pipeline
+    there are none yet.
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``.
+        dataset: An ``examples.datasets.colmap.Dataset``-like object.
+        max_views: If given, only the first ``max_views`` images are consulted.
+            Note that a face seen only by a view outside that window is culled,
+            so this trades runtime for over-culling.
+        min_views: Keep a face only if at least this many views see it. Raising
+            it culls grazing, single-view geometry that is technically observed
+            but poorly constrained; 1 removes only the genuinely unseen.
+        clean: Also drop degenerate geometry and small floating components
+            afterwards (see :func:`_clean_mesh`). Culling routinely leaves
+            specks behind where a mostly-unseen region kept a few faces.
+
+    Returns:
+        ``(mesh, stats)`` -- a new mesh, and a dict with ``num_faces_before``/
+        ``num_faces_after``/``num_culled``/``fraction_culled``,
+        ``num_views_used``, ``min_views``, and ``observation_histogram``: how
+        many faces were seen by exactly 0, 1, 2, ... views, truncated at 8+.
+        The histogram is the diagnostic worth reading -- a big spike at 0 on a
+        capture that circled the subject means the poses or the scale are
+        wrong, not that the subject has a large unseen back.
+
+    Raises:
+        ValueError: If ``mesh`` has no triangles, ``min_views`` is not
+            positive, or *every* face would be culled. The last is not a
+            legitimate outcome to return quietly: it means the dataset and the
+            mesh do not describe the same scene (wrong poses, wrong scale, a
+            mesh in a different coordinate frame), and handing back an empty
+            mesh at the end of a long run would hide that.
+    """
+    from .texturing import face_visibility
+
+    _require_open3d()
+
+    if min_views <= 0:
+        raise ValueError(f"min_views must be positive, got {min_views}.")
+    if len(mesh.triangles) == 0:
+        raise ValueError("Cannot cull faces from a mesh with no triangles.")
+
+    visible = face_visibility(mesh, dataset, max_views=max_views)
+    counts = visible.sum(axis=1)
+    keep = counts >= min_views
+
+    histogram = np.bincount(np.minimum(counts, 8), minlength=9).tolist()
+    stats = {
+        "num_faces_before": int(len(mesh.triangles)),
+        "num_faces_after": int(len(mesh.triangles)),
+        "num_culled": 0,
+        "fraction_culled": 0.0,
+        "num_views_used": int(visible.shape[1]),
+        "min_views": int(min_views),
+        "observation_histogram": histogram,
+    }
+
+    if not keep.any():
+        raise ValueError(
+            f"Every one of the {len(mesh.triangles)} faces would be culled: no "
+            f"view among the {visible.shape[1]} consulted sees any of them. "
+            "That is a mismatch between the mesh and the dataset -- wrong "
+            "poses, wrong scale, or a mesh in a different coordinate frame -- "
+            "not a mesh with a large unseen back."
+        )
+
+    culled = mesh
+    if not keep.all():
+        culled = _geometry_only_copy(mesh)
+        culled.remove_triangles_by_mask(~keep)
+        culled.remove_unreferenced_vertices()
+        if clean:
+            culled = _clean_mesh(culled)
+        culled.compute_vertex_normals()
+
+    stats["num_faces_after"] = int(len(culled.triangles))
+    stats["num_culled"] = stats["num_faces_before"] - stats["num_faces_after"]
+    stats["fraction_culled"] = (
+        stats["num_culled"] / stats["num_faces_before"]
+        if stats["num_faces_before"]
+        else 0.0
+    )
+    return culled, stats
+
+
 def _point_spacing(points: np.ndarray, k: int = 4, max_samples: int = 20000) -> float:
     """Mean distance from a point to its ``k`` nearest neighbours in the cloud.
 
@@ -592,6 +722,7 @@ from .texturing import (  # noqa: E402,F401  (import placement is deliberate)
     bake_texture_atlas,
     bake_texture_atlas_view_selected,
     face_view_quality,
+    face_visibility,
     level_seams,
     select_views_mrf,
 )

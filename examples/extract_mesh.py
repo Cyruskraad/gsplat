@@ -48,6 +48,7 @@ from gsplat.photogrammetry.mesh_extraction import (
     bake_ambient_occlusion,
     bake_mesh_texture,
     bake_normal_map,
+    cull_unobserved_faces,
     extract_mesh_poisson,
     extract_mesh_tsdf,
     simplify_mesh,
@@ -148,6 +149,19 @@ class Config:
     # close the seam at all. 0 disables levelling, which is only useful for
     # measuring what it was doing.
     texture_seam_smoothness: float = 0.1
+    # Remove faces no training camera ever saw before decimating and
+    # texturing. TSDF fusion returns a *closed* surface, so it invents the
+    # underside of anything resting on the ground and the back of anything the
+    # capture only circled halfway; none of it can be textured (those faces
+    # carry the seam-dilation fill colour) and all of it costs triangles and
+    # atlas area. Writes an observation histogram into mesh_metrics.json --
+    # a large spike at "seen by 0 views" on a capture that circled the subject
+    # means the poses or the scale are wrong, not that the back is unseen.
+    cull_unobserved: bool = False
+    # Keep a face only if at least this many views see it (--cull_unobserved
+    # only). Above 1 this also culls grazing, single-view geometry that is
+    # technically observed but poorly constrained.
+    cull_min_views: int = 1
     # Decimate the extracted mesh to roughly this many triangles before
     # texturing (quadric error metrics). TSDF/Poisson output is tessellated to
     # the voxel grid rather than to the scene's complexity, so this is usually
@@ -238,6 +252,45 @@ def main(cfg: Config) -> None:
             "into an atlas, so it requires --texture_mode atlas. Per-vertex "
             "colors have nothing to select a view for."
         )
+
+    # Cull before decimating: the triangle budget should be spent on surface
+    # that will actually be seen, and the atlas should not reserve area for
+    # faces that can never carry a colour.
+    cull_stats = None
+    if cfg.cull_unobserved:
+        if not cfg.bake_texture_:
+            raise ValueError(
+                "--cull_unobserved decides what to keep from the training "
+                "views, so it needs the dataset that --no-bake_texture_ opts "
+                "out of. Drop one of the two."
+            )
+        if len(mesh.triangles) == 0:
+            print(
+                "[extract_mesh] WARNING: nothing to cull -- the extracted mesh "
+                "has no triangles."
+            )
+        else:
+            mesh, cull_stats = cull_unobserved_faces(
+                mesh, dataset, min_views=cfg.cull_min_views
+            )
+            print(
+                f"[extract_mesh] culled {cull_stats['num_culled']} of "
+                f"{cull_stats['num_faces_before']} faces "
+                f"({cull_stats['fraction_culled']:.1%}) that fewer than "
+                f"{cfg.cull_min_views} of {cull_stats['num_views_used']} views "
+                "could see"
+            )
+            unseen = cull_stats["observation_histogram"][0]
+            if unseen > 0.5 * cull_stats["num_faces_before"]:
+                warnings.warn(
+                    f"{unseen} of {cull_stats['num_faces_before']} faces were "
+                    "seen by no view at all. On a capture that circled the "
+                    "subject that usually means the poses or the scale are "
+                    "wrong rather than that the subject has a large unseen "
+                    "back -- check the mesh against the cameras before "
+                    "shipping this.",
+                    RuntimeWarning,
+                )
 
     if cfg.target_triangles is not None and cfg.target_fit_ratio is not None:
         raise ValueError(
@@ -473,6 +526,8 @@ def main(cfg: Config) -> None:
         print(f"[extract_mesh] wrote {ao_path}")
 
     stats = mesh_quality_stats(mesh)
+    if cull_stats is not None:
+        stats["culling"] = cull_stats
     if decimation_stats is not None:
         stats["decimation"] = decimation_stats
     if normal_map_stats is not None:

@@ -271,6 +271,41 @@ the global optimum; it is run from several seeds (the per-face best, and
 greedy sweep is badly seed-dependent under a strong seam penalty. The
 practical gap is a few extra seams.
 
+#### Culling geometry no camera saw
+
+TSDF fusion returns a **closed** surface. That is what makes it watertight and
+easy to work with, and it also means it invents geometry: the underside of
+anything resting on the ground, the back of an object the capture only circled
+halfway, the inner shell of a volume sealed off from every camera. None of it
+was observed, so none of it can be textured — those faces end up carrying the
+seam-dilation fill colour — and all of it is paid for in triangles, atlas area
+and file size.
+
+`--cull_unobserved` removes it, before decimating and texturing, so the
+triangle budget is spent on surface that will be seen and the atlas reserves no
+area for faces that can never carry a colour:
+
+```bash
+python examples/extract_mesh.py --ckpt ... --data_dir ... --result_dir ...     --cull_unobserved --texture_mode atlas --target_fit_ratio 1.0 --normal_map
+```
+
+`--cull_min_views` raises the bar above "seen at all", which also drops
+grazing, single-view geometry that is technically observed but poorly
+constrained. The `culling` block in `mesh_metrics.json` reports an
+**observation histogram** — how many faces were seen by 0, 1, 2, … views. That
+is the number to read: a large spike at 0 on a capture that circled its subject
+means the poses or the scale are wrong, not that the subject has a large unseen
+back, and the CLI warns when more than half the faces fall there.
+
+Visibility here is the same projection-plus-occlusion test every bake uses, via
+`face_visibility`. It is deliberately **not** `face_view_quality() == 0`, and
+the difference is not academic: quality is *gradient energy*, so a face on a
+flat untextured surface — a painted wall, a clear sky — scores zero however
+plainly it is in view. Measured on a flat-shaded sphere, 12 of 224 faces score
+zero from every view while every camera sees them; a cull rewritten to reuse
+the quality matrix would delete surface out of the middle of an observed
+object. Both the distinction and its consequence are pinned by tests.
+
 #### Decimation + normal maps (the delivery path)
 
 TSDF and Poisson extraction tessellate to the voxel grid, not to the scene's
@@ -797,6 +832,12 @@ something gsplat ships.
   `mean_ao`/`min_ao` and the `cage`/`max_distance` used. A `mean_ao` of
   essentially 1.0 means nothing occluded anything — correct for a convex
   shape, and otherwise a sign the occlusion distance is too small.
+- `gsplat.photogrammetry.cull_unobserved_faces(mesh, dataset, min_views=1)`
+  returns `(mesh, stats)` with the unobserved faces removed and an observation
+  histogram; `face_visibility(mesh, dataset)` returns the raw `(F, V)` bool
+  matrix behind it. It never mutates the mesh you pass, and raises rather than
+  returning an empty one if *every* face would go — that means the mesh and the
+  dataset don't describe the same scene.
 - `gsplat.photogrammetry.simplify_mesh(mesh, target_triangles=...)` returns a
   quadric-decimated copy, and
   `simplify_mesh_to_error(mesh, points, error_over_spacing=...)` returns

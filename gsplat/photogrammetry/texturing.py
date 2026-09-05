@@ -1252,6 +1252,58 @@ def _box_means(table: np.ndarray, x0, y0, x1, y1) -> np.ndarray:
     return np.maximum(total / area, 0.0)
 
 
+def face_visibility(mesh, dataset, max_views: Optional[int] = None) -> np.ndarray:
+    """Which views can actually see each face, as an ``(F, V)`` bool array.
+
+    A face counts as visible from a view when its centroid projects inside that
+    image, faces towards it, and the ray from the camera reaches it without
+    hitting other geometry first -- the same test every bake in this module
+    uses for a *point*, applied to face centroids, so "visible" means one thing
+    across the module rather than three subtly different things.
+
+    **This is not the same question as :func:`face_view_quality` being
+    non-zero**, and conflating them deletes real geometry. Quality is gradient
+    energy over the projection, so a face that is perfectly visible on a flat,
+    untextured surface -- a painted wall, a clear sky reflection -- scores
+    ~0 because there is no detail there to measure, not because no camera saw
+    it. Anything deciding whether a face was *observed* must ask this.
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``.
+        dataset: An ``examples.datasets.colmap.Dataset``-like object.
+        max_views: If given, only the first ``max_views`` images are consulted.
+
+    Returns:
+        ``(F, V)`` bool array.
+
+    Raises:
+        ValueError: If ``mesh`` has no triangles.
+    """
+    o3d = _require_open3d()
+
+    triangles = np.asarray(mesh.triangles)
+    vertices = np.asarray(mesh.vertices)
+    if len(triangles) == 0:
+        raise ValueError("Cannot compute face visibility for a mesh with no triangles.")
+
+    centroids = vertices[triangles].mean(axis=1)
+    face_normals = np.asarray(
+        mesh.triangle_normals
+        if mesh.has_triangle_normals()
+        else mesh.compute_triangle_normals().triangle_normals
+    )
+    num_views = len(dataset) if max_views is None else min(max_views, len(dataset))
+
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+    visible = np.zeros((len(triangles), num_views), dtype=bool)
+    for chunk, _colors, _weights, view_index in _view_samples(
+        scene, o3d, dataset, centroids, face_normals, max_views, 1 << 20
+    ):
+        visible[chunk, view_index] = True
+    return visible
+
+
 def face_view_quality(mesh, dataset, max_views: Optional[int] = None):
     """Score how well each view could texture each face.
 
@@ -1275,8 +1327,6 @@ def face_view_quality(mesh, dataset, max_views: Optional[int] = None):
         ``(F, V)`` float array. Zero means the view cannot texture that face at
         all -- occluded, out of frame, or facing away.
     """
-    o3d = _require_open3d()
-
     if not mesh.has_vertex_normals():
         mesh.compute_vertex_normals()
     triangles = np.asarray(mesh.triangles)
@@ -1284,24 +1334,11 @@ def face_view_quality(mesh, dataset, max_views: Optional[int] = None):
     if len(triangles) == 0:
         raise ValueError("Cannot score views for a mesh with no triangles.")
 
-    centroids = vertices[triangles].mean(axis=1)
-    face_normals = np.asarray(
-        mesh.triangle_normals
-        if mesh.has_triangle_normals()
-        else mesh.compute_triangle_normals().triangle_normals
-    )
-
     num_views = len(dataset) if max_views is None else min(max_views, len(dataset))
     quality = np.zeros((len(triangles), num_views), dtype=np.float64)
 
     # Visibility, from the same ray cast the blended bakes use.
-    scene = o3d.t.geometry.RaycastingScene()
-    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
-    visible = np.zeros((len(triangles), num_views), dtype=bool)
-    for chunk, _colors, _weights, view_index in _view_samples(
-        scene, o3d, dataset, centroids, face_normals, max_views, 1 << 20
-    ):
-        visible[chunk, view_index] = True
+    visible = face_visibility(mesh, dataset, max_views=max_views)
 
     # 3D face area, the part of the projected area that doesn't depend on view.
     edge1 = vertices[triangles[:, 1]] - vertices[triangles[:, 0]]

@@ -1165,3 +1165,199 @@ def test_simplify_to_error_rejects_ambiguous_or_unmeasurable_input():
         simplify_mesh_to_error(mesh, np.zeros((0, 3)), max_error=0.1)
     with pytest.raises(ValueError, match="no triangles"):
         simplify_mesh_to_error(o3d.geometry.TriangleMesh(), points, max_error=0.1)
+
+
+# ---------------------------------------------------------------------------
+# Culling geometry no camera observed
+# ---------------------------------------------------------------------------
+
+
+def _nested_spheres(resolution=10, inner_radius=0.4):
+    """An outer shell with a second shell sealed inside it.
+
+    Ground truth that needs no renderer: no camera outside the outer sphere can
+    see *any* face of the inner one, and every face of the outer one is seen
+    from somewhere. The inner sphere's faces are the last block of triangles,
+    which is what makes "was exactly the right set removed?" answerable.
+    """
+    o3d = pytest.importorskip("open3d")
+
+    outer = o3d.geometry.TriangleMesh.create_sphere(radius=1.0, resolution=resolution)
+    inner = o3d.geometry.TriangleMesh.create_sphere(
+        radius=inner_radius, resolution=resolution
+    )
+    combined = outer + inner
+    combined.compute_vertex_normals()
+    return combined, len(outer.triangles), len(inner.triangles)
+
+
+def test_cull_removes_exactly_the_geometry_no_camera_can_see():
+    """Both directions matter, and the false-positive one matters more.
+
+    Leaving unseen geometry behind wastes triangles; culling *observed*
+    geometry destroys the asset. This checks the sealed inner shell is entirely
+    gone and the outer shell is entirely intact.
+    """
+    from gsplat.photogrammetry.mesh_extraction import cull_unobserved_faces
+
+    mesh, num_outer, num_inner = _nested_spheres()
+    dataset = _SphereDataset(num_views=16)
+
+    culled, stats = cull_unobserved_faces(mesh, dataset, clean=False)
+
+    # Premise: the inner shell really is invisible from every view, and the
+    # outer shell really is visible. Without this the assertions below could
+    # pass on a scene where there was nothing to cull.
+    assert stats["observation_histogram"][0] == num_inner, stats[
+        "observation_histogram"
+    ]
+
+    assert stats["num_faces_before"] == num_outer + num_inner
+    assert stats["num_culled"] == num_inner
+    assert stats["num_faces_after"] == num_outer
+    assert stats["fraction_culled"] == pytest.approx(
+        num_inner / (num_outer + num_inner)
+    )
+
+    # And the survivors are the outer shell specifically, not merely the right
+    # *number* of faces: every remaining centroid sits out near radius 1.
+    vertices = np.asarray(culled.vertices)
+    centroid_radii = np.linalg.norm(vertices[np.asarray(culled.triangles)].mean(1), 1)
+    assert centroid_radii.min() > 0.9, centroid_radii.min()
+
+
+def test_cull_does_not_mutate_the_caller_s_mesh():
+    """`remove_triangles_by_mask` is in-place; the input must survive it.
+
+    The pipeline keeps the pre-cull mesh around -- it is what `bake_normal_map`
+    takes its detail from -- so quietly emptying it would break the delivery
+    path in a way no assertion about the *returned* mesh would catch.
+    """
+    from gsplat.photogrammetry.mesh_extraction import cull_unobserved_faces
+
+    mesh, num_outer, num_inner = _nested_spheres(resolution=6)
+    before = len(mesh.triangles)
+
+    culled, _ = cull_unobserved_faces(mesh, _SphereDataset(num_views=8), clean=False)
+
+    assert len(mesh.triangles) == before
+    assert len(culled.triangles) < before
+
+
+def test_cull_is_monotone_in_min_views():
+    """Demanding more views can only remove more faces."""
+    from gsplat.photogrammetry.mesh_extraction import cull_unobserved_faces
+
+    mesh, _, _ = _nested_spheres(resolution=8)
+    dataset = _SphereDataset(num_views=8)
+
+    counts = [
+        cull_unobserved_faces(mesh, dataset, min_views=n, clean=False)[1][
+            "num_faces_after"
+        ]
+        for n in (1, 3, 4)
+    ]
+    assert counts == sorted(counts, reverse=True), counts
+    # Premise: the thresholds must actually separate, or this is vacuous.
+    # Measured on this scene: 224 faces survive min_views=1, 172 survive 3,
+    # and 33 survive 4 -- every outer face is seen by 2 to 4 of the 8 views.
+    assert counts[0] > counts[-1], counts
+
+    # Past that the guard takes over rather than returning an empty mesh: no
+    # face here is seen by 5 views, so demanding 5 has no solution.
+    with pytest.raises(ValueError, match="Every one of the"):
+        cull_unobserved_faces(mesh, dataset, min_views=5, clean=False)
+
+
+def test_cull_refuses_to_empty_the_mesh():
+    """Culling *everything* means the mesh and the dataset disagree.
+
+    Wrong poses, wrong scale, or a mesh in another coordinate frame -- not a
+    subject with a large unseen back. Returning an empty mesh at the end of a
+    long run would hide exactly that.
+    """
+    o3d = pytest.importorskip("open3d")
+
+    from gsplat.photogrammetry.mesh_extraction import cull_unobserved_faces
+
+    far = o3d.geometry.TriangleMesh.create_sphere(radius=1.0, resolution=6)
+    far.translate((100.0, 100.0, 100.0))
+    far.compute_vertex_normals()
+
+    with pytest.raises(ValueError, match="Every one of the"):
+        cull_unobserved_faces(far, _SphereDataset(num_views=6))
+
+
+def test_cull_rejects_bad_arguments():
+    o3d = pytest.importorskip("open3d")
+
+    from gsplat.photogrammetry.mesh_extraction import cull_unobserved_faces
+
+    mesh = _unit_sphere_mesh(resolution=6)
+    dataset = _SphereDataset(num_views=4)
+    with pytest.raises(ValueError, match="min_views must be positive"):
+        cull_unobserved_faces(mesh, dataset, min_views=0)
+    with pytest.raises(ValueError, match="no triangles"):
+        cull_unobserved_faces(o3d.geometry.TriangleMesh(), dataset)
+
+
+def test_visibility_is_not_the_same_question_as_quality():
+    """The distinction culling rests on, measured rather than asserted.
+
+    `face_view_quality` is gradient energy over the projection, so a face on a
+    *flat* surface scores ~0 however plainly it is in view -- there is no
+    detail there to measure. Culling on `quality == 0` would therefore delete
+    geometry every camera saw. This pins that the two disagree, and by how
+    much, so nobody later "simplifies" the cull to reuse the quality matrix.
+    """
+    from gsplat.photogrammetry.texturing import face_view_quality, face_visibility
+
+    flat = lambda points: np.full(np.asarray(points).shape, 0.6)  # noqa: E731
+    mesh = _unit_sphere_mesh(resolution=8)
+    dataset = _SphereDataset(num_views=8, pattern=flat)
+
+    visible = face_visibility(mesh, dataset)
+    quality = face_view_quality(mesh, dataset)
+
+    # Every face of this sphere is seen from somewhere, by 8 views around it.
+    assert visible.any(axis=1).all()
+    # A third of the (face, view) pairs that *are* visible score exactly zero,
+    # because the surface they see carries no gradient. Measured: 215 of 653.
+    visible_but_zero = int((visible & (quality == 0)).sum())
+    assert visible_but_zero > 0.25 * int(visible.sum()), (
+        visible_but_zero,
+        int(visible.sum()),
+    )
+    # And the set that matters: faces scoring zero from *every* view, which a
+    # quality-based cull would destroy outright despite every camera seeing
+    # them. Measured: 12 of 224.
+    would_be_lost = int((visible.any(axis=1) & (quality.max(axis=1) == 0)).sum())
+    assert would_be_lost > 0, "flat scene should leave some faces scoring zero"
+
+
+def test_cull_keeps_observed_faces_on_a_flat_untextured_surface():
+    """The trap from `test_visibility_is_not_the_same_question_as_quality`,
+    pinned where it would actually do damage.
+
+    That test shows the visibility and quality matrices disagree. This one
+    shows the *cull* must consult the right one: on a flat scene 12 of these
+    224 faces score zero quality from every view despite every camera seeing
+    them, so a cull rewritten to reuse the quality matrix silently deletes
+    surface off the middle of an observed object.
+    """
+    from gsplat.photogrammetry.mesh_extraction import cull_unobserved_faces
+    from gsplat.photogrammetry.texturing import face_view_quality
+
+    flat = lambda points: np.full(np.asarray(points).shape, 0.6)  # noqa: E731
+    mesh = _unit_sphere_mesh(resolution=8)
+    dataset = _SphereDataset(num_views=8, pattern=flat)
+
+    # Premise: quality-based culling really would destroy faces here.
+    quality = face_view_quality(mesh, dataset)
+    at_risk = int((quality.max(axis=1) == 0).sum())
+    assert at_risk > 0, "flat scene should leave faces scoring zero everywhere"
+
+    culled, stats = cull_unobserved_faces(mesh, dataset, clean=False)
+    assert stats["num_culled"] == 0, (stats, at_risk)
+    assert stats["observation_histogram"][0] == 0
+    assert len(culled.triangles) == len(mesh.triangles)

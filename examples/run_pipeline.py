@@ -116,6 +116,10 @@ class Config:
     # view that sees it -- sharper, but pointwise less accurate, and it
     # requires --texture_mode atlas. See examples/extract_mesh.py.
     texture_view_selection: bool = False
+    # Remove faces no training camera ever saw before decimating and texturing.
+    # TSDF fusion returns a closed surface, so it invents the underside and the
+    # unvisited back of the subject. See examples/extract_mesh.py.
+    cull_unobserved: bool = False
     # Torch device for the GPU stages.
     device: str = "cuda"
     # Print each stage's command without running anything.
@@ -401,6 +405,8 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                 ]
                 if cfg.texture_view_selection:
                     cmd += ["--texture_view_selection"]
+                if cfg.cull_unobserved:
+                    cmd += ["--cull_unobserved"]
                 _run(cmd, cfg.dry_run)
                 if not cfg.dry_run:
                     mesh_stats = (

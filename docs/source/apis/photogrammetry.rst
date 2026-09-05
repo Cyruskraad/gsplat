@@ -29,8 +29,8 @@ Mesh Extraction
 ------------------
 
 .. automodule:: gsplat.photogrammetry.mesh_extraction
-   :members: extract_mesh_tsdf, extract_mesh_poisson, simplify_mesh,
-             simplify_mesh_to_error
+   :members: extract_mesh_tsdf, extract_mesh_poisson, cull_unobserved_faces,
+             simplify_mesh, simplify_mesh_to_error
 
 Texturing
 ------------------
@@ -38,7 +38,8 @@ Texturing
 .. automodule:: gsplat.photogrammetry.texturing
    :members: bake_texture, bake_texture_atlas,
              bake_texture_atlas_view_selected, bake_mesh_texture,
-             face_view_quality, select_views_mrf, level_seams,
+             face_view_quality, face_visibility, select_views_mrf,
+             level_seams,
              bake_normal_map, bake_ambient_occlusion
 
 Neural SfM Import

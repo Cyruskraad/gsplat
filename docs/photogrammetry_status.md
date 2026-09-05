@@ -22,7 +22,7 @@
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
        tests/test_texturing.py tests/test_extract_mesh_io.py -q
    ```
-   Expect **130 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **137 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Before touching the texturing code**, read
    [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md). All
@@ -242,14 +242,14 @@ that surfaced them is (sixth §2.4, seventh §2.2, eighth/ninth §2.3, tenth
 | Test file | Count | Covers |
 |---|---|---|
 | `tests/test_bundle_adjustment.py` | 3 | Pure-torch optimization core (no pycolmap needed) |
-| `tests/test_mesh_extraction.py` | 29 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9); decimation to a fit target, with the k-NN spacing checked against a grid of known pitch (see §2.13) |
+| `tests/test_mesh_extraction.py` | 36 | TSDF fusion + Poisson reconstruction against an analytic sphere; UV-atlas texture baking against an analytically-shaded sphere (see §2.9); decimation to a fit target, with the k-NN spacing checked against a grid of known pitch (see §2.13); culling geometry no camera saw, against a sealed inner shell whose correct answer is known by construction (see §2.16) |
 | `tests/test_neural_sfm.py` | 4 | Track merging correctness/non-chaining, COLMAP round-trip, composition with bundle adjustment |
 | `tests/test_colmap_dataset.py` | 13 | `Parser`/`Dataset` overrides, `mono_depth_dir` and `mask_dir` alignment (including under real lens distortion and patch cropping), fisheye-ROI combination |
 | `tests/test_photogrammetry_metrics.py` | 14 | Geometry metrics against known analytic ground truth, plus `atlas_sharpness` (detail ordering, chart-border exclusion, empty/uint8 handling) |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
 | `tests/test_extract_mesh_io.py` | 5 | Texture-map writing: the 16-bit RGB PNG round trip (and the BGR channel reversal it depends on), and that 16 bits recovers normal detail 8 bits cannot |
 | `tests/test_texturing.py` | 29 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12; and seam levelling — the conjugate-gradient solver against a dense solve, shared-edge recovery, and that levelling closes the exposure steps without introducing a colour cast |
-| **Total** | **130** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| **Total** | **137** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -388,6 +388,63 @@ a test. Seam discontinuity on the shipped asset: 0.262 → 0.090.
 **Reviewed only:** the `--texture_view_selection` /
 `--texture_seam_smoothness` CLI guards and warnings, which need a real
 checkpoint to reach.
+
+### 2.16 Culling geometry no camera observed
+
+TSDF fusion returns a **closed** surface. That is what makes it watertight, and
+it also means it invents geometry: the underside of anything resting on the
+ground, the back of an object the capture only circled halfway, the inner shell
+of a volume sealed off from every camera. None of it can be textured — those
+faces carry the seam-dilation fill colour — and all of it costs triangles,
+atlas area and file size. `cull_unobserved_faces` / `--cull_unobserved`
+removes it, before decimation and texturing so neither spends its budget on
+surface that will never be seen.
+
+**Ground truth for the test needs no renderer:** a mesh built as an outer shell
+plus a second shell sealed inside it. No camera outside can see any face of the
+inner one, every face of the outer one is seen from somewhere, and the inner
+faces are a known block of triangle indices — so "was exactly the right set
+removed?" is answerable both ways. Measured: 360 of 720 faces culled, every
+survivor's centroid out at radius > 0.9, and an observation histogram showing
+exactly 360 faces seen by zero views.
+
+**The subtle part is which question visibility asks.** It is deliberately *not*
+`face_view_quality() == 0`. Quality is gradient energy over the projection, so
+a face on a flat untextured surface scores zero however plainly it is in view —
+there is no detail there to measure. Measured on a flat-shaded sphere: 215 of
+653 visible (face, view) pairs score exactly zero, and **12 of 224 faces score
+zero from every view while every camera sees them**. A cull reusing the quality
+matrix deletes surface out of the middle of an observed object. `face_visibility`
+was split out of `face_view_quality` for this, and both the matrix-level
+distinction and its consequence at the call site are pinned by tests.
+
+That second test exists because the first round of mutation checking **missed
+this**: swapping the implementation to `quality > 0` passed the whole suite,
+because the nested-spheres scene is textured and the two agree there. The
+matrix-level test proved the two differ; nothing pinned the *cull* consulting
+the right one until a flat-scene culling test was added.
+
+Culling everything **raises** rather than returning an empty mesh: that means
+the mesh and the dataset do not describe the same scene (wrong poses, wrong
+scale, a different coordinate frame), and handing back an empty mesh at the end
+of a long run would hide it. The CLI also warns when more than half the faces
+were seen by no view at all.
+
+**Executed:** the measurements above; the full delivery path end to end on CPU
+(6960 faces → 3480 culled → 112 after fit-target decimation → view-selected and
+seam-levelled albedo + 16-bit normal map + AO on one shared UV layout,
+OBJ/MTL/PNGs written and read back). Four mutations checked (cull on quality
+instead of visibility, mutate the caller's mesh in place, invert the keep mask,
+drop the cull-everything guard) — each fails a test. **Reviewed only:** the
+`--cull_unobserved` CLI guard and its histogram warning, which need a real
+checkpoint to reach.
+
+A bug caught in the CLI while wiring it, worth noting because `--help` is the
+only place it shows: inserting the two new fields *above* `target_triangles`
+left that field's docstring comment attached to `--cull_unobserved` and
+`--target_triangles` with none at all. tyro takes the comment block immediately
+above a field as its help, so field order and comment order have to move
+together.
 
 ### 2.15 Bilinear source-image sampling
 

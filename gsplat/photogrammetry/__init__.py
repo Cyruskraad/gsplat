@@ -55,6 +55,7 @@ requires the ``colmap`` command-line tool (built with CUDA support) on
 from .bundle_adjustment import refine_reconstruction
 from .dense_mvs import run_dense_mvs
 from .mesh_extraction import (
+    cull_unobserved_faces,
     extract_mesh_poisson,
     extract_mesh_tsdf,
     simplify_mesh,
@@ -80,6 +81,7 @@ from .texturing import (
     bake_texture_atlas,
     bake_texture_atlas_view_selected,
     face_view_quality,
+    face_visibility,
     level_seams,
     select_views_mrf,
 )
@@ -105,6 +107,7 @@ __all__ = [
     "bake_texture_atlas_view_selected",
     "bake_mesh_texture",
     "face_view_quality",
+    "face_visibility",
     "select_views_mrf",
     "level_seams",
     "NO_VIEW",
@@ -112,6 +115,7 @@ __all__ = [
     "bake_ambient_occlusion",
     "simplify_mesh",
     "simplify_mesh_to_error",
+    "cull_unobserved_faces",
     "merge_point_maps_to_tracks",
     "write_colmap_reconstruction",
     "point_to_mesh_distance",
