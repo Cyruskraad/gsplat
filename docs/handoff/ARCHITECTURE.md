@@ -16,6 +16,7 @@ Everything below is new on this branch unless marked *(modified)*.
 | `neural_sfm.py` | 299 | Adapter for externally-run DUSt3R/MASt3R/VGGT-style tools |
 | `__init__.py` | 146 | Re-exports; 41 public names |
 | `dense_mvs.py` | 138 | Shells out to the `colmap` CLI for patch-match stereo + fusion |
+| `photometric_alignment.py` | 400 | **Not exported.** A retained negative result — see `ISSUES.md` §5b |
 | `_open3d.py` | 31 | The shared `_require_open3d()` guard, so extraction and texturing need not depend on each other |
 
 ### CLIs — `examples/` (1,434 lines)
@@ -34,7 +35,7 @@ Also modified: `examples/simple_trainer_2dgs.py` (`--extract_mesh`,
 (`mono_depth_dir`, `mask_dir`), `.github/workflows/core_tests.yml` (installs
 the suite's deps).
 
-### Tests — 161 across 9 files
+### Tests — 163 across 10 files
 
 | File | Tests | Lines |
 |---|---:|---:|
@@ -45,6 +46,7 @@ the suite's deps).
 | `tests/test_colmap_dataset.py` | 13 | 568 |
 | `tests/test_extract_mesh_io.py` | 5 | 152 |
 | `tests/test_extract_mesh_cli.py` | 8 | 420 |
+| `tests/test_photometric_alignment.py` | 2 | 180 |
 | `tests/test_neural_sfm.py` | 4 | 243 |
 | `tests/test_bundle_adjustment.py` | 3 | 166 |
 

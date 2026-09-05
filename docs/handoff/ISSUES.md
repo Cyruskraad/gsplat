@@ -191,6 +191,46 @@ Two more testing notes from experience here:
   Poisson's Delaunay step. `make_synthetic_capture.py` adds radial noise by
   default, which is also what a real MVS cloud looks like.
 
+## 5b. Photometric pose refinement does not work here (measured)
+
+Zhou & Koltun colour-map optimisation was implemented in
+`gsplat/photogrammetry/photometric_alignment.py` and **does not work well
+enough to ship**. It is deliberately not exported and not on any CLI. The
+module docstring carries the full trail; the short version:
+
+- It converges to a scene-dependent **attractor of ~5-25 arcminutes regardless
+  of the starting error**, including from exactly correct poses. It helps when
+  poses are worse than that floor and harms when they are better. No
+  regularisation weight both preserves correct poses and recovers a large error.
+- **The objective's minimum is in the wrong place**, which is the finding.
+  Scored with the fused colour re-estimated at each pose, the converged pose
+  reaches **0.038** against **0.061 at the ground truth**. The optimiser is
+  correct; the formulation is not.
+- The cause is the appearance model: one colour per surface point cannot
+  express how views legitimately differ (pixel footprint, obliquity, the mesh's
+  own faceting inside a pixel). That difference is already 0.061 at the truth
+  and is *reducible* by moving cameras, so the bias exceeds the error corrected.
+- open3d ships this as `pipelines.color_map.run_rigid_optimizer` and is worse:
+  it degraded pose error in every configuration tried, and **given perfect
+  poses moved them to 223'**.
+
+Ruled out by measurement, not argument: the optimiser (Adam random-walks
+proportional to its learning rate; L-BFGS with a line search does not, and the
+attractor stayed), the image pyramid (present at one level), the fixture's
+tessellation (a *finer* mesh is worse), texture periodicity (a non-periodic
+field is worse), out-of-frame clamping and a target/residual scale mismatch
+(both were real bugs, both fixed, neither was the cause).
+
+**What would fix it:** a per-view appearance term, so a legitimate difference
+between views is explained rather than blamed on the pose -- per-view
+exposure/gain, and a footprint-aware target (the surface colour convolved with
+*that view's* pixel footprint rather than one point sample shared by all). That
+is the same modelling gap multi-view super-resolution exists to close, so do
+that first and revisit this after.
+
+`tests/test_photometric_alignment.py` pins both claims, so a future fix fails
+the tests loudly instead of the finding rotting into folklore.
+
 ## 6. What to do next
 
 Ordered by value.
