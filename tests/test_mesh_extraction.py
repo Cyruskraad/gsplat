@@ -1583,3 +1583,216 @@ def test_a_fixed_normal_radius_returns_noise_on_a_rescaled_cloud():
     assert alignment(scaled, 0.1) < 0.6
     # The derived radius is unaffected.
     assert alignment(scaled, derived_radius) > 0.99
+
+
+# ---------------------------------------------------------------------------
+# Photometric mesh refinement
+# ---------------------------------------------------------------------------
+
+
+def _mesh_views(mesh, num_views=10, width=96):
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    for path in (str(root / "examples"), str(root / "tests")):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+    from test_photometric_alignment import _MeshViews
+
+    return _MeshViews(mesh, num_views=num_views, width=width)
+
+
+def _radially_perturbed(scale, resolution=16, seed=0):
+    """A sphere whose vertices are pushed off radius 1 by known noise."""
+    o3d = pytest.importorskip("open3d")
+
+    rng = np.random.default_rng(seed)
+    mesh = _unit_sphere_mesh(resolution=resolution)
+    vertices = np.asarray(mesh.vertices).copy()
+    outward = vertices / np.linalg.norm(vertices, axis=1, keepdims=True)
+    noise = rng.normal(scale=scale, size=len(vertices))
+    mesh.vertices = o3d.utility.Vector3dVector(vertices + noise[:, None] * outward)
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+def _mean_radial_error(mesh):
+    """Distance from radius 1, against the analytic sphere -- not a reference
+    implementation."""
+    vertices = np.asarray(mesh.vertices)
+    return float(np.abs(np.linalg.norm(vertices, axis=1) - 1.0).mean())
+
+
+def test_refinement_pulls_perturbed_vertices_back_toward_the_true_surface():
+    """Nothing else in this package moves a vertex to fit the photographs.
+
+    Every other geometry lever is upstream (bundle adjustment, dense MVS, 2DGS
+    depth) or subtractive (culling, decimation). This is the refinement stage
+    OpenMVS ships as `RefineMesh`.
+
+    Measured against the *analytic* sphere: mean radial error 0.0244 -> 0.0125,
+    photoconsistency 0.0985 -> 0.0251, and the cloud-to-mesh fit against the
+    unperturbed vertices 0.0207 -> 0.0094.
+    """
+    from gsplat.photogrammetry.mesh_extraction import refine_mesh_photometric
+
+    truth = _unit_sphere_mesh(resolution=16)
+    dataset = _mesh_views(truth)
+    perturbed = _radially_perturbed(0.03)
+
+    before = _mean_radial_error(perturbed)
+    # Premise: the injected noise has to be measurable, or this is vacuous.
+    assert before > 0.015, before
+
+    refined, stats = refine_mesh_photometric(
+        perturbed, dataset, reference_points=np.asarray(truth.vertices)
+    )
+
+    after = _mean_radial_error(refined)
+    # Measured 1.95x. Deciding visibility per candidate instead of once at the
+    # surface degrades this to 1.55x, so the margin is what detects it.
+    assert after < before / 1.7, (before, after)
+    assert (
+        stats["mean_photoconsistency_after"]
+        < 0.5 * stats["mean_photoconsistency_before"]
+    )
+    assert (
+        stats["point_to_mesh_after"]["mean"] < stats["point_to_mesh_before"]["mean"]
+    ), (stats["point_to_mesh_before"], stats["point_to_mesh_after"])
+
+
+def test_the_regulariser_does_not_shrink_a_correct_sphere():
+    """The guard the prompt for this work asked for, and it is not academic.
+
+    A Laplacian smoothing term moves every vertex toward the average of its
+    neighbours, and on any convex surface that average lies *inside* it. Left
+    unprojected it collapses a correct sphere: measured, ten rounds at strength
+    0.3 take the mean radius from 1.0 to **0.9444**, and a refinement reporting
+    "converged" would be reporting a slow implosion.
+
+    Projecting the smoothing onto each vertex's tangent plane lets it
+    redistribute vertices *over* the surface without moving the surface. The
+    photometric term already owns the normal direction, so the two never fight.
+    Same ten rounds: 1.00017.
+    """
+    from gsplat.photogrammetry.mesh_extraction import (
+        _tangential_smoothing,
+        _vertex_neighbours,
+    )
+
+    mesh = _unit_sphere_mesh(resolution=16)
+    mesh.compute_vertex_normals()
+    vertices = np.asarray(mesh.vertices).copy()
+    normals = np.asarray(mesh.vertex_normals).copy()
+    starts, counts, neighbours = _vertex_neighbours(
+        np.asarray(mesh.triangles), len(vertices)
+    )
+
+    plain = vertices.copy()
+    tangential = vertices.copy()
+    for _ in range(10):
+        sums = np.zeros_like(plain)
+        for axis in range(3):
+            sums[:, axis] = np.add.reduceat(plain[neighbours, axis], starts, axis=0)
+        plain = plain + 0.3 * (sums / counts[:, None] - plain)
+        tangential = _tangential_smoothing(
+            tangential, normals, starts, counts, neighbours, 0.3
+        )
+
+    plain_radius = float(np.linalg.norm(plain, axis=1).mean())
+    tangential_radius = float(np.linalg.norm(tangential, axis=1).mean())
+
+    # Premise: the unprojected version really does collapse, so the projection
+    # is load-bearing rather than decorative.
+    assert plain_radius < 0.96, plain_radius
+    assert abs(tangential_radius - 1.0) < 0.01, tangential_radius
+
+
+def test_refinement_leaves_an_already_correct_sphere_alone():
+    """Do no harm -- within the method's own noise floor, which is stated.
+
+    A refinement that merely wanders until the objective looks better passes
+    the recovery test and fails this one.
+
+    It is not asserted that nothing moves. Sampling a texture through a finite
+    number of finite-resolution views has a floor: on this fixture the method
+    leaves ~0.0068 of radial error on a mesh that started at exactly zero,
+    against the 0.0125 it gets a 0.0244 error down to. So it cannot improve a
+    surface already better than its floor, and will add up to that much noise
+    -- a real limitation, stated rather than hidden behind a loose tolerance.
+    What must *not* happen is a systematic collapse, which is what the earlier
+    unprojected regulariser and the coarse pyramid levels both produced.
+    """
+    from gsplat.photogrammetry.mesh_extraction import refine_mesh_photometric
+
+    truth = _unit_sphere_mesh(resolution=16)
+    dataset = _mesh_views(truth)
+    refined, _stats = refine_mesh_photometric(_unit_sphere_mesh(resolution=16), dataset)
+
+    radii = np.linalg.norm(np.asarray(refined.vertices), axis=1)
+    # No systematic shrink: three levels of pyramid took this to 0.983, and an
+    # unprojected Laplacian to 0.944.
+    assert abs(float(radii.mean()) - 1.0) < 0.005, float(radii.mean())
+    # And the scatter stays inside the noise floor, well under what it corrects.
+    assert _mean_radial_error(refined) < 0.010, _mean_radial_error(refined)
+
+
+def test_displaced_candidates_are_invisible_to_the_visibility_hub():
+    """Why visibility is decided at the surface and reused, not re-tested.
+
+    `_view_samples` ray-casts every sample against the mesh, so a point
+    displaced off the surface is occluded *by the surface it came from*. Asking
+    it about candidate positions directly rejected **all 482 candidates at
+    every nonzero offset** on a correct sphere: the search had nothing to
+    choose between and the mesh moved on noise alone.
+
+    This asserts the trap itself, rather than trying to catch it through
+    convergence. The refinement's own default step (0.5 vertex spacings, about
+    0.077 here) is already twice the ray-cast tolerance (~0.036 at this camera
+    distance), so the recovery test above is only possible *because* visibility
+    is decoupled from the candidate position -- which makes this the assertion
+    that explains it.
+    """
+    from gsplat.photogrammetry.mesh_extraction import _point_spacing
+    from gsplat.photogrammetry.texturing import _view_samples
+
+    o3d = pytest.importorskip("open3d")
+
+    mesh = _unit_sphere_mesh(resolution=16)
+    mesh.compute_vertex_normals()
+    dataset = _mesh_views(mesh)
+    vertices = np.asarray(mesh.vertices).copy()
+    normals = np.asarray(mesh.vertex_normals).copy()
+    step = 0.5 * _point_spacing(vertices)
+
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+
+    def measurable(points):
+        seen = np.zeros(len(points), dtype=np.int64)
+        for chunk, _c, _w, _v in _view_samples(
+            scene, o3d, dataset, points, normals, None, 1 << 20
+        ):
+            seen[chunk] += 1
+        return int((seen >= 2).sum())
+
+    total = len(vertices)
+    # On the surface, essentially every vertex is measurable.
+    assert measurable(vertices) > 0.95 * total, measurable(vertices)
+    # One default step off it, in either direction, essentially none is.
+    assert measurable(vertices + step * normals) < 0.05 * total
+    assert measurable(vertices - step * normals) < 0.05 * total
+
+
+def test_refinement_rejects_geometry_it_cannot_search():
+    from gsplat.photogrammetry.mesh_extraction import refine_mesh_photometric
+
+    o3d = pytest.importorskip("open3d")
+
+    truth = _unit_sphere_mesh(resolution=16)
+    dataset = _mesh_views(truth, num_views=4, width=48)
+    with pytest.raises(ValueError, match="no geometry"):
+        refine_mesh_photometric(o3d.geometry.TriangleMesh(), dataset)
+    with pytest.raises(ValueError, match="num_offsets"):
+        refine_mesh_photometric(_unit_sphere_mesh(resolution=8), dataset, num_offsets=0)

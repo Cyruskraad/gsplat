@@ -116,6 +116,11 @@ class Config:
     # view that sees it -- sharper, but pointwise less accurate, and it
     # requires --texture_mode atlas. See examples/extract_mesh.py.
     texture_view_selection: bool = False
+    # Move each vertex along its normal to fit the photographs before
+    # texturing (Vu et al., TPAMI 2012). Needs no GPU. Composes with
+    # --photometric_align: cameras first, then the surface.
+    # See examples/extract_mesh.py.
+    refine_mesh: bool = False
     # Maximum depth to integrate during TSDF fusion, in scene units. Unset
     # derives it from the scene's own extent (it was hardcoded at 10.0 and not
     # reachable at all). See examples/extract_mesh.py.
@@ -472,6 +477,8 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                 ]
                 if cfg.texture_view_selection:
                     cmd += ["--texture_view_selection"]
+                if cfg.refine_mesh:
+                    cmd += ["--refine_mesh"]
                 if cfg.depth_trunc is not None:
                     cmd += ["--depth_trunc", str(cfg.depth_trunc)]
                 if cfg.texture_super_resolve:

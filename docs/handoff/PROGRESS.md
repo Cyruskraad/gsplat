@@ -9,7 +9,7 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **181 tests pass** (153 before this session). Every guard
+- **187 tests pass** (153 before this session). Every guard
   mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
@@ -52,6 +52,12 @@ looks right.
   (`ISSUES.md` § 4.22 tabulates four regimes), so **it stays opt-in and the
   test asserts "comparable", not "better"**. The pitch was that it would be
   strictly better than both; it is not.
+- **Photometric mesh refinement** (Vu et al. 2012, OpenMVS's `RefineMesh`) —
+  the first thing in this package that moves a vertex to fit the photographs.
+  On a sphere perturbed by 0.03, measured against the *analytic* surface:
+  mean radial error **0.0244 → 0.0125** (1.95x), photoconsistency
+  **0.0985 → 0.0251**, cloud-to-mesh **0.0207 → 0.0094**. Its noise floor is
+  ~0.0068 of radial error, stated in `ISSUES.md` § 4.30 rather than hidden.
 - **The last absolute scene-unit constants, now derived**:
   `voxel_size`/`sdf_trunc`/`depth_trunc` from the depth actually being fused,
   and Poisson's normal radius from the cloud's own spacing. Verified
@@ -97,7 +103,7 @@ docstring too.
 
 ---
 
-## The 17 bugs found and fixed
+## The 18 bugs found and fixed
 
 Each was confirmed by reverting the fix and showing a test genuinely fails.
 
@@ -179,6 +185,13 @@ Each was confirmed by reverting the fix and showing a test genuinely fails.
     an atlas at **464% of the ground truth's contrast**, which
     `atlas_sharpness` reads as a triumph. Caught by the L1 and by
     non-monotonicity in the regularization weight, not by the sharpness metric.
+
+18. **Three faults in the mesh-refinement search, each of which looked like
+    convergence.** Visibility re-tested at the candidate position rejected
+    *every* candidate (the surface occludes its own offsets); an unprojected
+    Laplacian regulariser collapsed a correct sphere to radius 0.944; and
+    `np.argmin`'s first-minimum tie-break resolved every tie toward the most
+    inward offset. All three are in `ISSUES.md` § 4.26–28 with their numbers.
 
 Two sharp edges are **guarded rather than fixed**, because they are upstream:
 `compute_uvatlas` segfaults (exit 139) on non-manifold input, so manifoldness is

@@ -59,6 +59,7 @@ from .mesh_extraction import (
     derive_reconstruction_parameters,
     extract_mesh_poisson,
     extract_mesh_tsdf,
+    refine_mesh_photometric,
     simplify_mesh,
     simplify_mesh_to_error,
 )
@@ -125,6 +126,7 @@ __all__ = [
     "NO_VIEW",
     "bake_normal_map",
     "bake_ambient_occlusion",
+    "refine_mesh_photometric",
     "simplify_mesh",
     "simplify_mesh_to_error",
     "cull_unobserved_faces",

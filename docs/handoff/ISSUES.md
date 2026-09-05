@@ -173,6 +173,42 @@ Each of these cost real time to discover. Do not re-derive them.
     regime, not a fault; the quality assertions live on a fixture that meets
     the premise.
 
+### Photometric mesh refinement
+
+26. **Visibility must be decided at the surface, then reused for every
+    candidate.** `_view_samples` ray-casts each sample against the mesh, so a
+    point displaced off the surface is occluded *by the surface it came from*.
+    Asking it about candidate offsets directly rejected **all 482 candidates at
+    every nonzero offset** on a correct sphere — the search had nothing to
+    choose between and the mesh drifted on noise alone. The question is "if the
+    surface were here instead, would the cameras agree?", and the cameras that
+    see a vertex do not change because it moved a fraction of a vertex spacing.
+    The default step (0.5 vertex spacings ≈ 0.077) is already **twice** the
+    ray-cast tolerance (~0.036 at 3.5 units), so this is not an edge case.
+27. **A Laplacian regulariser collapses a correct surface, and slowly enough to
+    look like convergence.** The average of a vertex's neighbours lies inside
+    any convex surface. Measured: ten rounds at strength 0.3 take a unit
+    sphere's mean radius to **0.9444**. Projecting the smoothing onto the
+    vertex's tangent plane holds **1.00017** — it redistributes vertices *over*
+    the surface without moving the surface, and the photometric term already
+    owns the normal direction, so the two never fight.
+28. **`np.argmin` breaks ties toward the first offset, which is the most
+    inward one.** With offsets ordered inward-to-outward, every tie and every
+    all-unmeasurable vertex resolves inward. Staying put has to be the default:
+    a move must strictly improve on the current position's cost.
+29. **Coarse-to-fine hurts here too**, exactly as for camera refinement
+    (trap 19). Recovering a sphere perturbed by 0.03: single-scale improves the
+    radial error **1.95x** where three pyramid levels manage **1.21x**; and on
+    an *already correct* sphere three levels drift the mean radius to **0.983**
+    where single-scale holds **0.9986**. Halving the image blurs away the very
+    detail the photoconsistency is measured from, so the coarse levels optimise
+    noise. `num_levels` defaults to 1.
+30. **The method has a noise floor, and it is worth stating.** Sampling a
+    texture through finitely many finite-resolution views leaves ~**0.0068** of
+    radial error on a mesh that started at exactly zero, against the
+    **0.0125** it gets a 0.0244 error down to. So it cannot improve a surface
+    already better than its floor, and will add up to that much noise.
+
 ### Photometric camera refinement
 
 17. **open3d already ships this algorithm and it does not work here.**
@@ -228,7 +264,7 @@ Each of these cost real time to discover. Do not re-derive them.
 
 ## 5. The recurring testing failure — read this before writing tests
 
-**Eight times on this branch, a test proved a *mechanism* worked while the
+**Nine times on this branch, a test proved a *mechanism* worked while the
 *call site* went unpinned.** Three times in this session's own work, *after* writing
 the test that was meant to pre-empt it — both caught only by mutating the
 caller. Each time the mutation passed the entire suite:
@@ -242,6 +278,8 @@ caller. Each time the mutation passed the entire suite:
 | `bake_mesh_texture` never accepted the `seam_smoothness` its CLI passed | No test had ever called `extract_mesh.main()` — the `assert cfg.ckpt` before the method dispatch made a GPU checkpoint the price of reaching it | `tests/test_extract_mesh_cli.py`, driving `main()` |
 | Force every pyramid level to full resolution | The pyramid test compared `num_levels=1` against `num_levels=3` at the same `alternations`, i.e. 3 optimisation rounds against 9. The extra *rounds* were doing the work the pyramid got credit for | An **equal-work** comparison (3 levels × 3 rounds vs 1 level × 9), in the regime where the objective actually aliases |
 | Hardcode Poisson's normal radius back to `0.1` | The test asserted the *derived* value in `stats_out`, which was written from the derivation rather than from the value actually passed to open3d. And the reconstruction itself is a weak detector: `orient_normals_consistent_tangent_plane` plus a modest octree depth still produce a plausible sphere from normals aligned only 0.507 with the truth | Report the stat from the value about to be **used**, and measure the normals against the analytic sphere directly |
+| Re-test visibility at each candidate offset (mesh refinement) | The recovery test's threshold (1.5x) was looser than the gap the mutation opens (1.95x -> 1.55x) | Tighten the threshold to the measured margin, and pin the trap itself: displaced points *are* invisible to `_view_samples` |
+| Compute the refined mesh, then return the original | (pre-empted) The CLI test compares the written vertices against an unrefined run rather than reading the stats | — |
 | Compute the refined poses, then discard them | The CLI test asserted the alignment *stats* reached `mesh_metrics.json`. Stats are an output of the solve, not evidence it was used | Comparing the delivered per-vertex colours, aligned vs not, against the analytic truth |
 
 **The lesson: after mutation-checking a mechanism, mutate the *caller* too.** If

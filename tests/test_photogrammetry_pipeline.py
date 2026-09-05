@@ -917,6 +917,7 @@ def test_pipeline_reaches_the_whole_delivery_path(tmp_path):
             "--texture_super_resolve",
             "--depth_trunc",
             "12.5",
+            "--refine_mesh",
         ],
     )
     for expected in (
@@ -936,6 +937,7 @@ def test_pipeline_reaches_the_whole_delivery_path(tmp_path):
         # Hardcoded at 10.0 and unreachable before, so a capture larger than
         # ten scene units silently lost its far geometry.
         "--depth_trunc 12.5",
+        "--refine_mesh",
     ):
         assert expected in line, (expected, line)
 

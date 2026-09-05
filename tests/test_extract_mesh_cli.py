@@ -443,6 +443,61 @@ def test_super_resolution_and_view_selection_are_refused_together(capture, tmp_p
         extract_mesh.main(cfg)
 
 
+def test_mesh_refinement_runs_from_the_cli_and_moves_the_geometry(
+    misregistered, tmp_path
+):
+    """`--refine_mesh` end to end, pinned on the geometry it delivers.
+
+    Stats alone are not evidence the flag was used -- that mistake has been
+    made three times on this branch and twice in this session. So this compares
+    the written mesh against the same run without the flag: a wiring that
+    computed a refined mesh and returned the original would produce identical
+    vertices.
+    """
+    _examples_on_path()
+    import json
+
+    import open3d as o3d
+
+    import extract_mesh
+
+    def run(refine):
+        cfg = _config(
+            misregistered,
+            tmp_path / ("refined" if refine else "raw"),
+            data_dir=misregistered["data_dir"],
+            mesh_path=misregistered["mesh_path"],
+            texture_mode="vertex",
+            bake_texture_=False,
+            refine_mesh=refine,
+            refine_mesh_iterations=2,
+        )
+        extract_mesh.main(cfg)
+        mesh = o3d.io.read_triangle_mesh(str(Path(cfg.result_dir) / "mesh.ply"))
+        return cfg, np.asarray(mesh.vertices)
+
+    _raw_cfg, raw = run(False)
+    refined_cfg, refined = run(True)
+
+    assert raw.shape == refined.shape
+    assert not np.allclose(raw, refined), (
+        "the refined mesh is identical to the unrefined one, so --refine_mesh "
+        "never reached the geometry"
+    )
+
+    stats = json.loads((Path(refined_cfg.result_dir) / "mesh_metrics.json").read_text())
+    refinement = stats["mesh_refinement"]
+    assert refinement["num_vertices_moved"] > 0
+    assert refinement["mean_vertex_displacement"] > 0.0
+    for key in (
+        "mean_photoconsistency_before",
+        "mean_photoconsistency_after",
+        "point_to_mesh_before",
+        "point_to_mesh_after",
+    ):
+        assert key in refinement, key
+
+
 # ---------------------------------------------------------------------------
 # The checkpoint-free entry itself
 # ---------------------------------------------------------------------------
