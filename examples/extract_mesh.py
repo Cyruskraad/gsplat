@@ -116,10 +116,22 @@ class Config:
     # Getting this wrong does not fail loudly -- it silently textures the mesh
     # from cameras that do not line up with it.
     mesh_frame: Literal["colmap", "normalized"] = "colmap"
-    # TSDF voxel size, in scene units.
-    voxel_size: float = 0.01
-    # TSDF truncation distance, in scene units.
-    sdf_trunc: float = 0.04
+    # TSDF voxel size, in scene units. Left unset it is derived from the
+    # rendered depth maps -- a voxel becomes the world size of one source
+    # pixel at the depth it observes, which is the finest scale the evidence
+    # supports. A fixed value only suits one scene scale: the old default of
+    # 0.01 produced an empty mesh at 10x that scale and 4.9x the error at 0.1x.
+    voxel_size: Optional[float] = None
+    # TSDF truncation distance, in scene units. Left unset it is 4 voxels.
+    sdf_trunc: Optional[float] = None
+    # Maximum depth to integrate, in scene units. Left unset it is set just
+    # past the depths the maps actually contain, so it rejects outliers
+    # without cropping real geometry.
+    depth_trunc: Optional[float] = None
+    # Neighbourhood radius for Poisson normal estimation, in scene units.
+    # Left unset it is 5x the cloud's own k-nearest-neighbour spacing, the
+    # measured knee past which open3d's neighbour cap binds anyway.
+    poisson_normal_radius: Optional[float] = None
     # Poisson reconstruction octree depth.
     poisson_depth: int = 9
     # Directory of precomputed per-image transient/dynamic-object masks (see
@@ -261,6 +273,7 @@ def main(cfg: Config) -> None:
     )
     dataset = Dataset(parser, split="train", mask_dir=cfg.mask_dir)
 
+    extraction_stats: dict = {}
     if cfg.method == "tsdf":
         ckpt = torch.load(cfg.ckpt, map_location=cfg.device)
         splats = {k: v.to(cfg.device) for k, v in ckpt["splats"].items()}
@@ -270,6 +283,8 @@ def main(cfg: Config) -> None:
             renderer=cfg.renderer,
             voxel_size=cfg.voxel_size,
             sdf_trunc=cfg.sdf_trunc,
+            depth_trunc=cfg.depth_trunc,
+            stats_out=extraction_stats,
             device=cfg.device,
         )
         # No dense MVS cloud on this path -- fall back to the sparse SfM
@@ -285,7 +300,13 @@ def main(cfg: Config) -> None:
         # for the same reason.
         points_xyz = transform_points(parser.transform, np.asarray(pcd.points))
         points_rgb = np.asarray(pcd.colors) if pcd.has_colors() else None
-        mesh = extract_mesh_poisson(points_xyz, points_rgb, depth=cfg.poisson_depth)
+        mesh = extract_mesh_poisson(
+            points_xyz,
+            points_rgb,
+            depth=cfg.poisson_depth,
+            normal_radius=cfg.poisson_normal_radius,
+            stats_out=extraction_stats,
+        )
         reference_points = points_xyz
     else:
         mesh = o3d.io.read_triangle_mesh(cfg.mesh_path)
@@ -315,6 +336,19 @@ def main(cfg: Config) -> None:
         f"[extract_mesh] extracted mesh with {len(mesh.vertices)} vertices, "
         f"{len(mesh.triangles)} triangles"
     )
+    if extraction_stats.get("derived"):
+        print(
+            "[extract_mesh] TSDF sized from the depth maps: voxel "
+            f"{extraction_stats['voxel_size']:.5g}, truncation "
+            f"{extraction_stats['sdf_trunc']:.5g}, depth cutoff "
+            f"{extraction_stats['depth_trunc']:.5g} scene units"
+        )
+    elif extraction_stats.get("normal_radius_derived"):
+        print(
+            "[extract_mesh] Poisson normals estimated over "
+            f"{extraction_stats['normal_radius']:.5g} scene units "
+            f"({extraction_stats['point_spacing']:.5g} point spacing)"
+        )
 
     if (cfg.normal_map or cfg.ao_map) and cfg.texture_mode != "atlas":
         raise ValueError(
@@ -634,6 +668,8 @@ def main(cfg: Config) -> None:
         print(f"[extract_mesh] wrote {ao_path}")
 
     stats = mesh_quality_stats(mesh)
+    if extraction_stats:
+        stats["extraction"] = extraction_stats
     if texture_size_stats is not None:
         stats["texture_size"] = texture_size_stats
     if cull_stats is not None:

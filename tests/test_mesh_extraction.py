@@ -1366,3 +1366,181 @@ def test_cull_keeps_observed_faces_on_a_flat_untextured_surface():
     assert stats["num_culled"] == 0, (stats, at_risk)
     assert stats["observation_histogram"][0] == 0
     assert len(culled.triangles) == len(mesh.triangles)
+
+
+# --- Derived reconstruction parameters (Task 3b) -----------------------------
+#
+# `voxel_size=0.01`, `sdf_trunc=0.04`, `depth_trunc=10.0` and Poisson's
+# `radius=0.1` were the last absolute scene-unit constants in the pipeline, on
+# a branch whose stated premise is that such a number means nothing on its own.
+# These tests pin the property that replaces them: the *same relative* result
+# at any scene scale.
+
+
+def test_derived_tsdf_parameters_scale_with_the_scene():
+    """A voxel is the world size of a source pixel at the depth it observes.
+
+    So at 10x the scene scale every derived length must be 10x, exactly. A
+    fixed constant is what cannot do this.
+    """
+    from gsplat.photogrammetry.mesh_extraction import derive_tsdf_parameters
+
+    base = derive_tsdf_parameters(_make_sphere_views(num_views=8))
+    scaled = derive_tsdf_parameters(
+        _make_sphere_views(num_views=8, radius=10.0, cam_dist=30.0)
+    )
+
+    for key in ("voxel_size", "sdf_trunc", "depth_trunc"):
+        assert scaled[key] == pytest.approx(
+            10.0 * base[key], rel=1e-6
+        ), f"{key} did not scale with the scene: {base[key]} -> {scaled[key]}"
+    # The truncation is a multiple of the voxel, not an independent constant.
+    assert base["sdf_trunc"] == pytest.approx(4.0 * base["voxel_size"])
+    # Premise: depth_trunc must not crop the geometry it is meant to keep.
+    assert base["depth_trunc"] > base["max_depth"]
+
+
+def test_derived_tsdf_beats_the_old_constant_away_from_its_scale():
+    """The constant was tuned for one scene scale, and only works there.
+
+    Measured: at 10x scale the old 0.01/0.04 default produces an **empty
+    mesh**; at 0.1x it produces 4.9x the relative error. The derived value
+    gives the same relative fit at every scale.
+    """
+    from gsplat.photogrammetry.mesh_extraction import _tsdf_fuse
+    from gsplat.photogrammetry.metrics import point_to_mesh_distance
+
+    def relative_error(scale, **kwargs):
+        views = _make_sphere_views(num_views=8, radius=scale, cam_dist=3.0 * scale)
+        mesh = _tsdf_fuse(views, **kwargs)
+        if len(mesh.triangles) == 0:
+            return None
+        directions = np.random.default_rng(0).normal(size=(2000, 3))
+        directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+        truth = directions * scale
+        return point_to_mesh_distance(truth, mesh)["mean"] / scale
+
+    fixed = dict(voxel_size=0.01, sdf_trunc=0.04, depth_trunc=10.0)
+
+    # Premise: at the scale the constant was tuned for, the two agree -- so the
+    # comparison below is about scale, not about the derivation being better
+    # in general.
+    assert relative_error(1.0) == pytest.approx(relative_error(1.0, **fixed), rel=0.1)
+
+    # The derived value holds its relative accuracy across a 100x span.
+    small, large = relative_error(0.1), relative_error(10.0)
+    assert small is not None and large is not None
+    assert small == pytest.approx(large, rel=0.2)
+
+    # The constant does not.
+    assert (
+        relative_error(10.0, **fixed) is None
+    ), "the old constant no longer fails at 10x scale -- re-measure the claim"
+    assert relative_error(0.1, **fixed) > 3.0 * small
+
+
+def test_derived_poisson_normal_radius_scales_with_the_cloud():
+    """Poisson's `radius=0.1` was the same kind of constant.
+
+    At 10x the scene, a fixed radius sees a tenth of the neighbourhood and the
+    surface degrades; the derived radius holds its relative fit.
+    """
+    from gsplat.photogrammetry.mesh_extraction import extract_mesh_poisson
+    from gsplat.photogrammetry.metrics import point_to_mesh_distance
+
+    rng = np.random.default_rng(0)
+    directions = rng.normal(size=(6000, 3))
+    directions /= np.linalg.norm(directions, axis=1, keepdims=True)
+
+    def relative_error(scale, **kwargs):
+        points = directions * scale
+        stats: dict = {}
+        mesh = extract_mesh_poisson(points, depth=7, stats_out=stats, **kwargs)
+        return point_to_mesh_distance(points, mesh)["mean"] / scale, stats
+
+    derived_small, stats_small = relative_error(1.0)
+    derived_large, stats_large = relative_error(10.0)
+    assert stats_small["normal_radius_derived"] is True
+    assert stats_large["normal_radius"] == pytest.approx(
+        10.0 * stats_small["normal_radius"], rel=1e-6
+    )
+    assert derived_small == pytest.approx(derived_large, rel=0.2)
+
+    # Premise: at 1x the fixed radius is fine, so what follows is about scale.
+    fixed_small, _ = relative_error(1.0, normal_radius=0.1)
+    assert fixed_small == pytest.approx(derived_small, rel=0.2)
+
+    fixed_large, _ = relative_error(10.0, normal_radius=0.1)
+    assert (
+        fixed_large > 3.0 * derived_large
+    ), "a fixed 0.1 radius no longer degrades at 10x scale -- re-measure"
+
+
+def test_an_explicit_parameter_does_not_un_derive_the_others():
+    """Overriding one TSDF parameter must leave the rest derived.
+
+    Filling all three from the derivation only when *all* are None would make
+    `--voxel_size 0.02` silently restore the old 10.0 depth cutoff too.
+    """
+    from gsplat.photogrammetry.mesh_extraction import (
+        _tsdf_fuse,
+        derive_tsdf_parameters,
+    )
+
+    views = _make_sphere_views(num_views=6)
+    derived = derive_tsdf_parameters(views)
+
+    stats: dict = {}
+    _tsdf_fuse(views, voxel_size=0.02, stats_out=stats)
+    assert stats["voxel_size"] == 0.02
+    assert stats["sdf_trunc"] == pytest.approx(derived["sdf_trunc"])
+    assert stats["depth_trunc"] == pytest.approx(derived["depth_trunc"])
+
+
+def test_deriving_tsdf_parameters_needs_some_depth():
+    """All-zero depth maps must say so, not divide by nothing."""
+    from gsplat.photogrammetry.mesh_extraction import derive_tsdf_parameters
+
+    views = _make_sphere_views(num_views=3)
+    for view in views:
+        view["depth"] = np.zeros_like(view["depth"])
+    with pytest.raises(ValueError, match="valid depth"):
+        derive_tsdf_parameters(views)
+
+
+def test_the_voxel_size_survives_a_speck_of_near_geometry():
+    """The median, not the minimum, over pixel footprints.
+
+    The minimum is whatever single pixel grazed the nearest surface, so a few
+    stray near-depth samples -- a speck of foreground, a splat artefact in
+    front of the camera -- would size the entire volume. At 1/20th the depth
+    that is a 20x finer voxel over the whole scene, which is a memory blow-up
+    rather than a quality gain.
+
+    Pinning this because it is exactly the kind of choice a later reader
+    "simplifies": the minimum looks like the conservative option.
+    """
+    from gsplat.photogrammetry.mesh_extraction import derive_tsdf_parameters
+
+    clean = _make_sphere_views(num_views=6)
+    contaminated = _make_sphere_views(num_views=6)
+    for view in contaminated:
+        depth = view["depth"]
+        valid = np.nonzero(depth > 0)
+        # 20 pixels out of thousands, twenty times closer than the surface.
+        picks = (valid[0][:20], valid[1][:20])
+        depth[picks] = depth[picks] / 20.0
+
+    baseline = derive_tsdf_parameters(clean)["voxel_size"]
+    spoiled = derive_tsdf_parameters(contaminated)["voxel_size"]
+
+    # Premise: the contamination really is there and really is extreme, or the
+    # robustness below is vacuous.
+    clean_min = min(float(v["depth"][v["depth"] > 0].min()) for v in clean)
+    dirty_min = min(float(v["depth"][v["depth"] > 0].min()) for v in contaminated)
+    assert dirty_min < clean_min / 10.0
+
+    assert spoiled == pytest.approx(baseline, rel=0.02), (
+        f"20 stray near pixels moved the voxel size {baseline:.6g} -> "
+        f"{spoiled:.6g}; the estimator is not robust to them"
+    )
