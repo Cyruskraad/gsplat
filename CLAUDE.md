@@ -8,11 +8,16 @@ photometric refinement -> cull -> decimate -> texture -> normal/AO maps, with
 AI-assisted priors, GOF-style level-set extraction, and per-stage automatic
 quality metrics.
 
-**Before continuing that work, read [`docs/handoff/README.md`](docs/handoff/README.md).**
-It indexes five short documents that together are the complete picture — scope,
-scaffolding, progress (including what was *executed* versus only *reviewed*),
-and the current issues. A new session should be able to read only those and
-continue immediately.
+**Before continuing that work, read
+[`docs/handoff/CURRENT_PLAN.md`](docs/handoff/CURRENT_PLAN.md)** — the live
+plan, with what to do next and how to verify it — and
+[`docs/handoff/README.md`](docs/handoff/README.md), which indexes the six short
+documents that together are the complete picture: scope, scaffolding, progress
+(including what was *executed* versus only *reviewed*), and the current issues.
+A new session should be able to read only those and continue immediately.
+
+Note that `docs/photogrammetry_texturing_plan.md` is a **finished** plan kept
+as a record; `docs/handoff/CURRENT_PLAN.md` is the live one.
 
 **[`docs/handoff/ISSUES.md`](docs/handoff/ISSUES.md) is the one to read
 carefully.** Several of its entries are measurements that invert the obvious

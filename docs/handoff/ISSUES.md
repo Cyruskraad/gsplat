@@ -321,7 +321,9 @@ Two traps found while building it, both of which pass a naive test:
 
 ## 6. What to do next
 
-Ordered by value.
+Ordered by value. [`CURRENT_PLAN.md`](CURRENT_PLAN.md) is the short,
+prioritised version of this section with the verification steps attached; this
+is the full list and the reasoning.
 
 **This section previously read "everything unblocked has been done". That was
 wrong, and the way it was wrong is the useful part:** it was written from the

@@ -1,10 +1,12 @@
 # Photogrammetry pipeline — handoff index
 
-**Read this file first. It is written so that a new session can read only the
-five files in this directory and be productive immediately.**
+**Read this file first, then [`CURRENT_PLAN.md`](CURRENT_PLAN.md). Together
+the six files in this directory are written so that a new session can read only
+them and be productive immediately — no other context is needed.**
 
 | File | What it answers |
 |---|---|
+| [`CURRENT_PLAN.md`](CURRENT_PLAN.md) | **The live plan — start here if you are about to do work.** What to do next, and how to verify it |
 | `README.md` (this) | Where things stand right now; how to pick up in five minutes |
 | [`SCOPE.md`](SCOPE.md) | What this project is, what it deliberately is *not*, the conventions it follows |
 | [`ARCHITECTURE.md`](ARCHITECTURE.md) | The scaffolding: modules, data flow, public API, file inventory |
@@ -70,7 +72,9 @@ command -v colmap                             # CUDA colmap build?
 of its entries are measurements that *invert the obvious intuition*; rediscovering
 them costs hours.
 
-**4. Then pick work from [`ISSUES.md`](ISSUES.md) § "What to do next".**
+**4. Then pick work from [`CURRENT_PLAN.md`](CURRENT_PLAN.md)**, which is the
+authoritative plan and carries the verification steps.
+[`ISSUES.md`](ISSUES.md) §6 is the longer, unprioritised list behind it.
 
 ---
 

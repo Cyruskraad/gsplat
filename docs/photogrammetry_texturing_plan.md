@@ -1,5 +1,8 @@
 # Plan: sharp texturing via per-face view selection + seam levelling
 
+> **This plan is finished. It is not the current plan.** For live work see
+> [`handoff/CURRENT_PLAN.md`](handoff/CURRENT_PLAN.md).
+
 **Status:** **complete** — all four steps are landed. Kept as the record of
 what was measured and why the tests are shaped the way they are; §"Premise,
 measured" and the step 2/3 findings are the parts worth reading before
