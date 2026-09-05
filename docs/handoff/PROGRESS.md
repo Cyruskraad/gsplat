@@ -9,7 +9,7 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **168 tests pass** (153 before this session). Every guard
+- **174 tests pass** (153 before this session). Every guard
   mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
@@ -43,6 +43,15 @@ looks right.
   view selection's L1 **0.229 → 0.053** — which *flips the L1 ranking* to the
   one exact poses produce. The headline tradeoff is a symptom of
   misregistration, and this is it going away, measured.
+- **Multi-view super-resolution** (Goldlücke et al. 2014) as a MAP
+  deconvolution on the atlas, solved with the existing hand-rolled
+  `_conjugate_gradient` and an IRLS Huber prior, no scipy. Against blending it
+  is a clean win on *both* axes — contrast **63.6% → 90.8%** of ground truth,
+  L1 **0.1081 → 0.0759** — which nothing else in the module manages. Against
+  view selection it is reliably sharper but pointwise a coin flip
+  (`ISSUES.md` § 4.22 tabulates four regimes), so **it stays opt-in and the
+  test asserts "comparable", not "better"**. The pitch was that it would be
+  strictly better than both; it is not.
 - **Three claims this session set out to confirm and instead falsified**, each
   recorded in `ISSUES.md` § 4 rather than quietly dropped: open3d's shipped
   implementation of the same algorithm (worse in every configuration, including
@@ -79,7 +88,7 @@ docstring too.
 
 ---
 
-## The 16 bugs found and fixed
+## The 17 bugs found and fixed
 
 Each was confirmed by reverting the fix and showing a test genuinely fails.
 
@@ -155,6 +164,12 @@ Each was confirmed by reverting the fix and showing a test genuinely fails.
     texture's wavelength. The solve then made registration **worse**
     (62' → 155'). Fixed by rotating `t₀` with the delta. Found by measuring the
     outcome rather than the objective — the residual fell throughout.
+
+17. **The super-resolution prior entered the normal equations with the wrong
+    sign**, making the operator indefinite and the deconvolution divergent —
+    an atlas at **464% of the ground truth's contrast**, which
+    `atlas_sharpness` reads as a triumph. Caught by the L1 and by
+    non-monotonicity in the regularization weight, not by the sharpness metric.
 
 Two sharp edges are **guarded rather than fixed**, because they are upstream:
 `compute_uvatlas` segfaults (exit 139) on non-manifold input, so manifoldness is

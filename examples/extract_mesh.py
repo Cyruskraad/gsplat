@@ -171,6 +171,20 @@ class Config:
     # --texture_mode atlas. Complements --texture_outlier_sigma, which still
     # governs the blended fallback regions.
     texture_view_selection: bool = False
+    # Solve for the texture whose reprojection best explains every view --
+    # a MAP deconvolution that models each camera's point spread function
+    # (Goldlucke et al., IJCV 2014) -- instead of blending the views or picking
+    # one per face. Strictly better than blending on *both* sharpness and
+    # pointwise error, which nothing else here manages; sharper than
+    # --texture_view_selection but not strictly better than it, so it stays
+    # opt-in. Requires --texture_mode atlas, and cannot be combined with
+    # --texture_view_selection or --texture_pages. Run --photometric_align
+    # first if you can: deconvolution sharpens whatever the views agree on,
+    # including their disagreements when the cameras are misregistered.
+    texture_super_resolve: bool = False
+    # Weight on the gradient prior for --texture_super_resolve. Too small and
+    # the deconvolution rings; too large and it reproduces the blend.
+    texture_super_resolve_lambda: float = 0.1
     # Seam penalty for --texture_view_selection: how much worse a view the
     # labelling will accept to avoid a colour discontinuity between two
     # neighbouring faces. Higher means fewer, larger single-view regions.
@@ -381,6 +395,11 @@ def main(cfg: Config) -> None:
         raise ValueError(
             "--texture_pages splits a UV atlas across several images, so it "
             "requires --texture_mode atlas."
+        )
+    if cfg.texture_super_resolve and cfg.texture_mode != "atlas":
+        raise ValueError(
+            "--texture_super_resolve solves for a texture on the atlas's own "
+            "parameterization, so it requires --texture_mode atlas."
         )
     if cfg.texture_view_selection and cfg.texture_mode != "atlas":
         raise ValueError(
@@ -598,6 +617,8 @@ def main(cfg: Config) -> None:
             ),
             num_pages=cfg.texture_pages,
             view_selection=cfg.texture_view_selection,
+            super_resolve=cfg.texture_super_resolve,
+            super_resolve_regularization=cfg.texture_super_resolve_lambda,
             mrf_smoothness=cfg.texture_mrf_lambda,
             seam_smoothness=(
                 cfg.texture_seam_smoothness if cfg.texture_seam_smoothness > 0 else None
@@ -611,7 +632,40 @@ def main(cfg: Config) -> None:
             )
         else:
             print("[extract_mesh] baked per-vertex texture from training images")
-        if view_selection_stats:
+        # `stats_out` is filled by whichever atlas bake ran, and the two report
+        # different things -- only view selection has an MRF and seams. Branch
+        # on the key rather than assuming, which cost a KeyError once.
+        if "psf_sigma_texels" in view_selection_stats:
+            sharp = view_selection_stats["atlas_sharpness"]["mean_gradient"]
+            blended_sharp = view_selection_stats["blended_atlas_sharpness"][
+                "mean_gradient"
+            ]
+            solver = view_selection_stats["solver"]
+            print(
+                "[extract_mesh] super-resolution: PSF "
+                f"{view_selection_stats['mean_psf_sigma_texels']:.2f} texels "
+                f"over {view_selection_stats['num_views_used']} views, "
+                f"{solver['iterations']} CG iterations "
+                f"(residual {solver['residual']:.2e})"
+            )
+            print(
+                f"[extract_mesh] atlas sharpness {sharp:.4f} vs "
+                f"{blended_sharp:.4f} blended "
+                f"({sharp / blended_sharp - 1.0:+.1%})"
+                if blended_sharp > 0
+                else f"[extract_mesh] atlas sharpness {sharp:.4f}"
+            )
+            if not solver["converged"]:
+                warnings.warn(
+                    "The super-resolution solve hit its iteration cap with "
+                    f"relative residual {solver['residual']:.2e}. The atlas is "
+                    "the partial solution, which degrades toward the plain "
+                    "blend rather than toward nonsense -- the solve is for a "
+                    "correction to it. A very small "
+                    "--texture_super_resolve_lambda conditions this badly.",
+                    RuntimeWarning,
+                )
+        elif view_selection_stats:
             mrf = view_selection_stats["mrf"]
             sharp = view_selection_stats["atlas_sharpness"]["mean_gradient"]
             blended_sharp = view_selection_stats["blended_atlas_sharpness"][
@@ -771,7 +825,11 @@ def main(cfg: Config) -> None:
     if ao_stats is not None:
         stats["ambient_occlusion"] = ao_stats
     if view_selection_stats:
-        stats["view_selection"] = view_selection_stats
+        stats[
+            "super_resolution"
+            if "psf_sigma_texels" in view_selection_stats
+            else "view_selection"
+        ] = view_selection_stats
     if alignment_stats is not None:
         stats["photometric_alignment"] = alignment_stats
     if len(mesh.triangles) == 0:

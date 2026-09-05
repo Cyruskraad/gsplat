@@ -374,6 +374,75 @@ def test_the_refined_poses_are_the_ones_the_bake_uses(misregistered, tmp_path):
     assert aligned_l1 < raw_l1, (raw_l1, aligned_l1)
 
 
+def test_super_resolution_runs_from_the_cli_and_beats_the_blend(capture, tmp_path):
+    """`--texture_super_resolve` end to end, pinned on its *effect*.
+
+    Asserting only that the flag is accepted would repeat the mistake this file
+    exists to stop: `--texture_seam_smoothness` was accepted by the CLI for
+    three commits while crashing inside it. So this checks the solve's own
+    reported comparison -- the delivered atlas against the blend it started
+    from -- which a dispatcher that quietly ignored the flag could not produce.
+    """
+    _examples_on_path()
+    import json
+
+    import extract_mesh
+
+    cfg = _config(
+        capture,
+        tmp_path,
+        texture_mode="atlas",
+        texture_size=128,
+        texture_super_resolve=True,
+    )
+    extract_mesh.main(cfg)
+
+    assert (Path(cfg.result_dir) / "mesh.obj").exists()
+    stats = json.loads((Path(cfg.result_dir) / "mesh_metrics.json").read_text())
+    solve = stats["super_resolution"]
+    # Not asserted: that the solve *converged*. On a capture this small it
+    # often does not inside the iteration cap, and that is a legitimate
+    # outcome the CLI warns about rather than an error -- the unknown is a
+    # correction to the blended atlas, so an early stop degrades toward
+    # blending instead of toward nonsense. What matters here is that the flag
+    # reached the solve and the solve made progress.
+    assert 0.0 < solve["solver"]["residual"] < 1.0, solve["solver"]
+    assert solve["solver"]["iterations"] > 0
+    assert solve["mean_psf_sigma_texels"] > 0.0
+    # The solve changed the atlas: a dispatcher that accepted the flag and then
+    # ran the plain blend would report these two as the same number.
+    assert (
+        solve["atlas_sharpness"]["mean_gradient"]
+        != solve["blended_atlas_sharpness"]["mean_gradient"]
+    )
+    # Not asserted here: that it came out *sharper*. On this capture it does
+    # not -- 0.059 against the blend's 0.075 -- and that is a real property of
+    # the regime rather than a wiring fault. The fixture is 6 views of 64x64
+    # over a scene 4 units across, so a source pixel covers more surface than a
+    # texel and there is no sub-texel detail to recover; the gradient prior
+    # then dominates the under-determined solve and smooths. The quality claim
+    # is asserted in `tests/test_texturing.py`, on a fixture whose resolution
+    # makes the premise true. Pinning it here as well would encode "this method
+    # always helps", which the measurements do not support.
+
+
+def test_super_resolution_and_view_selection_are_refused_together(capture, tmp_path):
+    """Two answers to the same question, so the CLI must not take both."""
+    _examples_on_path()
+    import extract_mesh
+
+    cfg = _config(
+        capture,
+        tmp_path,
+        texture_mode="atlas",
+        texture_size=64,
+        texture_super_resolve=True,
+        texture_view_selection=True,
+    )
+    with pytest.raises(ValueError, match="same question"):
+        extract_mesh.main(cfg)
+
+
 # ---------------------------------------------------------------------------
 # The checkpoint-free entry itself
 # ---------------------------------------------------------------------------

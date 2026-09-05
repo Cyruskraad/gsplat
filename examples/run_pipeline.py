@@ -116,6 +116,10 @@ class Config:
     # view that sees it -- sharper, but pointwise less accurate, and it
     # requires --texture_mode atlas. See examples/extract_mesh.py.
     texture_view_selection: bool = False
+    # Solve for the texture whose reprojection best explains every view (a
+    # MAP deconvolution modelling the camera PSF) instead of blending them.
+    # Requires --texture_mode atlas. See examples/extract_mesh.py.
+    texture_super_resolve: bool = False
     # Deliver an existing mesh instead of reconstructing one: cull, decimate,
     # texture and map the .obj/.ply at this path. The extract_mesh stage then
     # needs no checkpoint and no GPU, so the delivery half of the pipeline runs
@@ -464,6 +468,8 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                 ]
                 if cfg.texture_view_selection:
                     cmd += ["--texture_view_selection"]
+                if cfg.texture_super_resolve:
+                    cmd += ["--texture_super_resolve"]
                 if cfg.photometric_align:
                     cmd += [
                         "--photometric_align",

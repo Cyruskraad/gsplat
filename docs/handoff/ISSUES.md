@@ -126,6 +126,53 @@ Each of these cost real time to discover. Do not re-derive them.
     cameras should not see is also facing away and back-face rejection already
     removes it. Use `tests/test_texturing.py::_two_quads`.
 
+### Multi-view super-resolution
+
+22. **It is not strictly better than both alternatives, and the pitch said it
+    would be.** Against *blending* it is a clean win on both axes at once —
+    contrast 63.6% → 90.8% of the ground truth's and L1 0.1081 → 0.0759 —
+    which nothing else in the module manages. Against *view selection* it is
+    reliably sharper but pointwise a coin flip, and which way it lands depends
+    on the regime:
+
+    | Regime | view selection | super-resolved |
+    |---|---|---|
+    | 128 atlas, 48 px views (σ 0.61 tx) | 0.0785 | **0.0759** |
+    | 192 atlas, 48 px views (σ 0.89 tx) | 0.0787 | **0.0784** |
+    | 256 atlas, 64 px views (σ 0.89 tx) | **0.0770** | 0.0788 |
+    | 384 atlas, 64 px views (σ 1.54 tx) | **0.0400** | 0.0493 |
+
+    The reason is structural: single-view sampling reads the source pixels with
+    **no forward model at all**, while this approximates the PSF as a per-view
+    Gaussian in atlas space. Every approximation in that model shows up as
+    pointwise error, and at wide PSFs it costs more than the deconvolution
+    recovers. So it stays opt-in. Do not tighten the test to a strict win on
+    synthetic data.
+23. **The gradient prior enters the normal equations with a PLUS, and getting
+    it wrong looks like success.** `_laplacian` returns the positive
+    semi-definite graph Laplacian, so the normal equations of
+    `||S T − c||² + λ Tᵀ L T` are `(SᵀWS + λL) T = SᵀWc`. Subtracting it makes
+    the operator **indefinite**, CG has no descent direction, and the solve
+    diverges — into an atlas measuring **464% of the ground truth's contrast**.
+    `atlas_sharpness` alone calls that a triumph. The tells are the L1 (five
+    times worse) and non-monotonicity in λ (0.02 → 464%, 0.1 → 168%,
+    0.5 → 375%). Any test on this must bound contrast from **above** as well as
+    below.
+24. **More solver iterations make it worse, not better.** L1 against the truth
+    is *U-shaped* in λ and in iteration count: driving the data residual down
+    harder over-fits a forward model that is only an approximation. A
+    monotonicity assertion on L1 is therefore false; contrast *is* monotonic in
+    λ and is what to assert.
+25. **Its premise is a resolution one, and small captures do not meet it.** The
+    method recovers detail no single view resolves, so it needs the atlas to be
+    finer than a source pixel's footprint (σ ≳ 0.5 texels). On
+    `tests/test_extract_mesh_cli.py`'s deliberately tiny capture — 6 views of
+    64×64 over a scene 4 units across — a source pixel covers *more* surface
+    than a texel, there is nothing to recover, the prior dominates and the
+    result comes out **blurrier than the blend** (0.059 vs 0.075). That is the
+    regime, not a fault; the quality assertions live on a fixture that meets
+    the premise.
+
 ### Photometric camera refinement
 
 17. **open3d already ships this algorithm and it does not work here.**

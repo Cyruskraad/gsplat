@@ -914,6 +914,7 @@ def test_pipeline_reaches_the_whole_delivery_path(tmp_path):
             "--photometric_align",
             "--photometric_align_levels",
             "4",
+            "--texture_super_resolve",
         ],
     )
     for expected in (
@@ -929,6 +930,7 @@ def test_pipeline_reaches_the_whole_delivery_path(tmp_path):
         # it is the most expensive kind to leave unwired.
         "--photometric_align",
         "--photometric_align_levels 4",
+        "--texture_super_resolve",
     ):
         assert expected in line, (expected, line)
 
