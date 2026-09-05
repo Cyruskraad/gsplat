@@ -16,6 +16,7 @@ Everything below is new on this branch unless marked *(modified)*.
 | `neural_sfm.py` | 299 | Adapter for externally-run DUSt3R/MASt3R/VGGT-style tools |
 | `__init__.py` | 146 | Re-exports; 41 public names |
 | `dense_mvs.py` | 138 | Shells out to the `colmap` CLI for patch-match stereo + fusion |
+| `level_set.py` | 620 | GOF-style iso-surface extraction; marching tetrahedra + diagnostics (CPU) and the Gaussian opacity field (GPU, unrun) |
 | `mesh_refinement.py` | 330 | Slides vertices along normals onto the photoconsistent surface (patch NCC) |
 | `photometric_alignment.py` | 400 | **Not exported.** A retained negative result — see `ISSUES.md` §5b |
 | `_open3d.py` | 31 | The shared `_require_open3d()` guard, so extraction and texturing need not depend on each other |
@@ -36,7 +37,7 @@ Also modified: `examples/simple_trainer_2dgs.py` (`--extract_mesh`,
 (`mono_depth_dir`, `mask_dir`), `.github/workflows/core_tests.yml` (installs
 the suite's deps).
 
-### Tests — 174 across 11 files
+### Tests — 196 across 12 files
 
 | File | Tests | Lines |
 |---|---:|---:|
@@ -49,6 +50,7 @@ the suite's deps).
 | `tests/test_extract_mesh_cli.py` | 8 | 420 |
 | `tests/test_photometric_alignment.py` | 2 | 180 |
 | `tests/test_mesh_refinement.py` | 5 | 250 |
+| `tests/test_level_set.py` | 20 | 330 |
 | `tests/test_neural_sfm.py` | 4 | 243 |
 | `tests/test_bundle_adjustment.py` | 3 | 166 |
 
@@ -142,7 +144,7 @@ are now derived from the capture itself:
 
 ---
 
-## Public API — 42 names
+## Public API — 49 names
 
 ```
 Reconstruction   refine_reconstruction  run_dense_mvs
@@ -151,6 +153,9 @@ Reconstruction   refine_reconstruction  run_dense_mvs
 Surface          extract_mesh_tsdf  extract_mesh_poisson  derive_tsdf_parameters
                  cull_unobserved_faces  simplify_mesh  simplify_mesh_to_error
                  refine_mesh_photometric
+                 extract_level_set  marching_tetrahedra  tetrahedral_grid
+                 gaussian_opacity_field  probe_field  level_set_residual
+                 validate_level_set_pipeline
 
 Texturing        bake_texture  bake_texture_atlas  bake_texture_atlas_view_selected
                  bake_texture_atlas_pages  bake_mesh_texture

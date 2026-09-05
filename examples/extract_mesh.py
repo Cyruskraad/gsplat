@@ -56,6 +56,11 @@ from gsplat.photogrammetry.mesh_extraction import (
     simplify_mesh,
     simplify_mesh_to_error,
 )
+from gsplat.photogrammetry.level_set import (
+    extract_level_set,
+    gaussian_opacity_field,
+    validate_level_set_pipeline,
+)
 from gsplat.photogrammetry.mesh_refinement import refine_mesh_photometric
 from gsplat.photogrammetry.metrics import mesh_quality_stats, point_to_mesh_distance
 
@@ -100,7 +105,7 @@ class Config:
     # "poisson" reconstructs from --dense_points; "mesh" skips reconstruction
     # and loads --mesh_path, so an existing mesh can be culled, decimated,
     # textured and mapped without a checkpoint or a GPU.
-    method: Literal["tsdf", "poisson", "mesh"] = "tsdf"
+    method: Literal["tsdf", "poisson", "mesh", "level_set"] = "tsdf"
     # Renderer used to produce depth maps for TSDF fusion.
     renderer: Literal["2dgs", "3dgs"] = "2dgs"
     # Path to a dense MVS point cloud (see examples/dense_mvs.py). Required
@@ -139,6 +144,23 @@ class Config:
     refine_smoothness: float = 1.0
     # Visibility/tangent-frame recomputations for --refine_mesh.
     refine_rounds: int = 6
+    # Grid cells along the longest axis for --method level_set. Cost and
+    # memory are cubic in this; start at 64 and check the reported residual
+    # before raising it.
+    level_set_resolution: int = 128
+    # Iso-value for --method level_set. The field is 0.5 - opacity, so 0.0 is
+    # the half-opacity surface. Run --level_set_selftest and then read the
+    # probe report in mesh_metrics.json before changing it.
+    level_set_level: float = 0.0
+    # Directory to dump level-set intermediates into (field samples coloured by
+    # value, the raw surface, the raw field array). For debugging a GPU run
+    # that produced something surprising.
+    level_set_debug_dir: Optional[str] = None
+    # Run the level-set self-test against analytic fields and exit. Needs no
+    # GPU and no checkpoint -- the first thing to run in a new environment, and
+    # the first thing to run when a real extraction misbehaves: if it fails,
+    # the bug is in gsplat, not in your scene.
+    level_set_selftest: bool = False
     # Neighbourhood radius for Poisson normal estimation, in scene units.
     # Left unset it is 5x the cloud's own k-nearest-neighbour spacing, the
     # measured knee past which open3d's neighbour cap binds anyway.
@@ -256,6 +278,16 @@ class Config:
 
 
 def main(cfg: Config) -> None:
+    if cfg.level_set_selftest:
+        results = validate_level_set_pipeline()
+        if not results["passed"]:
+            raise RuntimeError(
+                "The level-set self-test failed against analytic fields, so "
+                "the extractor is broken independently of any scene: "
+                f"{results['failures']}"
+            )
+        return
+
     # Each method needs a different input, and the check has to be per-method:
     # a blanket `assert cfg.ckpt` made --method poisson demand a checkpoint it
     # never opens, and made main() unreachable without a GPU -- which is how a
@@ -265,6 +297,7 @@ def main(cfg: Config) -> None:
         "tsdf": ("ckpt", cfg.ckpt),
         "poisson": ("dense_points", cfg.dense_points),
         "mesh": ("mesh_path", cfg.mesh_path),
+        "level_set": ("ckpt", cfg.ckpt),
     }
     if cfg.method not in required:
         raise ValueError(f"Unknown method: {cfg.method!r}")
@@ -319,6 +352,34 @@ def main(cfg: Config) -> None:
             stats_out=extraction_stats,
         )
         reference_points = points_xyz
+    elif cfg.method == "level_set":
+        ckpt = torch.load(cfg.ckpt, map_location=cfg.device)
+        splats = {k: v.to(cfg.device) for k, v in ckpt["splats"].items()}
+        field_fn, field_info = gaussian_opacity_field(splats, device=cfg.device)
+        print(
+            f"[extract_mesh] built an opacity field over "
+            f"{field_info['num_gaussians']} Gaussians. This path has never run "
+            "against a real checkpoint -- check the residual below before "
+            "trusting the result."
+        )
+        mesh, level_stats = extract_level_set(
+            field_fn,
+            np.asarray(field_info["bounds"]),
+            resolution=cfg.level_set_resolution,
+            level=cfg.level_set_level,
+            debug_dir=cfg.level_set_debug_dir,
+            diagnostics=extraction_stats,
+        )
+        for message in level_stats["warnings"]:
+            warnings.warn(f"level-set extraction: {message}", RuntimeWarning)
+        residual = level_stats.get("residual", {}).get("mean_abs_over_cell")
+        print(
+            f"[extract_mesh] level set: {level_stats['num_triangles']} triangles, "
+            f"watertight={level_stats['is_watertight']}, surface sits "
+            f"{residual if residual is None else round(residual, 4)} cells from "
+            "the requested level"
+        )
+        reference_points = parser.points
     else:
         mesh = o3d.io.read_triangle_mesh(cfg.mesh_path)
         if len(mesh.triangles) == 0:

@@ -265,6 +265,60 @@ was written** — the reverse of §5b, and the cheapest lesson on this branch.
 *with* per-view exposure variation: without it, removing the z-normalisation —
 the one decision that distinguishes this from §5b — passes every other test.
 
+## 5d. Level-set extraction: what is verified, and what is not
+
+`gsplat/photogrammetry/level_set.py` (GOF-style, Yu et al. 2024) is exported and
+on the CLI as `--method level_set`. **It has never run on a GPU or against a
+real trained checkpoint.** Be precise about the split, because it is narrower
+than "GPU-blocked" suggests:
+
+**Executed and measured here** — marching tetrahedra against analytic fields:
+watertight at every resolution, area 4pi and volume 4pi/3 on a sphere to within
+0.1%, a plane's area exactly 9.0, and **quadratic convergence** (error falls
+4.17x per halving, as linear interpolation on a smooth field should). Also the
+opacity field adapter's own arithmetic, on CPU with synthetic Gaussians: the
+0.5-opacity radius matches closed form to 0.06%, and the quaternion rotation
+convention is correct.
+
+**Not executed** — CUDA, and a real scene's thousands of anisotropic Gaussians
+with real scale and opacity distributions. Also unanswered: whether a level set
+of this simplified opacity field is a *good* surface. GOF adds a view-dependent
+ray-space refinement this deliberately omits, so this is an approximation of
+the paper, not a reimplementation.
+
+**Debugging it on a GPU, in the order to reach for things:**
+
+1. `--level_set_selftest` — no GPU, no checkpoint, runs the whole extractor
+   against analytic fields. **If this fails the bug is in gsplat, not in your
+   scene.** It is also the cheapest thing in this list.
+2. `probe_field` — one coarse field evaluation. Catches the three silent
+   failures (level outside the field's range, bounds that miss the surface,
+   a degenerate field) *before* the expensive extraction.
+3. `stats["warnings"]` — every one of those failures returns an empty mesh with
+   a sentence naming which of the level, the bounds or the field is at fault,
+   and the actual numbers. The empty case reports the same keys as a successful
+   one, deliberately: it is the case you inspect *because* something is wrong.
+4. `--level_set_debug_dir` — writes the grid coloured red/blue either side of
+   the level, the raw pre-cleanup surface, and the field array, so the
+   intermediate state can be opened in a viewer.
+5. `level_set_residual` — **the check that needs no ground truth**: re-evaluate
+   the field at the extracted vertices and see how far they sit from the level.
+   Reported against the cell size, so below 1 is expected and far above is not.
+   On a real capture this is the only faithfulness number available.
+
+Two traps found while building it, both of which pass a naive test:
+
+- **Vertex positions cannot check connectivity.** The first version grouped
+  marching-tetrahedra corners per edge and reshaped, building each face from
+  three *different* tetrahedra's corners. Every vertex still landed exactly
+  right — they are interpolated per edge, independent of grouping — so radius
+  and convergence looked perfect while the surface was shredded. Only
+  `is_edge_manifold` saw it.
+- **A single-axis rotation cannot distinguish R from its transpose.** They give
+  mirror-image ellipsoids, and an axis-aligned bounding box is invariant under
+  that mirror. Transposing the rotation passed every extent test until one used
+  a 120-degree rotation about (1,1,1), which permutes three distinct axes.
+
 ## 6. What to do next
 
 Ordered by value.

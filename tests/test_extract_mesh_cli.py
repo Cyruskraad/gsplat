@@ -453,3 +453,32 @@ def test_each_method_requires_its_own_input(tmp_path):
         )
     )
     assert os.path.exists(os.path.join(common["result_dir"], "mesh.ply"))
+
+
+def test_the_level_set_selftest_is_reachable_from_the_cli(tmp_path):
+    """`--level_set_selftest` needs no GPU and no checkpoint, so it must run.
+
+    It exists so a GPU user can prove the extractor works against analytic
+    fields before spending time on a real scene, and so that a failure there
+    points at gsplat rather than at their capture. That is only useful if the
+    flag actually reaches the self-test, which is exactly the kind of CLI
+    wiring this file exists to pin.
+    """
+    import extract_mesh
+
+    # No data_dir, no ckpt, no mesh: the self-test must short-circuit before
+    # any of the input checks, or it is useless in the situation it is for.
+    extract_mesh.main(extract_mesh.Config(level_set_selftest=True))
+
+
+def test_a_failing_level_set_selftest_stops_the_run(monkeypatch, tmp_path):
+    """A broken extractor must not be reported as a passing self-test."""
+    import extract_mesh
+
+    monkeypatch.setattr(
+        extract_mesh,
+        "validate_level_set_pipeline",
+        lambda *a, **k: {"passed": False, "failures": ["deliberate"], "checks": {}},
+    )
+    with pytest.raises(RuntimeError, match="self-test failed"):
+        extract_mesh.main(extract_mesh.Config(level_set_selftest=True))
