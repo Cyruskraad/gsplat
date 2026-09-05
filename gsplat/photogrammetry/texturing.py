@@ -153,6 +153,7 @@ def _bake_points_from_views(
     outlier_sigma: Optional[float] = None,
     outlier_iterations: int = 3,
     min_views_for_clipping: int = 3,
+    occluder=None,
 ):
     """Accumulate occlusion-aware, view-weighted colors for surface points.
 
@@ -160,9 +161,15 @@ def _bake_points_from_views(
     :func:`bake_texture_atlas` (which bakes at texel positions), so both
     produce the same color signal and only differ in where they sample it.
 
+    ``occluder`` is what rays are cast against, defaulting to ``mesh``. It has
+    to be separable for multi-page atlases: baking one page of a mesh means
+    passing only that page's geometry as ``mesh``, and a page cast against
+    *itself* is blind to everything the rest of the mesh puts in front of it --
+    the far wall of a room would be textured straight through the near one.
+
     For each point, projects into every (or up to ``max_views``) training
     camera, discards out-of-frame projections and -- via ray casting against
-    ``mesh`` itself -- occluded ones, and accumulates the remaining observed
+    ``occluder`` -- occluded ones, and accumulates the remaining observed
     pixel colors weighted by view-direction/surface-normal alignment and
     inverse distance.
 
@@ -211,7 +218,9 @@ def _bake_points_from_views(
     """
     o3d = _require_open3d()
 
-    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(mesh)
+    t_mesh = o3d.t.geometry.TriangleMesh.from_legacy(
+        mesh if occluder is None else occluder
+    )
     scene = o3d.t.geometry.RaycastingScene()
     scene.add_triangles(t_mesh)
 
@@ -589,6 +598,7 @@ def bake_texture_atlas(
     margin: float = 2.0,
     max_stretch: float = 1.0 / 6.0,
     dilation: int = 4,
+    occluder=None,
 ):
     """Bake a UV-unwrapped texture atlas onto ``mesh`` from the training images.
 
@@ -631,6 +641,9 @@ def bake_texture_atlas(
             Lower values cut the mesh into more, less distorted charts.
         dilation: How many texels to grow baked colors outward across seams
             and unobserved patches.
+        occluder: Geometry to ray-cast against, defaulting to ``mesh``. Only
+            needed when ``mesh`` is a *part* of a larger surface -- one page of
+            a multi-page atlas -- which cannot see what the rest of it hides.
 
     Returns:
         ``(mesh, texture)``: ``mesh`` with ``triangle_uvs``/``textures`` set in
@@ -670,6 +683,7 @@ def bake_texture_atlas(
             max_views=max_views,
             outlier_sigma=outlier_sigma,
             outlier_iterations=outlier_iterations,
+            occluder=occluder,
         )
         observed = weight_accum > 0
         texture[rows[observed], cols[observed]] = (
@@ -688,6 +702,119 @@ def bake_texture_atlas(
     return mesh, texture
 
 
+def bake_texture_atlas_pages(
+    mesh,
+    dataset,
+    num_pages: int,
+    texture_size: int = 2048,
+    max_views: Optional[int] = None,
+    outlier_sigma: Optional[float] = None,
+    outlier_iterations: int = 3,
+    dilation: int = 4,
+):
+    """Bake the mesh across several atlas pages instead of one.
+
+    One atlas has a ceiling: past 8192 or 16384 texels a side, GPUs stop
+    wanting to hold it and the evidence still might not fit -- which is exactly
+    what :func:`recommended_texture_size` reports as ``clamped``. Splitting the
+    surface across N pages multiplies the texel budget by N without any single
+    image growing, and is what production assets do.
+
+    Faces are split by :func:`partition_faces`, each page unwrapped and baked
+    on its own, and the per-page UVs scattered back onto the original faces.
+    The geometry is untouched: the returned mesh is the one passed in, now
+    carrying ``triangle_uvs``, one texture per page, and
+    ``triangle_material_ids`` saying which page each face reads from -- which
+    is what open3d writes as a multi-material ``.obj`` + ``.mtl`` + N PNGs.
+
+    **Each page is baked against the whole mesh as the occluder**, not against
+    itself. A page cast against its own geometry alone is blind to everything
+    the rest of the surface puts in front of it, and would texture the far wall
+    of a room straight through the near one.
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``. Each page must be
+            individually manifold to unwrap; the error names the page if not.
+        dataset: An ``examples.datasets.colmap.Dataset``-like object.
+        num_pages: How many atlas pages. 1 is just :func:`bake_texture_atlas`.
+        texture_size: Width/height of *each* page.
+        max_views: See :func:`bake_texture_atlas`.
+        outlier_sigma: See :func:`_bake_points_from_views`.
+        outlier_iterations: See :func:`_bake_points_from_views`.
+        dilation: See :func:`bake_texture_atlas`.
+
+    Returns:
+        ``(mesh, textures, stats)`` -- ``textures`` is a list of ``num_pages``
+        ``uint8`` atlases, and ``stats`` reports ``num_pages``,
+        ``texture_size``, ``total_texels`` and ``faces_per_page``.
+
+    Raises:
+        ValueError: If ``num_pages`` is not positive, there are fewer faces
+            than pages, or a page cannot be unwrapped.
+    """
+    o3d = _require_open3d()
+
+    triangles = np.asarray(mesh.triangles)
+    vertices = np.asarray(mesh.vertices)
+    labels = partition_faces(mesh, num_pages)
+
+    corner_uvs = np.zeros((3 * len(triangles), 2), dtype=np.float64)
+    textures = []
+    faces_per_page = []
+    for page in range(num_pages):
+        face_ids = np.nonzero(labels == page)[0]
+        faces_per_page.append(int(len(face_ids)))
+
+        # A standalone submesh, re-indexed onto only the vertices it uses.
+        used, remapped = np.unique(triangles[face_ids], return_inverse=True)
+        sub = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(vertices[used]),
+            o3d.utility.Vector3iVector(remapped.reshape(-1, 3).astype(np.int32)),
+        )
+        sub.compute_vertex_normals()
+
+        try:
+            sub, texture = bake_texture_atlas(
+                sub,
+                dataset,
+                texture_size=texture_size,
+                max_views=max_views,
+                outlier_sigma=outlier_sigma,
+                outlier_iterations=outlier_iterations,
+                dilation=dilation,
+                occluder=mesh,
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"Atlas page {page} of {num_pages} could not be baked: {e} "
+                "Splitting a mesh into pages cuts it along face boundaries, "
+                "which can leave a page non-manifold even when the whole mesh "
+                "is not. Try a different num_pages, or bake a single page."
+            ) from e
+
+        page_uvs = np.asarray(sub.triangle_uvs).reshape(-1, 3, 2)
+        # Face f's three corner UVs live at rows 3f, 3f+1, 3f+2 of the whole
+        # mesh's (3F, 2) array. `face_ids` is in the same order the submesh's
+        # triangles were built in, so the two line up row for row.
+        slots = (face_ids[:, None] * 3 + np.arange(3)).reshape(-1)
+        corner_uvs[slots] = page_uvs.reshape(-1, 2)
+        textures.append(texture)
+
+    mesh.triangle_uvs = o3d.utility.Vector2dVector(corner_uvs)
+    mesh.textures = [o3d.geometry.Image(t) for t in textures]
+    mesh.triangle_material_ids = o3d.utility.IntVector(labels.astype(np.int32))
+    return (
+        mesh,
+        textures,
+        {
+            "num_pages": int(num_pages),
+            "texture_size": int(texture_size),
+            "total_texels": int(num_pages * texture_size**2),
+            "faces_per_page": faces_per_page,
+        },
+    )
+
+
 def bake_mesh_texture(
     mesh,
     dataset,
@@ -700,6 +827,7 @@ def bake_mesh_texture(
     view_selection: bool = False,
     mrf_smoothness: float = 1.0,
     stats_out: Optional[dict] = None,
+    num_pages: int = 1,
 ):
     """Bake texture onto ``mesh`` in either supported form.
 
@@ -727,6 +855,11 @@ def bake_mesh_texture(
             :func:`bake_texture_atlas_view_selected` for the tradeoff this
             makes. Ignored in ``"vertex"`` mode, which has no faces to label.
         mrf_smoothness: Seam penalty, for ``view_selection``.
+        num_pages: In ``"atlas"`` mode, split the surface across this many
+            atlas pages (see :func:`bake_texture_atlas_pages`). Above 1 the
+            returned ``texture`` is the *first* page; the rest are on the mesh,
+            and ``stats_out`` carries the page stats. Not combinable with
+            ``view_selection`` yet.
         stats_out: If given, a dict updated in place with the view-selection
             stats. An out-parameter rather than a third return value because
             several callers unpack this function's ``(mesh, texture)`` pair,
@@ -754,7 +887,28 @@ def bake_mesh_texture(
             f"Unknown texture mode {mode!r}, expected 'vertex' or 'atlas'."
         )
 
+    if num_pages > 1 and view_selection:
+        raise ValueError(
+            "num_pages > 1 and view_selection cannot be combined yet: view "
+            "selection labels faces across the whole mesh and would need its "
+            "seam levelling to run across page boundaries, which is not "
+            "implemented. Pick one."
+        )
+
     try:
+        if num_pages > 1:
+            mesh, textures, stats = bake_texture_atlas_pages(
+                mesh,
+                dataset,
+                num_pages=num_pages,
+                texture_size=texture_size,
+                max_views=max_views,
+                outlier_sigma=outlier_sigma,
+                outlier_iterations=outlier_iterations,
+            )
+            if stats_out is not None:
+                stats_out.update(stats)
+            return mesh, textures[0]
         if view_selection:
             mesh, texture, stats = bake_texture_atlas_view_selected(
                 mesh,
@@ -1309,6 +1463,68 @@ def face_projected_areas(mesh, dataset, max_views: Optional[int] = None) -> np.n
         )
         areas[seen] = np.maximum(areas[seen], _triangle_pixel_areas(uv))
     return areas
+
+
+def partition_faces(mesh, num_pages: int) -> np.ndarray:
+    """Split a mesh's faces into ``num_pages`` compact, balanced groups.
+
+    Each group gets its own atlas page, so the split wants two things: groups
+    of roughly equal face count (pages of equal resolution then carry roughly
+    equal detail) and spatial coherence (a group scattered across the scene
+    unwraps into many small charts, which pack badly and multiply seams).
+
+    Recursive median splits give both, deterministically and with no
+    dependency: repeatedly take the group with the most faces, find its
+    longest axis, and cut it at the median of the face centroids along that
+    axis. Balanced by construction, since a median split is even, and compact
+    because each cut is axis-aligned on the longest extent.
+
+    Clustering (k-means on centroids) would give slightly rounder groups, but
+    it is iterative, needs a seeding rule to be reproducible, and buys little
+    here: what matters is that a group is contiguous, not that it is round.
+
+    Args:
+        mesh: An ``open3d.geometry.TriangleMesh``.
+        num_pages: How many groups. 1 returns all-zeros.
+
+    Returns:
+        ``(F,)`` int array of group indices in ``[0, num_pages)``.
+
+    Raises:
+        ValueError: If ``mesh`` has no triangles, ``num_pages`` is not
+            positive, or there are fewer faces than pages.
+    """
+    _require_open3d()
+
+    triangles = np.asarray(mesh.triangles)
+    vertices = np.asarray(mesh.vertices)
+    if len(triangles) == 0:
+        raise ValueError("Cannot partition a mesh with no triangles.")
+    if num_pages <= 0:
+        raise ValueError(f"num_pages must be positive, got {num_pages}.")
+    if num_pages > len(triangles):
+        raise ValueError(
+            f"Cannot split {len(triangles)} faces into {num_pages} pages: a "
+            "page with no faces would unwrap to an empty atlas."
+        )
+
+    centroids = vertices[triangles].mean(axis=1)
+    groups = [np.arange(len(triangles))]
+    while len(groups) < num_pages:
+        # Split the biggest group, so face counts stay even as we go.
+        index = int(np.argmax([len(g) for g in groups]))
+        members = groups.pop(index)
+        points = centroids[members]
+        axis = int(np.argmax(points.max(axis=0) - points.min(axis=0)))
+        order = members[np.argsort(points[:, axis], kind="stable")]
+        half = len(order) // 2
+        groups.append(order[:half])
+        groups.append(order[half:])
+
+    labels = np.zeros(len(triangles), dtype=np.int64)
+    for page, members in enumerate(groups):
+        labels[members] = page
+    return labels
 
 
 def recommended_texture_size(

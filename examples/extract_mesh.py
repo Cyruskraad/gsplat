@@ -133,6 +133,12 @@ class Config:
     # (there is no defensible constant -- measured across test meshes it
     # ranges 43%-73%).
     texture_texels_per_pixel: Optional[float] = None
+    # Split the surface across this many atlas pages instead of one. Past 8192
+    # or 16384 texels a side an atlas stops being practical, and splitting is
+    # the only way to keep adding texels -- N pages of --texture_size carry
+    # what one page of N times the area would. Writes mesh_0.png ... mesh_N.png
+    # and a multi-material .mtl. Not combinable with --texture_view_selection.
+    texture_pages: int = 1
     # Robust multi-view fusion: discard observations more than this many
     # standard deviations from a point's own mean colour before averaging, so
     # a specular highlight or a slightly misregistered camera doesn't get
@@ -255,6 +261,11 @@ def main(cfg: Config) -> None:
             "--normal_map/--ao_map need UV coordinates to bake into, so they "
             "require --texture_mode atlas (which also switches the output to "
             ".obj)."
+        )
+    if cfg.texture_pages > 1 and cfg.texture_mode != "atlas":
+        raise ValueError(
+            "--texture_pages splits a UV atlas across several images, so it "
+            "requires --texture_mode atlas."
         )
     if cfg.texture_view_selection and cfg.texture_mode != "atlas":
         raise ValueError(
@@ -399,6 +410,7 @@ def main(cfg: Config) -> None:
             outlier_sigma=(
                 cfg.texture_outlier_sigma if cfg.texture_outlier_sigma > 0 else None
             ),
+            num_pages=cfg.texture_pages,
             view_selection=cfg.texture_view_selection,
             mrf_smoothness=cfg.texture_mrf_lambda,
             seam_smoothness=(

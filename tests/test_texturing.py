@@ -20,6 +20,8 @@ independently -- hand-built adjacency, hand-built quality matrices, and the
 analytic sphere dataset from tests/test_mesh_extraction.py.
 """
 
+import os
+
 import numpy as np
 import pytest
 
@@ -1163,3 +1165,323 @@ def test_evidence_is_bounded_by_the_surface_not_the_view_count():
         evidence_few,
         evidence_many,
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-page atlases
+# ---------------------------------------------------------------------------
+
+
+def _two_quads():
+    """A near quad hiding the centre of a larger one behind it.
+
+    The smallest scene that is *non-convex*: both quads face the cameras, so
+    back-face rejection does not separate them and only an occlusion test can.
+    A sphere cannot stand in for this -- it is convex, so every face the
+    cameras should not see is also facing away from them, and a bake with no
+    occlusion test at all still gets the right answer.
+    """
+    vertices, triangles = [], []
+    for z, half in ((0.0, 0.5), (-1.0, 1.0)):
+        base = len(vertices)
+        vertices += [
+            [-half, -half, z],
+            [half, -half, z],
+            [half, half, z],
+            [-half, half, z],
+        ]
+        triangles += [[base, base + 1, base + 2], [base, base + 2, base + 3]]
+    mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(np.array(vertices, dtype=np.float64)),
+        o3d.utility.Vector3iVector(np.array(triangles, dtype=np.int32)),
+    )
+    mesh.compute_vertex_normals()
+    return mesh
+
+
+class _QuadViews:
+    """Cameras in front of :func:`_two_quads`; near quad red, far quad blue."""
+
+    def __init__(self, mesh, num_views=6, distance=4.0, size=128, focal=160.0):
+        torch = pytest.importorskip("torch")
+
+        scene = o3d.t.geometry.RaycastingScene()
+        scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(mesh))
+        K = np.array([[focal, 0, size / 2], [0, focal, size / 2], [0, 0, 1.0]])
+        self._items = []
+        for i in range(num_views):
+            angle = 0.25 * (i / max(num_views - 1, 1) - 0.5)
+            camera = np.array([distance * np.sin(angle), 0.0, distance * np.cos(angle)])
+            forward = -camera / np.linalg.norm(camera)
+            right = np.cross(forward, np.array([0.0, 1.0, 0.0]))
+            right /= np.linalg.norm(right)
+            rotation = np.stack([right, -np.cross(right, forward), forward], axis=1)
+            camtoworld = np.eye(4)
+            camtoworld[:3, :3], camtoworld[:3, 3] = rotation, camera
+
+            ys, xs = np.meshgrid(np.arange(size), np.arange(size), indexing="ij")
+            dirs = np.stack(
+                [
+                    (xs - size / 2 + 0.5) / focal,
+                    (ys - size / 2 + 0.5) / focal,
+                    np.ones_like(xs),
+                ],
+                axis=-1,
+            )
+            dirs = np.einsum(
+                "ij,hwj->hwi",
+                rotation,
+                dirs / np.linalg.norm(dirs, axis=-1, keepdims=True),
+            )
+            rays = np.concatenate(
+                [np.broadcast_to(camera, (size, size, 3)), dirs], axis=-1
+            ).astype(np.float32)
+            hit = scene.cast_rays(o3d.core.Tensor(rays))
+            primitive = hit["primitive_ids"].numpy()
+            landed = np.isfinite(hit["t_hit"].numpy())
+
+            image = np.zeros((size, size, 3))
+            image[landed & (primitive < 2)] = [0.9, 0.1, 0.1]
+            image[landed & (primitive >= 2) & (primitive < 4)] = [0.1, 0.1, 0.9]
+            self._items.append(
+                {
+                    "camtoworld": torch.from_numpy(camtoworld),
+                    "K": torch.from_numpy(K),
+                    "image": torch.from_numpy((image * 255).astype(np.float32)),
+                }
+            )
+
+    def __len__(self):
+        return len(self._items)
+
+    def __getitem__(self, index):
+        return self._items[index]
+
+
+def test_a_page_is_occluded_by_the_rest_of_the_mesh_not_just_itself():
+    """The trap in baking one page of a multi-page atlas.
+
+    A page ray-cast against its own geometry alone is blind to everything the
+    rest of the surface puts in front of it -- it textures the far wall of a
+    room straight through the near one. Here the far quad's centre is hidden
+    in every view, so the only correct answer is "never observed"; casting
+    against the page alone instead samples the *near* quad's red onto it.
+    """
+    from gsplat.photogrammetry.texturing import _bake_points_from_views
+
+    mesh = _two_quads()
+    dataset = _QuadViews(mesh)
+    hidden_point = np.array([[0.0, 0.0, -1.0]])
+    facing_camera = np.array([[0.0, 0.0, 1.0]])
+
+    far_page = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(np.asarray(mesh.vertices)[4:]),
+        o3d.utility.Vector3iVector(np.array([[0, 1, 2], [0, 2, 3]], dtype=np.int32)),
+    )
+
+    _, weight_whole = _bake_points_from_views(
+        mesh, dataset, hidden_point, facing_camera, occluder=mesh
+    )
+    colors_page, weight_page = _bake_points_from_views(
+        mesh, dataset, hidden_point, facing_camera, occluder=far_page
+    )
+
+    # Correct: hidden in every view, so nothing was accumulated.
+    assert weight_whole[0] == 0.0, weight_whole
+
+    # Premise: casting against the page alone does *not* merely lose accuracy,
+    # it accepts the sample -- and the colour it accepts is the occluder's.
+    assert weight_page[0] > 0.0, weight_page
+    sampled = colors_page[0] / weight_page[0]
+    assert sampled[0] > 0.7 and sampled[2] < 0.3, sampled  # the near quad's red
+
+
+def test_partition_is_balanced_deterministic_and_compact():
+    """Even face counts, reproducible, and groups that stay together in space."""
+    from gsplat.photogrammetry.texturing import partition_faces
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    mesh = _unit_sphere_mesh(resolution=20)
+    centroids = np.asarray(mesh.vertices)[np.asarray(mesh.triangles)].mean(axis=1)
+
+    spreads = []
+    for pages in (1, 2, 4, 8):
+        labels = partition_faces(mesh, pages)
+        assert labels.min() >= 0 and labels.max() == pages - 1
+        counts = np.bincount(labels, minlength=pages)
+        # Median splits of powers of two are exactly even.
+        assert counts.max() == counts.min(), (pages, counts)
+        np.testing.assert_array_equal(labels, partition_faces(mesh, pages))
+        spreads.append(
+            float(
+                np.mean(
+                    [
+                        np.linalg.norm(
+                            centroids[labels == g] - centroids[labels == g].mean(0),
+                            axis=1,
+                        ).mean()
+                        for g in range(pages)
+                    ]
+                )
+            )
+        )
+    # Compactness: more pages must mean tighter groups, or the split is not
+    # spatial at all. Measured 0.996 -> 0.890 -> 0.770 -> 0.476.
+    assert spreads == sorted(spreads, reverse=True), spreads
+    assert spreads[-1] < 0.6 * spreads[0], spreads
+
+    # A count that is not a power of two still works, and is balanced within
+    # 2x -- "split the biggest" cannot do better with median cuts.
+    counts = np.bincount(partition_faces(mesh, 3))
+    assert counts.max() / counts.min() <= 2.0, counts
+
+
+def test_partition_rejects_more_pages_than_faces():
+    from gsplat.photogrammetry.texturing import partition_faces
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    mesh = _unit_sphere_mesh(resolution=4)
+    with pytest.raises(ValueError, match="num_pages must be positive"):
+        partition_faces(mesh, 0)
+    with pytest.raises(ValueError, match="page with no faces"):
+        partition_faces(mesh, len(mesh.triangles) + 1)
+    with pytest.raises(ValueError, match="no triangles"):
+        partition_faces(o3d.geometry.TriangleMesh(), 2)
+
+
+def _page_face_error(mesh, textures, pattern, size):
+    """Mean colour error sampling each face through *its own* page and UVs."""
+    vertices = np.asarray(mesh.vertices)
+    triangles = np.asarray(mesh.triangles)
+    uvs = np.asarray(mesh.triangle_uvs)
+    ids = np.asarray(mesh.triangle_material_ids)
+    centroids = vertices[triangles].mean(axis=1)
+    truth = pattern(centroids / np.linalg.norm(centroids, axis=1, keepdims=True))
+
+    errors = []
+    for face in range(len(triangles)):
+        uv = uvs[3 * face : 3 * face + 3].mean(axis=0)
+        col = int(np.clip(uv[0] * size, 0, size - 1))
+        row = int(np.clip((1.0 - uv[1]) * size, 0, size - 1))
+        errors.append(
+            np.abs(textures[ids[face]][row, col] / 255.0 - truth[face]).mean()
+        )
+    return float(np.mean(errors))
+
+
+def test_pages_buy_texel_budget_without_a_bigger_image():
+    """N pages of size S carry what one page of the same total texels does.
+
+    That is the whole point: past 8192 or 16384 a side an atlas stops being
+    practical, and splitting is the only way to keep adding texels. Measured
+    on a high-frequency pattern -- 4x256 lands at 0.0318 against 1x512's
+    0.0310, where a single 256 manages only 0.0569.
+    """
+    from gsplat.photogrammetry.texturing import bake_texture_atlas_pages
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    dataset = _SphereDataset(num_views=16, pattern=_high_frequency_pattern)
+
+    def bake(pages, size):
+        mesh = _unit_sphere_mesh(resolution=30)
+        mesh, textures, stats = bake_texture_atlas_pages(
+            mesh, dataset, num_pages=pages, texture_size=size
+        )
+        assert stats["total_texels"] == pages * size * size
+        assert len(textures) == pages
+        return _page_face_error(mesh, textures, _high_frequency_pattern, size)
+
+    one_small = bake(1, 256)
+    four_small = bake(4, 256)
+    one_big = bake(1, 512)
+
+    # Premise: a single small page must actually be losing detail here.
+    assert one_small > 1.4 * one_big, (one_small, one_big)
+    # Four pages recover it, landing near the equal-budget single page.
+    assert four_small < 0.75 * one_small, (four_small, one_small)
+    assert four_small < 1.25 * one_big, (four_small, one_big)
+
+
+def test_multi_page_mesh_writes_and_reads_back_as_multi_material_obj():
+    """Every face must address the page its material id names, through disk.
+
+    A UV scattered onto the wrong face, or a material id off by one, produces
+    an asset that loads without complaint and is textured with someone else's
+    surface -- so this checks the colours after a round trip, not just the
+    counts.
+    """
+    from gsplat.photogrammetry.texturing import bake_texture_atlas_pages
+
+    _SphereDataset, _unit_sphere_mesh = _sphere_fixtures()
+    from test_mesh_extraction import _surface_pattern
+
+    size = 256
+    mesh = _unit_sphere_mesh(resolution=20)
+    mesh, textures, stats = bake_texture_atlas_pages(
+        mesh, _SphereDataset(num_views=16), num_pages=4, texture_size=size
+    )
+    assert stats["faces_per_page"] == [380, 380, 380, 380]
+    assert _page_face_error(mesh, textures, _surface_pattern, size) < 0.02
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, "mesh.obj")
+        assert o3d.io.write_triangle_mesh(path, mesh)
+        written = sorted(os.listdir(directory))
+        assert written == [
+            "mesh.mtl",
+            "mesh.obj",
+            "mesh_0.png",
+            "mesh_1.png",
+            "mesh_2.png",
+            "mesh_3.png",
+        ], written
+
+        loaded = o3d.io.read_triangle_mesh(path, True)
+        assert len(loaded.textures) == 4
+        assert len(np.unique(np.asarray(loaded.triangle_material_ids))) == 4
+
+
+def test_page_bake_uses_the_whole_mesh_as_the_occluder():
+    """The same trap as above, pinned where the pipeline actually hits it.
+
+    `test_a_page_is_occluded_by_the_rest_of_the_mesh_not_just_itself` proves
+    the sampler honours an occluder; this proves `bake_texture_atlas_pages`
+    passes it one. Mutation checking found that gap: swapping the call site to
+    `occluder=None` left the whole suite green, because the direct test
+    supplies its own occluder either way.
+    """
+    from gsplat.photogrammetry.texturing import (
+        bake_texture_atlas_pages,
+        partition_faces,
+    )
+
+    size = 128
+    mesh = _two_quads()
+    # Premise: the split must actually separate the two quads, or there is no
+    # cross-page occlusion to get wrong. Faces 0-1 are the near quad, 2-3 the far.
+    labels = partition_faces(mesh, 2)
+    assert labels[0] == labels[1] and labels[2] == labels[3], labels
+    assert labels[0] != labels[2], labels
+
+    mesh, textures, _ = bake_texture_atlas_pages(
+        _two_quads(), _QuadViews(_two_quads()), num_pages=2, texture_size=size
+    )
+    uvs = np.asarray(mesh.triangle_uvs)
+    ids = np.asarray(mesh.triangle_material_ids)
+
+    sampled = []
+    for face in (2, 3):  # the far quad, hidden at its centre in every view
+        uv = uvs[3 * face : 3 * face + 3].mean(axis=0)
+        col = int(np.clip(uv[0] * size, 0, size - 1))
+        row = int(np.clip((1.0 - uv[1]) * size, 0, size - 1))
+        sampled.append(textures[ids[face]][row, col] / 255.0)
+    hidden = np.mean(sampled, axis=0)
+
+    # The near quad is red. Whatever the hidden centre ends up as -- unobserved
+    # and left to the dilation fill, or reached by the far quad's own visible
+    # blue border -- it must not be the thing standing in front of it.
+    # Measured: [0, 0, 0] correct, [0.898, 0.102, 0.102] with the occluder
+    # dropped.
+    assert not (hidden[0] > 0.5 and hidden[1] < 0.3), hidden

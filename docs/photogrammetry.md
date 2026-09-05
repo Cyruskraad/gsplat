@@ -131,6 +131,32 @@ Baked colors are grown a few texels outward across UV seams and into patches
 no camera observed, so bilinear sampling and mipmapping don't bleed
 background into the surface.
 
+#### More than one atlas page
+
+Past 8192 or 16384 texels a side an atlas stops being practical — GPUs stop
+wanting to hold it — and the evidence may still not fit, which is exactly what
+`recommended_texture_size` reports as `clamped`. `--texture_pages N` splits the
+surface across N pages instead, multiplying the texel budget without any single
+image growing. Measured on a high-frequency pattern: 4 pages of 256² reach a
+face error of 0.0318, against 0.0310 for one 512² page of the same total
+budget, where a single 256² manages only 0.0569.
+
+Faces are split by recursive median cuts on their centroids — deterministic,
+balanced by construction, and spatially compact, so each page unwraps into few
+large charts rather than many scattered ones. open3d writes the result as a
+multi-material `.obj` + `.mtl` + `mesh_0.png … mesh_N.png`, which loads with
+every page attached.
+
+**Each page is baked against the whole mesh as its occluder**, not against
+itself. This is the one subtle part: a page cast against only its own geometry
+is blind to whatever the rest of the surface puts in front of it, and would
+texture the far wall of a room straight through the near one. A convex test
+shape cannot catch that — back-face rejection already hides those samples — so
+it is pinned with a deliberately non-convex scene: a small quad hiding the
+centre of a larger one behind it, both facing the cameras. Correct, the hidden
+centre comes back unobserved; with the occluder dropped it comes back painted
+the near quad's red.
+
 #### Sizing the atlas from the evidence
 
 `--texture_size` is the same wrong question `--target_triangles` was: the right
@@ -872,6 +898,10 @@ something gsplat ships.
   `mean_ao`/`min_ao` and the `cage`/`max_distance` used. A `mean_ao` of
   essentially 1.0 means nothing occluded anything — correct for a convex
   shape, and otherwise a sign the occlusion distance is too small.
+- `gsplat.photogrammetry.bake_texture_atlas_pages(mesh, dataset, num_pages)`
+  returns `(mesh, textures, stats)` — the mesh carrying per-page
+  `triangle_material_ids` and one texture per page; `partition_faces(mesh, n)`
+  is the split behind it.
 - `gsplat.photogrammetry.recommended_texture_size(mesh, dataset,
   texels_per_pixel=1.0)` returns `(size, stats)`, the atlas resolution the
   capture's own evidence supports; `face_projected_areas(mesh, dataset)`

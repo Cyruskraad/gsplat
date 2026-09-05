@@ -22,7 +22,7 @@
        tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
        tests/test_texturing.py tests/test_extract_mesh_io.py -q
    ```
-   Expect **144 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
+   Expect **150 passed**. Needs `pycolmap`, `open3d`, `scikit-learn`,
    `opencv-python-headless`, `imageio`, `piexif`, `pytest-check` installed.
 4. **Before touching the texturing code**, read
    [`photogrammetry_texturing_plan.md`](photogrammetry_texturing_plan.md). All
@@ -248,8 +248,8 @@ that surfaced them is (sixth §2.4, seventh §2.2, eighth/ninth §2.3, tenth
 | `tests/test_photogrammetry_metrics.py` | 14 | Geometry metrics against known analytic ground truth, plus `atlas_sharpness` (detail ordering, chart-border exclusion, empty/uint8 handling) |
 | `tests/test_photogrammetry_pipeline.py` | 33 | Orchestration (timing/status/failure handling), artifact collection, the four new per-stage metric functions, the `priors` quality gate, report-on-failure, and the cross-stage derived metrics (see §2.9) |
 | `tests/test_extract_mesh_io.py` | 5 | Texture-map writing: the 16-bit RGB PNG round trip (and the BGR channel reversal it depends on), and that 16 bits recovers normal detail 8 bits cannot |
-| `tests/test_texturing.py` | 36 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12; and seam levelling — the conjugate-gradient solver against a dense solve, shared-edge recovery, and that levelling closes the exposure steps without introducing a colour cast |
-| **Total** | **144** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
+| `tests/test_texturing.py` | 42 | Per-face view selection: edge adjacency (vs Euler's identity), the gradient summed-area table, the quality term's geometry and visibility, the MRF's seam/quality tradeoff, unusable-view handling, determinism and multi-seed escape; and the view-selected bake — detail retention vs blending, the blended fallback, the shared UV layout, and the two numerical guards in §2.12; and seam levelling — the conjugate-gradient solver against a dense solve, shared-edge recovery, and that levelling closes the exposure steps without introducing a colour cast |
+| **Total** | **150** | **All passing** in an isolated venv with real `pycolmap`/`open3d`/`scikit-learn`/`opencv` installed |
 
 Every new/modified file is also checked against the repo's exact pinned
 `black==22.3.0` and `python -m py_compile`.
@@ -388,6 +388,51 @@ a test. Seam discontinuity on the shipped asset: 0.262 → 0.090.
 **Reviewed only:** the `--texture_view_selection` /
 `--texture_seam_smoothness` CLI guards and warnings, which need a real
 checkpoint to reach.
+
+### 2.18 Multi-page atlases
+
+Past 8192 or 16384 texels a side an atlas stops being practical and the
+evidence may still not fit — which §2.17's sizing now reports as `clamped`.
+`bake_texture_atlas_pages` / `--texture_pages N` splits the surface across N
+pages instead. Measured on a high-frequency pattern: 4 pages of 256² reach a
+face error of **0.0318**, against **0.0310** for one 512² page of the same
+total budget, where a single 256² manages only **0.0569**.
+
+Faces are split by recursive median cuts on their centroids: deterministic,
+exactly balanced for powers of two, and spatially compact (mean group spread
+falls 0.996 → 0.890 → 0.770 → 0.476 from 1 to 8 pages), so each page unwraps
+into few large charts. Geometry is untouched — only `triangle_uvs`,
+`triangle_material_ids` and the texture list change — and open3d writes that as
+a multi-material `.obj` + `.mtl` + N PNGs, verified through a disk round trip.
+
+**The subtle part is the occluder.** A page ray-cast against only its own
+geometry is blind to whatever the rest of the surface puts in front of it, and
+textures the far wall of a room straight through the near one.
+`_bake_points_from_views` gained an `occluder` argument for this, and pages
+pass the whole mesh.
+
+**A convex test shape cannot catch that**, which is worth recording: on a
+sphere the bake is *identical* with and without the occluder, because every
+face the cameras should not see is also facing away from them and back-face
+rejection already removes it. The guard is pinned instead with a deliberately
+non-convex scene — a small quad hiding the centre of a larger one, both facing
+the cameras. Correct: the hidden point comes back with weight 0.0. With the
+occluder dropped: weight 1.198 and the near quad's red painted onto it.
+
+That took **two** tests, and mutation checking is what found the second. The
+first proves the sampler honours an occluder; swapping the *call site* in
+`bake_texture_atlas_pages` to `occluder=None` still left the suite green,
+because that test supplies its own occluder either way. This is the third time
+on this branch that a mechanism-level test passed while the call site went
+unpinned (cf. §2.16's quality-vs-visibility cull, §2.17's max-over-views).
+
+**Executed:** the measurements above; four mutations checked (bake each page
+against itself, give every face material id 0, scatter page UVs to the wrong
+faces, partition without sorting) — each fails a test. **Reviewed only:** the
+`--texture_pages` atlas-mode guard. Combining pages with view selection is
+**refused rather than half-supported**: the MRF labels faces across the whole
+mesh and its seam levelling would have to run across page boundaries, which is
+not implemented.
 
 ### 2.17 Sizing the atlas from the evidence
 
