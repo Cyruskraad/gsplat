@@ -117,10 +117,26 @@ class Config:
     # under --data_dir (as a dense MVS cloud or a mesh built from one is), and
     # is mapped into the normalized frame the dataset's cameras use.
     mesh_path: Optional[str] = None
-    # TSDF voxel size, in scene units.
-    voxel_size: float = 0.01
-    # TSDF truncation distance, in scene units.
-    sdf_trunc: float = 0.04
+    # TSDF voxel size, in scene units. Unset (the default) derives it from the
+    # depth actually being fused -- one voxel per sample of the evidence --
+    # rather than assuming a scene scale. A number in scene units means nothing
+    # on its own: 0.01, the old default, is a fifth of a millimetre on a coin
+    # and a centimetre on a cathedral.
+    voxel_size: Optional[float] = None
+    # TSDF truncation distance, in scene units. Unset derives it as four
+    # voxels, the ratio the old 0.04/0.01 defaults encoded.
+    sdf_trunc: Optional[float] = None
+    # Maximum depth to integrate, in scene units; farther pixels are treated as
+    # background/sky. Unset derives it from the scene's own extent. This was
+    # hardcoded at 10.0 and not exposed at all, so a capture larger than ten
+    # scene units silently lost its far geometry.
+    depth_trunc: Optional[float] = None
+    # Neighbourhood radius for Poisson normal estimation, in scene units.
+    # Unset derives it as three point spacings -- the radius at which a disc
+    # holds about the 30 neighbours a stable plane fit wants. The old fixed
+    # 0.1 returns normals no better than chance on a cloud ten times larger
+    # (measured: mean |n . truth| 0.507, against 0.9999 derived).
+    poisson_normal_radius: Optional[float] = None
     # Poisson reconstruction octree depth.
     poisson_depth: int = 9
     # Directory of precomputed per-image transient/dynamic-object masks (see
@@ -333,6 +349,7 @@ def main(cfg: Config) -> None:
     def _into_dataset_frame(points: np.ndarray) -> np.ndarray:
         return transform_points(parser.transform, np.asarray(points))
 
+    reconstruction_stats_out: dict = {}
     if source == "tsdf":
         ckpt = torch.load(cfg.ckpt, map_location=cfg.device)
         splats = {k: v.to(cfg.device) for k, v in ckpt["splats"].items()}
@@ -342,7 +359,9 @@ def main(cfg: Config) -> None:
             renderer=cfg.renderer,
             voxel_size=cfg.voxel_size,
             sdf_trunc=cfg.sdf_trunc,
+            depth_trunc=cfg.depth_trunc,
             device=cfg.device,
+            stats_out=reconstruction_stats_out,
         )
         # No dense MVS cloud on this path -- fall back to the sparse SfM
         # cloud as the cloud-to-mesh fit reference. `parser.points` is already
@@ -352,7 +371,13 @@ def main(cfg: Config) -> None:
         pcd = o3d.io.read_point_cloud(cfg.dense_points)
         points_xyz = _into_dataset_frame(np.asarray(pcd.points))
         points_rgb = np.asarray(pcd.colors) if pcd.has_colors() else None
-        mesh = extract_mesh_poisson(points_xyz, points_rgb, depth=cfg.poisson_depth)
+        mesh = extract_mesh_poisson(
+            points_xyz,
+            points_rgb,
+            depth=cfg.poisson_depth,
+            normal_radius=cfg.poisson_normal_radius,
+            stats_out=reconstruction_stats_out,
+        )
         reference_points = points_xyz
     elif source == "mesh":
         mesh = o3d.io.read_triangle_mesh(cfg.mesh_path)
@@ -384,6 +409,25 @@ def main(cfg: Config) -> None:
         f"[extract_mesh] extracted mesh with {len(mesh.vertices)} vertices, "
         f"{len(mesh.triangles)} triangles"
     )
+    if reconstruction_stats_out.get("derived"):
+        chosen = ", ".join(
+            f"{name}={reconstruction_stats_out[name]:.5g}"
+            for name in reconstruction_stats_out["derived"]
+        )
+        print(
+            f"[extract_mesh] derived {chosen} from the evidence "
+            f"(point spacing {reconstruction_stats_out['point_spacing']:.5g}, "
+            f"extent {reconstruction_stats_out['diagonal']:.5g})"
+        )
+        if reconstruction_stats_out.get("clamped"):
+            warnings.warn(
+                "The derived voxel size was clamped to keep the TSDF grid "
+                "bounded: this cloud's points are far denser than its extent, "
+                "so one voxel per sample would not fit in memory. The mesh is "
+                "coarser than the evidence supports. Pass --voxel_size "
+                "explicitly if you can afford a finer grid.",
+                RuntimeWarning,
+            )
 
     if (cfg.normal_map or cfg.ao_map) and cfg.texture_mode != "atlas":
         raise ValueError(
@@ -832,6 +876,8 @@ def main(cfg: Config) -> None:
         ] = view_selection_stats
     if alignment_stats is not None:
         stats["photometric_alignment"] = alignment_stats
+    if reconstruction_stats_out:
+        stats["reconstruction_parameters"] = reconstruction_stats_out
     if len(mesh.triangles) == 0:
         # Extraction produced nothing usable. Say so plainly instead of
         # letting the cloud-to-mesh measurement fail against an empty surface.

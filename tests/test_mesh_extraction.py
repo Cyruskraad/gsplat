@@ -1366,3 +1366,220 @@ def test_cull_keeps_observed_faces_on_a_flat_untextured_surface():
     assert stats["num_culled"] == 0, (stats, at_risk)
     assert stats["observation_histogram"][0] == 0
     assert len(culled.triangles) == len(mesh.triangles)
+
+
+# ---------------------------------------------------------------------------
+# Derived reconstruction parameters
+# ---------------------------------------------------------------------------
+
+
+def _scaled_views(views, factor):
+    """The same capture, with the whole world (and cameras) scaled by `factor`."""
+    scaled = []
+    for view in views:
+        extrinsic = view["extrinsic"].copy()
+        extrinsic[:3, 3] *= factor
+        scaled.append(
+            {
+                "color": view["color"],
+                "depth": (view["depth"] * factor).astype(np.float32),
+                "K": view["K"],
+                "extrinsic": extrinsic,
+            }
+        )
+    return scaled
+
+
+def test_derived_parameters_are_scale_equivariant():
+    """The property that makes them derivations rather than new magic numbers.
+
+    `voxel_size=0.01`, `sdf_trunc=0.04`, `depth_trunc=10.0` and
+    `estimate_normals(radius=0.1)` were absolute scene-unit constants on a
+    pipeline whose stated design goal is that a number in scene units means
+    nothing on its own. 0.01 is a fifth of a millimetre on a coin and a
+    centimetre on a cathedral: one of those reconstructions is impossible and
+    the other discards most of what was captured.
+
+    So the test is not "is the number right" -- there is no right number -- but
+    "does it follow the scene". Scale the cloud tenfold and every derived
+    length must scale exactly tenfold, while the *ratios* between them stay
+    put.
+    """
+    from gsplat.photogrammetry.mesh_extraction import derive_reconstruction_parameters
+
+    rng = np.random.default_rng(0)
+    cloud = rng.normal(size=(4000, 3))
+    cloud /= np.linalg.norm(cloud, axis=1, keepdims=True)
+
+    small = derive_reconstruction_parameters(cloud)
+    large = derive_reconstruction_parameters(cloud * 10.0)
+
+    for key in (
+        "point_spacing",
+        "diagonal",
+        "voxel_size",
+        "sdf_trunc",
+        "depth_trunc",
+        "normal_radius",
+    ):
+        # rtol at float32's precision, not float64's: `_point_spacing` runs
+        # its neighbour search in float32, so the equivariance is exact only to
+        # about seven digits.
+        assert np.isclose(large[key], 10.0 * small[key], rtol=1e-6), (
+            key,
+            small[key],
+            large[key],
+        )
+
+    # The ratios the old constants encoded, now held by construction rather
+    # than by whoever remembers to change both numbers together.
+    assert np.isclose(small["sdf_trunc"], 4.0 * small["voxel_size"])
+    assert np.isclose(small["normal_radius"], 3.0 * small["point_spacing"])
+    assert not small["clamped"]
+
+
+def test_the_voxel_grid_is_clamped_before_it_exhausts_memory():
+    """A cloud far denser than its extent must not ask for an unbounded grid.
+
+    One voxel per sample is the right rule right up until the samples are a
+    millionth of the scene apart, at which point the honest answer is a grid
+    that does not fit in memory. Clamping trades resolution for finishing, and
+    says so rather than silently.
+    """
+    from gsplat.photogrammetry.mesh_extraction import derive_reconstruction_parameters
+
+    rng = np.random.default_rng(1)
+    # A tight cluster (tiny spacing) plus two far-apart outliers (huge extent).
+    cloud = np.concatenate(
+        [
+            rng.normal(scale=1e-4, size=(2000, 3)),
+            np.array([[-500.0, 0.0, 0.0], [500.0, 0.0, 0.0]]),
+        ]
+    )
+    derived = derive_reconstruction_parameters(cloud, max_grid=512)
+
+    assert derived["clamped"] is True
+    assert derived["voxel_size"] > derived["point_spacing"]
+    assert np.isclose(derived["voxel_size"], derived["diagonal"] / 512.0)
+    # And the truncation follows the clamped voxel, not the raw spacing.
+    assert np.isclose(derived["sdf_trunc"], 4.0 * derived["voxel_size"])
+
+
+def test_derivation_refuses_a_degenerate_cloud():
+    from gsplat.photogrammetry.mesh_extraction import derive_reconstruction_parameters
+
+    with pytest.raises(ValueError, match="degenerate"):
+        derive_reconstruction_parameters(np.zeros((100, 3)))
+
+
+def test_tsdf_fusion_derives_its_own_scale_from_the_depth_it_is_fusing():
+    """The call site, on the CPU side of the seam so it can actually be run.
+
+    `extract_mesh_tsdf` needs a GPU, so the derivation deliberately lives in
+    `_tsdf_fuse` -- the pure open3d/numpy half that was split out precisely so
+    the fusion could be exercised without one. `extract_mesh_tsdf` only passes
+    its arguments through.
+
+    The mutation this is written against is hardcoding the old defaults back:
+    at ten times the scale, `voxel_size=0.01` on a 20-unit sphere is a grid
+    2000 voxels across per axis and `depth_trunc=10.0` rejects every pixel of
+    a subject 30 units away, so the reconstruction returns nothing at all.
+    """
+    from gsplat.photogrammetry.mesh_extraction import _tsdf_fuse
+
+    for factor in (1.0, 10.0):
+        views = _scaled_views(_make_sphere_views(), factor)
+        stats: dict = {}
+        mesh = _tsdf_fuse(views, stats_out=stats)
+
+        assert set(stats["derived"]) == {"voxel_size", "sdf_trunc", "depth_trunc"}
+        # Derived from the back-projected depth, so it tracks the scene. A
+        # unit sphere's bounding box is 2 on a side, so its diagonal is
+        # 2*sqrt(3); the cameras do not quite cover the whole surface, so the
+        # measured box comes in slightly under that.
+        assert np.isclose(
+            stats["diagonal"], 2.0 * np.sqrt(3.0) * factor, rtol=0.15
+        ), stats
+        assert stats["depth_trunc"] > 2.0 * factor
+
+        vertices = np.asarray(mesh.vertices)
+        assert len(vertices) > 50, factor
+        radii = np.linalg.norm(vertices, axis=1)
+        # Still a sphere of the right radius, at either scale.
+        assert np.mean(np.abs(radii - factor)) < 0.1 * factor, factor
+
+    # An explicit value still wins, and is reported as not derived.
+    stats = {}
+    _tsdf_fuse(_make_sphere_views(), voxel_size=0.05, stats_out=stats)
+    assert "voxel_size" not in stats["derived"]
+
+
+def test_poisson_derives_its_normal_radius_from_the_cloud():
+    """The old fixed 0.1 finds no neighbours on a cloud ten times larger.
+
+    A radius in scene units is a guess about scale; three point spacings is a
+    measurement of it. This asserts the reconstruction survives a tenfold scale
+    change, which the constant does not.
+    """
+    rng = np.random.default_rng(2)
+    cloud = rng.normal(size=(6000, 3))
+    cloud /= np.linalg.norm(cloud, axis=1, keepdims=True)
+
+    for factor in (1.0, 10.0):
+        stats: dict = {}
+        mesh = extract_mesh_poisson(cloud * factor, depth=6, stats_out=stats)
+        assert stats["derived"] == ["normal_radius"]
+        assert np.isclose(
+            stats["normal_radius"], 3.0 * stats["point_spacing"], rtol=1e-9
+        )
+        vertices = np.asarray(mesh.vertices)
+        assert len(vertices) > 50, factor
+        radii = np.linalg.norm(vertices, axis=1)
+        assert np.mean(np.abs(radii - factor)) < 0.15 * factor, factor
+
+
+def test_a_fixed_normal_radius_returns_noise_on_a_rescaled_cloud():
+    """Why the radius has to be derived, measured against the analytic normal.
+
+    The reconstruction itself is a weak detector here: Poisson at a modest
+    octree depth, followed by
+    `orient_normals_consistent_tangent_plane`, still produces a plausible
+    sphere from badly-estimated normals -- a mutation restoring the hardcoded
+    `radius=0.1` passed the reconstruction test. So this measures the normals
+    directly, against the closed form the sphere provides.
+
+    At the original scale a fixed 0.1 is fine (mean |n . truth| = 0.9999). Ten
+    times larger, where the cloud's spacing is 0.459, it finds nothing inside
+    its radius and returns **0.507** -- which is chance, since the mean of
+    |cos| over random directions is 0.5. The derived radius holds 0.9999 at
+    both.
+    """
+    from gsplat.photogrammetry.mesh_extraction import derive_reconstruction_parameters
+
+    o3d = pytest.importorskip("open3d")
+
+    rng = np.random.default_rng(2)
+    cloud = rng.normal(size=(6000, 3))
+    cloud /= np.linalg.norm(cloud, axis=1, keepdims=True)
+
+    def alignment(points, radius):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.estimate_normals(
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=radius, max_nn=30)
+        )
+        normals = np.asarray(pcd.normals)
+        truth = points / np.linalg.norm(points, axis=1, keepdims=True)
+        # Absolute, because normal estimation has no consistent orientation.
+        return float(np.abs((normals * truth).sum(axis=1)).mean())
+
+    scaled = cloud * 10.0
+    derived_radius = derive_reconstruction_parameters(scaled)["normal_radius"]
+
+    # Premise: at the scale the constant was chosen for, it is fine -- so this
+    # is about scale, not about 0.1 being a bad number.
+    assert alignment(cloud, 0.1) > 0.99
+    # Ten times larger, it is indistinguishable from guessing.
+    assert alignment(scaled, 0.1) < 0.6
+    # The derived radius is unaffected.
+    assert alignment(scaled, derived_radius) > 0.99

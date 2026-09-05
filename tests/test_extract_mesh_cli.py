@@ -507,6 +507,57 @@ def test_poisson_runs_on_a_dense_cloud_with_no_checkpoint(capture, tmp_path):
     assert float(np.asarray(mesh.vertex_colors).std()) > 0.02
 
 
+def test_poisson_reports_the_parameters_it_derived(capture, tmp_path):
+    """`--method poisson` must choose its normal radius and say what it chose.
+
+    The CLI half of the derivation: the constants are gone from `Config`'s
+    defaults (they are `None` now), so a run that did not derive anything would
+    reach open3d with `radius=None` and fail rather than silently using a
+    number nobody chose.
+    """
+    _examples_on_path()
+    import json
+
+    import extract_mesh
+
+    cfg = _config(
+        capture,
+        tmp_path,
+        mesh_path=None,
+        method="poisson",
+        dense_points=capture["dense_path"],
+        poisson_depth=6,
+        texture_mode="vertex",
+        bake_texture_=False,
+    )
+    extract_mesh.main(cfg)
+
+    stats = json.loads((Path(cfg.result_dir) / "mesh_metrics.json").read_text())
+    derived = stats["reconstruction_parameters"]
+    assert derived["derived"] == ["normal_radius"]
+    assert derived["normal_radius"] == pytest.approx(
+        3.0 * derived["point_spacing"], rel=1e-6
+    )
+    assert derived["point_spacing"] > 0.0
+
+    # An explicit value still overrides, and is reported as not derived.
+    cfg = _config(
+        capture,
+        tmp_path / "explicit",
+        mesh_path=None,
+        method="poisson",
+        dense_points=capture["dense_path"],
+        poisson_depth=6,
+        poisson_normal_radius=0.25,
+        texture_mode="vertex",
+        bake_texture_=False,
+    )
+    extract_mesh.main(cfg)
+    stats = json.loads((Path(cfg.result_dir) / "mesh_metrics.json").read_text())
+    assert stats["reconstruction_parameters"]["derived"] == []
+    assert stats["reconstruction_parameters"]["normal_radius"] == 0.25
+
+
 def test_geometry_off_disk_lands_in_the_dataset_frame(capture, tmp_path):
     """A mesh read from disk must be put in the frame the cameras live in.
 

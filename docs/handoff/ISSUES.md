@@ -228,8 +228,8 @@ Each of these cost real time to discover. Do not re-derive them.
 
 ## 5. The recurring testing failure — read this before writing tests
 
-**Seven times on this branch, a test proved a *mechanism* worked while the
-*call site* went unpinned.** Twice in this session's own work, *after* writing
+**Eight times on this branch, a test proved a *mechanism* worked while the
+*call site* went unpinned.** Three times in this session's own work, *after* writing
 the test that was meant to pre-empt it — both caught only by mutating the
 caller. Each time the mutation passed the entire suite:
 
@@ -241,6 +241,7 @@ caller. Each time the mutation passed the entire suite:
 | Return an unmeasured decimation result | The first attempt produced the same mesh by coincidence | A stronger mutation (return an over-decimated mesh) |
 | `bake_mesh_texture` never accepted the `seam_smoothness` its CLI passed | No test had ever called `extract_mesh.main()` — the `assert cfg.ckpt` before the method dispatch made a GPU checkpoint the price of reaching it | `tests/test_extract_mesh_cli.py`, driving `main()` |
 | Force every pyramid level to full resolution | The pyramid test compared `num_levels=1` against `num_levels=3` at the same `alternations`, i.e. 3 optimisation rounds against 9. The extra *rounds* were doing the work the pyramid got credit for | An **equal-work** comparison (3 levels × 3 rounds vs 1 level × 9), in the regime where the objective actually aliases |
+| Hardcode Poisson's normal radius back to `0.1` | The test asserted the *derived* value in `stats_out`, which was written from the derivation rather than from the value actually passed to open3d. And the reconstruction itself is a weak detector: `orient_normals_consistent_tangent_plane` plus a modest octree depth still produce a plausible sphere from normals aligned only 0.507 with the truth | Report the stat from the value about to be **used**, and measure the normals against the analytic sphere directly |
 | Compute the refined poses, then discard them | The CLI test asserted the alignment *stats* reached `mesh_metrics.json`. Stats are an output of the solve, not evidence it was used | Comparing the delivered per-vertex colours, aligned vs not, against the analytic truth |
 
 **The lesson: after mutation-checking a mechanism, mutate the *caller* too.** If

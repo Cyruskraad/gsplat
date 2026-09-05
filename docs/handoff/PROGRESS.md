@@ -9,7 +9,7 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **174 tests pass** (153 before this session). Every guard
+- **181 tests pass** (153 before this session). Every guard
   mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
@@ -52,6 +52,15 @@ looks right.
   (`ISSUES.md` § 4.22 tabulates four regimes), so **it stays opt-in and the
   test asserts "comparable", not "better"**. The pitch was that it would be
   strictly better than both; it is not.
+- **The last absolute scene-unit constants, now derived**:
+  `voxel_size`/`sdf_trunc`/`depth_trunc` from the depth actually being fused,
+  and Poisson's normal radius from the cloud's own spacing. Verified
+  scale-equivariant: scale the cloud tenfold and every derived length scales
+  exactly tenfold. The old fixed `radius=0.1` returns normals **no better than
+  chance** on a cloud ten times larger (mean |n·truth| **0.507**, against
+  **0.9999** derived — 0.5 is what random directions give). `--depth_trunc`
+  was not even exposed before, so a capture larger than ten scene units
+  silently lost its far geometry.
 - **Three claims this session set out to confirm and instead falsified**, each
   recorded in `ISSUES.md` § 4 rather than quietly dropped: open3d's shipped
   implementation of the same algorithm (worse in every configuration, including

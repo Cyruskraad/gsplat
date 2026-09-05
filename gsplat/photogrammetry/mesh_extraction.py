@@ -85,12 +85,13 @@ def extract_mesh_tsdf(
     dataset,
     renderer: str = "2dgs",
     sh_degree: int = 3,
-    voxel_size: float = 0.01,
-    sdf_trunc: float = 0.04,
-    depth_trunc: float = 10.0,
+    voxel_size: Optional[float] = None,
+    sdf_trunc: Optional[float] = None,
+    depth_trunc: Optional[float] = None,
     near_plane: float = 0.01,
     far_plane: float = 1e10,
     device: str = "cuda",
+    stats_out: Optional[dict] = None,
 ):
     """Extract a triangle mesh via TSDF fusion of rendered depth maps.
 
@@ -109,10 +110,17 @@ def extract_mesh_tsdf(
         renderer: ``"2dgs"`` (recommended -- surfels give much better depth
             for TSDF fusion) or ``"3dgs"``.
         sh_degree: SH degree to evaluate ``splats``' colors at.
-        voxel_size: TSDF voxel size, in scene units.
-        sdf_trunc: TSDF truncation distance, in scene units.
+        voxel_size: TSDF voxel size, in scene units. ``None`` (the default)
+            derives it from the depth actually being fused, rather than
+            assuming a scene scale -- see
+            :func:`derive_reconstruction_parameters`. The derivation happens in
+            :func:`_tsdf_fuse`, on the pure-open3d side of the seam, so it is
+            testable without a GPU.
+        sdf_trunc: TSDF truncation distance, in scene units. ``None`` derives
+            it as four voxels.
         depth_trunc: Maximum depth (scene units) to integrate; farther pixels
-            are ignored (background/sky).
+            are ignored (background/sky). ``None`` derives it from the scene's
+            own extent.
         device: Torch device the trained splats live on / rendering runs on.
 
     Returns:
@@ -199,15 +207,55 @@ def extract_mesh_tsdf(
         )
 
     return _tsdf_fuse(
-        views, voxel_size=voxel_size, sdf_trunc=sdf_trunc, depth_trunc=depth_trunc
+        views,
+        voxel_size=voxel_size,
+        sdf_trunc=sdf_trunc,
+        depth_trunc=depth_trunc,
+        stats_out=stats_out,
     )
+
+
+def _backprojected_cloud(views, max_points: int = 20000) -> np.ndarray:
+    """The depth being fused, as a world-space point cloud.
+
+    This is the evidence the reconstruction actually has, so it is what its
+    resolution should be derived from -- and unlike the splats or the MVS
+    cloud it is available *here*, on the pure-open3d side of the seam, which is
+    what makes the derivation testable without a GPU.
+
+    Pixels are strided rather than all back-projected: this feeds a k-nearest
+    neighbour density estimate and a bounding box, and twenty thousand points
+    settle both.
+    """
+    per_view = max(1, max_points // max(len(views), 1))
+    clouds = []
+    for view in views:
+        depth = np.asarray(view["depth"], dtype=np.float64)
+        K = np.asarray(view["K"], dtype=np.float64)
+        extrinsic = np.asarray(view["extrinsic"], dtype=np.float64)
+        rows, cols = np.nonzero(depth > 0)
+        if rows.size == 0:
+            continue
+        if rows.size > per_view:
+            stride = rows.size // per_view
+            rows, cols = rows[::stride][:per_view], cols[::stride][:per_view]
+        z = depth[rows, cols]
+        x = (cols + 0.5 - K[0, 2]) * z / K[0, 0]
+        y = (rows + 0.5 - K[1, 2]) * z / K[1, 1]
+        camera = np.stack([x, y, z], axis=1)
+        camtoworld = np.linalg.inv(extrinsic)
+        clouds.append(camera @ camtoworld[:3, :3].T + camtoworld[:3, 3])
+    if not clouds:
+        return np.zeros((0, 3))
+    return np.concatenate(clouds, axis=0)
 
 
 def _tsdf_fuse(
     views,
-    voxel_size: float = 0.01,
-    sdf_trunc: float = 0.04,
-    depth_trunc: float = 10.0,
+    voxel_size: Optional[float] = None,
+    sdf_trunc: Optional[float] = None,
+    depth_trunc: Optional[float] = None,
+    stats_out: Optional[dict] = None,
 ):
     """Fuse a list of posed (color, depth) views into a triangle mesh via TSDF.
 
@@ -222,15 +270,46 @@ def _tsdf_fuse(
                 depth at that pixel).
             ``"K"``: (3, 3) camera intrinsics.
             ``"extrinsic"``: (4, 4) world-to-camera transform.
-        voxel_size: TSDF voxel size, in scene units.
-        sdf_trunc: TSDF truncation distance, in scene units.
-        depth_trunc: Maximum depth (scene units) to integrate.
+        voxel_size: TSDF voxel size, in scene units. ``None`` derives it from
+            the depth being fused -- see
+            :func:`derive_reconstruction_parameters`.
+        sdf_trunc: TSDF truncation distance, in scene units. ``None`` derives
+            it as four voxels.
+        depth_trunc: Maximum depth (scene units) to integrate. ``None`` derives
+            it from the scene's extent.
+        stats_out: If given, a dict updated in place with whatever was derived,
+            so a caller can report the numbers it did not have to choose.
 
     Returns:
         An ``open3d.geometry.TriangleMesh``, cleaned of degenerate geometry
         and small floating components.
     """
     o3d = _require_open3d()
+
+    if voxel_size is None or sdf_trunc is None or depth_trunc is None:
+        cloud = _backprojected_cloud(views)
+        if len(cloud) < 5:
+            raise ValueError(
+                "Cannot derive TSDF parameters: the views carry fewer than "
+                "five depth samples between them, so there is no scale to "
+                "measure. Pass voxel_size/sdf_trunc/depth_trunc explicitly, or "
+                "check that the depth maps are not empty."
+            )
+        derived = derive_reconstruction_parameters(cloud)
+        if stats_out is not None:
+            stats_out.update(derived)
+            stats_out["derived"] = [
+                name
+                for name, value in (
+                    ("voxel_size", voxel_size),
+                    ("sdf_trunc", sdf_trunc),
+                    ("depth_trunc", depth_trunc),
+                )
+                if value is None
+            ]
+        voxel_size = derived["voxel_size"] if voxel_size is None else voxel_size
+        sdf_trunc = derived["sdf_trunc"] if sdf_trunc is None else sdf_trunc
+        depth_trunc = derived["depth_trunc"] if depth_trunc is None else depth_trunc
 
     volume = o3d.pipelines.integration.ScalableTSDFVolume(
         voxel_length=voxel_size,
@@ -271,6 +350,9 @@ def extract_mesh_poisson(
     normals: Optional[np.ndarray] = None,
     depth: int = 9,
     density_quantile_threshold: float = 0.01,
+    normal_radius: Optional[float] = None,
+    normal_max_nn: int = 30,
+    stats_out: Optional[dict] = None,
 ):
     """Poisson surface reconstruction from a (typically dense MVS) point cloud.
 
@@ -286,6 +368,16 @@ def extract_mesh_poisson(
             how much point support they had) falls below this quantile are
             trimmed -- the standard Poisson cleanup step to remove
             hallucinated geometry in unobserved regions.
+        normal_radius: Neighbourhood radius for normal estimation, in scene
+            units. ``None`` (the default) derives it as three point spacings,
+            which is the radius at which a disc holds about the
+            ``normal_max_nn`` neighbours a stable plane fit wants -- see
+            :func:`derive_reconstruction_parameters`. The old fixed ``0.1``
+            was a scene-unit constant on a cloud of unknown scale: on a dense
+            capture it swept in thousands of points and over-smoothed every
+            normal, and on a sparse one it found none at all.
+        normal_max_nn: Neighbour cap for normal estimation.
+        stats_out: If given, a dict updated in place with what was derived.
 
     Returns:
         An ``open3d.geometry.TriangleMesh``.
@@ -303,8 +395,26 @@ def extract_mesh_poisson(
     if normals is not None:
         pcd.normals = o3d.utility.Vector3dVector(np.asarray(normals, dtype=np.float64))
     else:
+        derived_names = []
+        if normal_radius is None:
+            derived = derive_reconstruction_parameters(
+                points_xyz, normal_max_nn=normal_max_nn
+            )
+            normal_radius = derived["normal_radius"]
+            derived_names = ["normal_radius"]
+            if stats_out is not None:
+                stats_out.update(derived)
+        if stats_out is not None:
+            # Reported from the value about to be *used*, not from the
+            # derivation that suggested it. Writing the derived number instead
+            # lets a call site drift from what it reports -- a mutation that
+            # hardcoded 0.1 here kept every stats assertion green.
+            stats_out["normal_radius"] = float(normal_radius)
+            stats_out["derived"] = derived_names
         pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30)
+            search_param=o3d.geometry.KDTreeSearchParamHybrid(
+                radius=normal_radius, max_nn=normal_max_nn
+            )
         )
         pcd.orient_normals_consistent_tangent_plane(k=15)
 
@@ -539,6 +649,96 @@ def _point_spacing(points: np.ndarray, k: int = 4, max_samples: int = 20000) -> 
     _indices, squared = search.knn_search(o3d.core.Tensor(queries), k + 1)
     distances = np.sqrt(np.maximum(squared.numpy(), 0.0))
     return float(distances[:, 1:].mean())
+
+
+def derive_reconstruction_parameters(
+    points: np.ndarray,
+    max_grid: int = 2048,
+    sdf_trunc_voxels: float = 4.0,
+    normal_radius_spacings: float = 3.0,
+    normal_max_nn: int = 30,
+) -> Dict[str, float]:
+    """Choose the reconstruction's absolute constants from the evidence.
+
+    ``voxel_size=0.01``, ``sdf_trunc=0.04``, ``depth_trunc=10.0`` and
+    ``estimate_normals(radius=0.1)`` were the last magic numbers in this
+    package, and they are all in **scene units** -- on a pipeline whose stated
+    design goal is that a number in scene units means nothing on its own
+    (``docs/handoff/SCOPE.md``). 0.01 is a fifth of a millimetre on a coin and
+    a centimetre on a cathedral; one of those reconstructions is impossible and
+    the other throws away most of what was captured.
+
+    Each is derived here from the reference cloud's own k-nearest-neighbour
+    spacing and extent, the same way :func:`simplify_mesh_to_error` already
+    derives its error budget:
+
+    - **voxel_size = the cloud's point spacing.** One voxel per sample. Finer
+      invents detail no measurement supports and multiplies the grid; coarser
+      discards detail that was paid for. Clamped so the grid stays under
+      ``max_grid`` voxels along the bounding box's diagonal, because the
+      alternative on a large scene is exhausting memory rather than producing
+      a poor mesh.
+    - **sdf_trunc = 4 x voxel_size**, the ratio open3d's own examples use and
+      exactly the ratio the old defaults encoded (0.04 / 0.01). Keeping it as a
+      *ratio* is the point: it now follows the voxel size instead of having to
+      be remembered alongside it.
+    - **depth_trunc = 1.5 x the bounding-box diagonal.** Its job is to reject
+      background and sky, so the scene's own size is the only defensible scale.
+      The 1.5 leaves room for cameras standing well back from the subject.
+    - **normal_radius = 3 x point spacing.** A plane fit needs enough
+      neighbours to be stable, and on a surface sampled at spacing ``s`` a disc
+      of radius ``3s`` contains about ``pi * 9 = 28`` points -- which is where
+      the companion ``max_nn=30`` comes from. The two agreed by coincidence
+      before; now they agree by construction.
+
+    Args:
+        points: ``(P, 3)`` reference cloud -- the dense MVS cloud, the sparse
+            SfM points, or the back-projected depth being fused.
+        max_grid: Cap on voxels along the bounding-box diagonal.
+        sdf_trunc_voxels: Truncation distance, in voxels.
+        normal_radius_spacings: Normal-estimation radius, in point spacings.
+        normal_max_nn: Neighbour cap passed to open3d's normal estimation.
+
+    Returns:
+        A dict with the derived ``voxel_size``, ``sdf_trunc``, ``depth_trunc``,
+        ``normal_radius`` and ``normal_max_nn``, plus the ``point_spacing`` and
+        ``diagonal`` they came from and whether the voxel size was
+        ``clamped``.
+
+    Raises:
+        ValueError: If there are too few points to measure a spacing, or the
+            cloud is degenerate (every point in one place).
+    """
+    points = np.asarray(points, dtype=np.float64)
+    if points.ndim != 2 or points.shape[1] != 3:
+        raise ValueError(f"points must have shape (P, 3), got {points.shape}")
+
+    spacing = _point_spacing(points)
+    extent = points.max(axis=0) - points.min(axis=0)
+    diagonal = float(np.linalg.norm(extent))
+    if not np.isfinite(diagonal) or diagonal <= 0.0 or spacing <= 0.0:
+        raise ValueError(
+            "Cannot derive reconstruction parameters from a degenerate cloud "
+            f"(extent {extent}, point spacing {spacing}). Every point is in "
+            "the same place, or the cloud contains non-finite coordinates."
+        )
+
+    voxel_size = spacing
+    smallest_allowed = diagonal / float(max_grid)
+    clamped = voxel_size < smallest_allowed
+    if clamped:
+        voxel_size = smallest_allowed
+
+    return {
+        "point_spacing": float(spacing),
+        "diagonal": diagonal,
+        "voxel_size": float(voxel_size),
+        "sdf_trunc": float(sdf_trunc_voxels * voxel_size),
+        "depth_trunc": float(1.5 * diagonal),
+        "normal_radius": float(normal_radius_spacings * spacing),
+        "normal_max_nn": int(normal_max_nn),
+        "clamped": bool(clamped),
+    }
 
 
 def simplify_mesh_to_error(

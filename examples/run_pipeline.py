@@ -116,6 +116,10 @@ class Config:
     # view that sees it -- sharper, but pointwise less accurate, and it
     # requires --texture_mode atlas. See examples/extract_mesh.py.
     texture_view_selection: bool = False
+    # Maximum depth to integrate during TSDF fusion, in scene units. Unset
+    # derives it from the scene's own extent (it was hardcoded at 10.0 and not
+    # reachable at all). See examples/extract_mesh.py.
+    depth_trunc: Optional[float] = None
     # Solve for the texture whose reprojection best explains every view (a
     # MAP deconvolution modelling the camera PSF) instead of blending them.
     # Requires --texture_mode atlas. See examples/extract_mesh.py.
@@ -468,6 +472,8 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                 ]
                 if cfg.texture_view_selection:
                     cmd += ["--texture_view_selection"]
+                if cfg.depth_trunc is not None:
+                    cmd += ["--depth_trunc", str(cfg.depth_trunc)]
                 if cfg.texture_super_resolve:
                     cmd += ["--texture_super_resolve"]
                 if cfg.photometric_align:

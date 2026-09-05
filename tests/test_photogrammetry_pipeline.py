@@ -915,6 +915,8 @@ def test_pipeline_reaches_the_whole_delivery_path(tmp_path):
             "--photometric_align_levels",
             "4",
             "--texture_super_resolve",
+            "--depth_trunc",
+            "12.5",
         ],
     )
     for expected in (
@@ -931,6 +933,9 @@ def test_pipeline_reaches_the_whole_delivery_path(tmp_path):
         "--photometric_align",
         "--photometric_align_levels 4",
         "--texture_super_resolve",
+        # Hardcoded at 10.0 and unreachable before, so a capture larger than
+        # ten scene units silently lost its far geometry.
+        "--depth_trunc 12.5",
     ):
         assert expected in line, (expected, line)
 
