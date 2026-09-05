@@ -9,7 +9,7 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **187 tests pass** (153 before this session). Every guard
+- **194 tests pass** (153 before this session). Every guard
   mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
@@ -52,6 +52,12 @@ looks right.
   (`ISSUES.md` § 4.22 tabulates four regimes), so **it stays opt-in and the
   test asserts "comparable", not "better"**. The pitch was that it would be
   strictly better than both; it is not.
+- **The CPU half of splat-to-surface level-set extraction** (the approach
+  Gaussian Opacity Fields takes), against an analytic field: marching
+  tetrahedra over a Kuhn-decomposed grid recovers `f(x) = |x| − r` **watertight
+  and edge-manifold** at every resolution tested, with vertices on the sphere
+  to **0.007 of a cell**, and the error falling **~4x per halving of the cell**
+  — second order, not the linear halving the obvious guess predicts.
 - **Photometric mesh refinement** (Vu et al. 2012, OpenMVS's `RefineMesh`) —
   the first thing in this package that moves a vertex to fit the photographs.
   On a sphere perturbed by 0.03, measured against the *analytic* surface:
@@ -78,6 +84,14 @@ looks right.
 
 ### Reviewed by code inspection only
 
+- **`gaussian_density_field` has never run.** It needs a GPU and the compiled
+  CUDA extension, and it is the *only* part of the level-set path that does.
+  Everything downstream of it — the Kuhn decomposition, the
+  marching-tetrahedra table, the shared-vertex identification, the cleanup —
+  is measured against analytic ground truth (see above). Its one
+  CPU-reachable guard, the appearance-embedding refusal, *is* tested. The
+  field evaluation itself, and therefore the claim that this extracts a
+  surface from a real Gaussian field, is **unverified**.
 - The GPU-only half of `extract_mesh.py`: `--method tsdf` (which renders depth
   maps from a checkpoint) and the `--texture_texels_per_pixel` clamp warning,
   which needs an atlas larger than the cap. Everything else in that script now

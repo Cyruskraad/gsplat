@@ -1760,13 +1760,47 @@ def test_the_psf_width_is_measured_from_the_capture():
     mesh = _unit_sphere_mesh(resolution=16)
     dataset = _mesh_rendered_views(mesh)
 
-    sigmas = {}
-    for size in (64, 128):
+    measured = {}
+    # Both sizes must sit above the sigma floor (0.35 texels, below which a
+    # Gaussian is indistinguishable from the identity on this grid and the
+    # value is clamped). At 64 texels it clamps, and a clamped sigma no longer
+    # carries the footprint -- which is what made the first version of this
+    # assertion fail by 18%.
+    for size in (128, 192):
+        # sigma is derived before the solve runs, so the solve is cut short
+        # here: this test is about the rule, not about deconvolution quality.
         _, _, stats = bake_texture_atlas_super_resolved(
-            _unit_sphere_mesh(resolution=16), dataset, texture_size=size
+            _unit_sphere_mesh(resolution=16),
+            dataset,
+            texture_size=size,
+            cg_iterations=4,
+            irls_iterations=1,
         )
-        sigmas[size] = stats["mean_psf_sigma_texels"]
+        measured[size] = stats
         assert stats["texel_world_size"] > 0.0
+        assert stats["mean_psf_sigma_texels"] > 0.36, (size, stats)
 
-    ratio = sigmas[128] / sigmas[64]
-    assert 1.7 < ratio < 2.3, (sigmas, ratio)
+    # A finer atlas means smaller texels, so one source pixel spans more of
+    # them: sigma must rise as `texel_world_size` falls.
+    assert (
+        measured[192]["texel_world_size"] < measured[128]["texel_world_size"]
+    ), measured
+    assert (
+        measured[192]["mean_psf_sigma_texels"] > measured[128]["mean_psf_sigma_texels"]
+    ), measured
+
+    # And the rule exactly: sigma is the source pixel's footprint divided by a
+    # texel's, so `sigma * texel_world_size` is the footprint itself and does
+    # not depend on the atlas at all.
+    #
+    # Asserted this way rather than as "doubling the atlas doubles sigma",
+    # which is only true if both unwraps pack the charts equally tightly.
+    # `compute_uvatlas` is non-deterministic (ISSUES.md #10) *and* seeded from
+    # open3d's global RNG, which other tests in the suite set -- so the naive
+    # form passed alone and failed in a full run, which is the worst way for a
+    # test to be wrong.
+    footprints = {
+        size: stats["mean_psf_sigma_texels"] * stats["texel_world_size"]
+        for size, stats in measured.items()
+    }
+    assert footprints[128] == pytest.approx(footprints[192], rel=0.05), footprints

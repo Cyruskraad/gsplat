@@ -1796,3 +1796,162 @@ def test_refinement_rejects_geometry_it_cannot_search():
         refine_mesh_photometric(o3d.geometry.TriangleMesh(), dataset)
     with pytest.raises(ValueError, match="num_offsets"):
         refine_mesh_photometric(_unit_sphere_mesh(resolution=8), dataset, num_offsets=0)
+
+
+# ---------------------------------------------------------------------------
+# Level-set extraction (the CPU half of the splat-to-surface path)
+# ---------------------------------------------------------------------------
+
+
+def _analytic_sphere(radius=1.0, centre=(0.0, 0.0, 0.0)):
+    """f(x) = |x - c| - r: negative inside, zero exactly on the surface."""
+    centre = np.asarray(centre, dtype=np.float64)
+
+    def field(points):
+        return np.linalg.norm(np.asarray(points) - centre, axis=1) - radius
+
+    return field
+
+
+def test_level_set_extraction_recovers_an_analytic_sphere():
+    """The CPU half, against a field whose answer is known in closed form.
+
+    Nothing here needs a Gaussian. Evaluating a Gaussian field needs a GPU and
+    the compiled CUDA extension, so the field evaluation is isolated in
+    `gaussian_density_field` and *everything else* -- the Kuhn decomposition,
+    the marching-tetrahedra table, the shared-vertex identification, the
+    cleanup -- is exercised here against `f(x) = |x| - r`. Same seam
+    `_tsdf_fuse` already established.
+    """
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    mesh, stats = extract_level_set(
+        _analytic_sphere(1.0), ((-1.5, -1.5, -1.5), (1.5, 1.5, 1.5)), resolution=32
+    )
+
+    vertices = np.asarray(mesh.vertices)
+    assert len(vertices) > 1000
+    radial = np.abs(np.linalg.norm(vertices, axis=1) - 1.0)
+    # Every vertex sits on the sphere to well within a cell. Measured mean
+    # 0.007 cells, max well under one.
+    assert radial.max() < stats["cell_size"], (radial.max(), stats["cell_size"])
+    assert radial.mean() < 0.05 * stats["cell_size"], radial.mean()
+
+
+def test_the_extracted_surface_is_watertight():
+    """Shared vertices, not a triangle soup that merely looks like a surface.
+
+    Each intersection is named by the **grid edge** it lies on, so the two
+    tetrahedra either side of a face produce the same vertex. Without that they
+    produce two coincident ones and the mesh has a boundary everywhere while
+    rendering identically. It also matters downstream: `compute_uvatlas`
+    *segfaults* on non-manifold input rather than raising
+    (`docs/handoff/ISSUES.md`), so a mesh that is quietly non-manifold takes
+    the whole texturing stage out with exit 139.
+    """
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    for resolution in (16, 32):
+        mesh, _stats = extract_level_set(
+            _analytic_sphere(1.0),
+            ((-1.5, -1.5, -1.5), (1.5, 1.5, 1.5)),
+            resolution=resolution,
+        )
+        assert mesh.is_edge_manifold(), resolution
+        assert mesh.is_vertex_manifold(), resolution
+        assert mesh.is_watertight(), resolution
+
+
+def test_halving_the_cell_size_quarters_the_error():
+    """Convergence, measured -- and it is second order, not first.
+
+    The obvious expectation is that halving the cell halves the error. It does
+    not: measured mean radial error goes 0.002855 -> 0.000685 -> 0.000175 as
+    the resolution doubles from 16 to 64, a factor of **~4 each time**. Linear
+    interpolation along an edge places the crossing to second order for a
+    smooth field, so the error falls with the square of the cell size.
+
+    Asserting the wrong law would be worse than asserting nothing: a first-order
+    bound is satisfied by a second-order method, so the test would pass while
+    silently tolerating a real regression to linear convergence.
+    """
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    field = _analytic_sphere(1.0)
+    bounds = ((-1.5, -1.5, -1.5), (1.5, 1.5, 1.5))
+
+    errors = []
+    for resolution in (16, 32, 64):
+        mesh, _stats = extract_level_set(field, bounds, resolution=resolution)
+        vertices = np.asarray(mesh.vertices)
+        errors.append(float(np.abs(np.linalg.norm(vertices, axis=1) - 1.0).mean()))
+
+    for coarse, fine in zip(errors, errors[1:]):
+        ratio = coarse / fine
+        assert 3.0 < ratio < 5.5, (errors, ratio)
+
+
+def test_level_set_handles_an_off_centre_box_and_a_non_cubic_one():
+    """The grid is not assumed to be centred, cubic, or aligned with the shape."""
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    centre = (0.3, -0.7, 0.2)
+    mesh, stats = extract_level_set(
+        _analytic_sphere(0.5, centre),
+        ((-0.4, -1.4, -0.5), (1.1, 0.1, 0.9)),
+        resolution=24,
+    )
+    vertices = np.asarray(mesh.vertices)
+    assert len(vertices) > 200
+    radial = np.linalg.norm(vertices - np.asarray(centre), axis=1)
+    assert np.abs(radial - 0.5).max() < stats["cell_size"]
+    # A box longer in one axis gets more cells there, not stretched ones.
+    assert stats["grid_shape"][0] >= stats["grid_shape"][2]
+
+
+def test_level_set_rejects_degenerate_input():
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    with pytest.raises(ValueError, match="resolution"):
+        extract_level_set(_analytic_sphere(), ((0, 0, 0), (1, 1, 1)), resolution=0)
+    with pytest.raises(ValueError, match="Degenerate bounds"):
+        extract_level_set(_analytic_sphere(), ((0, 0, 0), (0, 0, 0)))
+
+
+def test_an_empty_field_yields_an_empty_mesh_rather_than_failing():
+    """A level nothing crosses is a legitimate answer, not an error."""
+    from gsplat.photogrammetry.mesh_extraction import extract_level_set
+
+    mesh, stats = extract_level_set(
+        lambda points: np.ones(len(points)),
+        ((-1, -1, -1), (1, 1, 1)),
+        resolution=8,
+    )
+    assert len(mesh.triangles) == 0
+    assert stats["num_triangles"] == 0
+    assert stats["num_points_evaluated"] > 0
+
+
+def test_the_gaussian_field_keeps_the_appearance_embedding_refusal():
+    """The GPU half is untested here, but its one CPU-reachable guard is not.
+
+    `gaussian_density_field` needs a GPU to evaluate, and this environment has
+    none. The appearance-embedding refusal, though, happens before any device
+    is touched -- and it has to stay, for the reason `SCOPE.md` gives:
+    per-image appearance variation does not map onto one canonical surface.
+    """
+    from gsplat.photogrammetry.mesh_extraction import gaussian_density_field
+
+    torch = pytest.importorskip("torch")
+
+    splats = {
+        "means": torch.zeros(4, 3),
+        "quats": torch.zeros(4, 4),
+        "scales": torch.zeros(4, 3),
+        "opacities": torch.zeros(4),
+        # An appearance-embedding checkpoint: 'features'/'colors', no SH.
+        "features": torch.zeros(4, 32),
+        "colors": torch.zeros(4, 3),
+    }
+    with pytest.raises(ValueError, match="appearance-embedding"):
+        gaussian_density_field(splats, device="cuda")

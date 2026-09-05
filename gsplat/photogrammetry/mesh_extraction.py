@@ -1260,3 +1260,334 @@ from .texturing import (  # noqa: E402,F401  (import placement is deliberate)
     recommended_texture_size,
     select_views_mrf,
 )
+
+
+# ---------------------------------------------------------------------------
+# Level-set extraction from a scalar field
+#
+# TSDF fusion of rendered depth (`extract_mesh_tsdf`) is the 2020-era answer to
+# "turn a radiance field into a surface". Current work extracts the surface
+# from the Gaussian field itself -- Gaussian Opacity Fields (Yu et al., 2024)
+# takes a level set of the opacity field via tetrahedral marching; SuGaR
+# (Guedon & Lepetit, 2024) and PGSR (Chen et al., 2024) take related routes.
+#
+# Evaluating a Gaussian field needs a GPU and gsplat's compiled CUDA
+# extension, neither of which exists in the environment this was written in.
+# So the split below is deliberate and follows the precedent `_tsdf_fuse`
+# already set: everything except the field evaluation is pure NumPy/open3d and
+# is verified against an **analytic** field, and the one function that needs a
+# GPU is thin, isolated, and marked as never having run.
+# ---------------------------------------------------------------------------
+
+# Kuhn decomposition: the six tetrahedra that tile a unit cube, as indices into
+# the cube's eight corners ordered by (i, j, k) bits. Every tetrahedron shares
+# the cube's main diagonal 0-7, which is what makes the tiling consistent
+# between neighbouring cubes -- and therefore the surface watertight.
+_CUBE_TETRAHEDRA = np.array(
+    [
+        [0, 1, 3, 7],
+        [0, 1, 5, 7],
+        [0, 2, 3, 7],
+        [0, 2, 6, 7],
+        [0, 4, 5, 7],
+        [0, 4, 6, 7],
+    ],
+    dtype=np.int64,
+)
+
+_TET_EDGES = [(0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3)]
+
+
+def _marching_tetrahedra_table():
+    """Which tetrahedron edges each inside/outside pattern cuts, as triangles.
+
+    Generated rather than typed out. A hand-written 16-case table is the
+    classic place for a transposition to hide: it would produce a surface that
+    looks plausible and is quietly non-manifold in a few cells, which is
+    exactly the kind of defect `compute_uvatlas` then *segfaults* on
+    (``docs/handoff/ISSUES.md``) rather than reporting.
+
+    The rule is short enough to state directly. A tetrahedron edge is cut when
+    its two ends fall on opposite sides of the level. With one corner inside,
+    the three edges leaving it form one triangle. With three inside, the same
+    holds for the one corner outside. With two inside (``i``, ``j``) and two out
+    (``k``, ``l``), the four cut edges form a quad, and taking them in the
+    cyclic order (i,k), (i,l), (j,l), (j,k) is what makes the two triangles
+    split it along a diagonal instead of crossing it.
+    """
+    index = {edge: i for i, edge in enumerate(_TET_EDGES)}
+
+    def edge_id(a, b):
+        return index[(a, b) if a < b else (b, a)]
+
+    table = []
+    for case in range(16):
+        inside = [c for c in range(4) if case & (1 << c)]
+        outside = [c for c in range(4) if not case & (1 << c)]
+        if len(inside) in (0, 4):
+            table.append([])
+        elif len(inside) == 1:
+            i = inside[0]
+            table.append([[edge_id(i, c) for c in outside]])
+        elif len(inside) == 3:
+            k = outside[0]
+            table.append([[edge_id(c, k) for c in inside]])
+        else:
+            i, j = inside
+            k, l = outside
+            quad = [edge_id(i, k), edge_id(i, l), edge_id(j, l), edge_id(j, k)]
+            table.append([[quad[0], quad[1], quad[2]], [quad[0], quad[2], quad[3]]])
+    return table
+
+
+_MARCHING_TET_TABLE = _marching_tetrahedra_table()
+
+
+def extract_level_set(
+    field,
+    bounds,
+    resolution: int = 64,
+    level: float = 0.0,
+    batch_size: int = 1 << 20,
+    clean: bool = True,
+):
+    """Extract the ``level`` iso-surface of a scalar field by marching tetrahedra.
+
+    Pure NumPy and open3d: ``field`` is any callable taking ``(P, 3)`` query
+    points and returning ``(P,)`` values, so this is exercised here against a
+    closed-form sphere rather than against a Gaussian field it cannot run.
+    Pair it with :func:`gaussian_density_field` for the real thing.
+
+    Tetrahedra rather than cubes, following Gaussian Opacity Fields: marching
+    cubes' ambiguous face cases need a disambiguation rule to avoid holes,
+    while a tetrahedron's four corners admit no ambiguity at all -- one corner
+    apart from the other three, or two apart from two, and both have a single
+    triangulation. Each grid cube is split by the Kuhn decomposition, whose six
+    tetrahedra all share the cube's main diagonal, so neighbouring cubes agree
+    on their shared faces and the surface closes.
+
+    Vertices are identified by the **grid edge** they sit on, so the two
+    tetrahedra either side of a face produce the *same* vertex rather than two
+    coincident ones. That is what makes the result watertight instead of a
+    triangle soup that merely looks like a surface.
+
+    Args:
+        field: Callable ``(P, 3) -> (P,)``. Negative inside the surface by the
+            usual convention, though only the sign change matters.
+        bounds: ``((min_x, min_y, min_z), (max_x, max_y, max_z))``.
+        resolution: Cells along the longest axis of ``bounds``. Cells are cubic,
+            so the other axes get however many fit.
+        level: The iso-value to extract.
+        batch_size: Query points per call into ``field``, bounding peak memory
+            (and, for a GPU field, VRAM).
+        clean: Drop degenerate triangles and small floating components via
+            :func:`_clean_mesh`.
+
+    Returns:
+        ``(mesh, stats)``. ``stats`` reports the ``cell_size``, the
+        ``grid_shape``, how many points were evaluated, and the triangle and
+        vertex counts.
+
+    Raises:
+        ValueError: If ``resolution`` is below 1 or ``bounds`` is degenerate.
+    """
+    o3d = _require_open3d()
+
+    lower = np.asarray(bounds[0], dtype=np.float64)
+    upper = np.asarray(bounds[1], dtype=np.float64)
+    extent = upper - lower
+    if resolution < 1:
+        raise ValueError(f"resolution must be at least 1, got {resolution}.")
+    if not np.all(np.isfinite(extent)) or np.max(extent) <= 0.0:
+        raise ValueError(
+            f"Degenerate bounds {bounds!r}: the box has no positive extent, so "
+            "there is no volume to march through."
+        )
+
+    cell = float(np.max(extent)) / resolution
+    counts = np.maximum(np.ceil(extent / cell).astype(np.int64), 1)
+    shape = counts + 1  # grid *points* per axis
+
+    axes = [lower[a] + cell * np.arange(shape[a]) for a in range(3)]
+    grid = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1).reshape(-1, 3)
+
+    values = np.empty(len(grid), dtype=np.float64)
+    for start in range(0, len(grid), batch_size):
+        chunk = grid[start : start + batch_size]
+        values[start : start + batch_size] = np.asarray(
+            field(chunk), dtype=np.float64
+        ).reshape(-1)
+
+    # Cube corner offsets, ordered so bit 0 is +i, bit 1 is +j, bit 2 is +k --
+    # the order `_CUBE_TETRAHEDRA` indexes into.
+    strides = np.array([shape[1] * shape[2], shape[2], 1], dtype=np.int64)
+    corner_offsets = np.array(
+        [[(c >> 0) & 1, (c >> 1) & 1, (c >> 2) & 1] for c in range(8)], dtype=np.int64
+    )
+    base = np.stack(
+        np.meshgrid(*[np.arange(counts[a]) for a in range(3)], indexing="ij"), axis=-1
+    ).reshape(-1, 3)
+    cube_corners = (base[:, None, :] + corner_offsets[None, :, :]) @ strides  # (C, 8)
+
+    tets = cube_corners[:, _CUBE_TETRAHEDRA].reshape(-1, 4)  # (6C, 4)
+    tet_values = values[tets]
+    inside = tet_values < level
+    case = (
+        inside[:, 0].astype(np.int64)
+        | (inside[:, 1].astype(np.int64) << 1)
+        | (inside[:, 2].astype(np.int64) << 2)
+        | (inside[:, 3].astype(np.int64) << 3)
+    )
+
+    edge_pairs = []
+    triangles = []
+    for case_id, tri_list in enumerate(_MARCHING_TET_TABLE):
+        if not tri_list:
+            continue
+        selected = np.nonzero(case == case_id)[0]
+        if selected.size == 0:
+            continue
+        corners = tets[selected]
+        for tri in tri_list:
+            columns = []
+            for edge in tri:
+                a, b = _TET_EDGES[edge]
+                pair = np.stack([corners[:, a], corners[:, b]], axis=1)
+                # Canonical (low, high) order, so the two tetrahedra sharing
+                # this edge name the same vertex.
+                pair = np.sort(pair, axis=1)
+                columns.append(pair)
+            edge_pairs.append(np.concatenate(columns, axis=0))
+            triangles.append(selected.size)
+
+    mesh = o3d.geometry.TriangleMesh()
+    stats = {
+        "cell_size": cell,
+        "grid_shape": [int(v) for v in shape],
+        "num_points_evaluated": int(len(grid)),
+        "level": float(level),
+        "num_vertices": 0,
+        "num_triangles": 0,
+    }
+    if not edge_pairs:
+        return mesh, stats
+
+    all_pairs = np.concatenate(edge_pairs, axis=0)
+    unique_pairs, inverse = np.unique(all_pairs, axis=0, return_inverse=True)
+
+    low = values[unique_pairs[:, 0]]
+    high = values[unique_pairs[:, 1]]
+    denominator = high - low
+    # A vertex whose two ends carry the same value sits at the midpoint: the
+    # crossing is real (the signs differ) but the linear model has no slope to
+    # place it with.
+    t = np.where(
+        np.abs(denominator) > 1e-12,
+        (level - low) / np.where(denominator == 0, 1, denominator),
+        0.5,
+    )
+    t = np.clip(t, 0.0, 1.0)
+    p0 = grid[unique_pairs[:, 0]]
+    p1 = grid[unique_pairs[:, 1]]
+    vertices = p0 + t[:, None] * (p1 - p0)
+
+    # `edge_pairs` was built one triangle-corner column at a time, so the
+    # inverse indices come back grouped by corner; regroup into triangles.
+    faces = []
+    cursor = 0
+    for count in triangles:
+        corner_block = inverse[cursor : cursor + 3 * count].reshape(3, count).T
+        faces.append(corner_block)
+        cursor += 3 * count
+    faces = np.concatenate(faces, axis=0)
+
+    mesh.vertices = o3d.utility.Vector3dVector(vertices)
+    mesh.triangles = o3d.utility.Vector3iVector(faces.astype(np.int32))
+    mesh.remove_duplicated_vertices()
+    mesh.remove_degenerate_triangles()
+    mesh.remove_unreferenced_vertices()
+    if clean:
+        mesh = _clean_mesh(mesh)
+    mesh.compute_vertex_normals()
+
+    stats["num_vertices"] = int(len(mesh.vertices))
+    stats["num_triangles"] = int(len(mesh.triangles))
+    return mesh, stats
+
+
+def gaussian_density_field(
+    splats: Dict[str, Tensor],
+    device: str = "cuda",
+    batch_size: int = 1 << 18,
+):
+    """The Gaussian field's density at arbitrary points, as a callable.
+
+    **This half has never been run.** It needs a GPU and gsplat's compiled CUDA
+    extension, and the environment this was written in has neither
+    (``torch.cuda.is_available()`` is False, "No CUDA toolkit found"). It is
+    deliberately thin, and everything downstream of it --
+    :func:`extract_level_set` and the mesh cleanup -- is pure NumPy/open3d and
+    *is* verified, against an analytic field. See ``docs/handoff/PROGRESS.md``
+    for what that split means.
+
+    The density at a point is the opacity-weighted sum of each Gaussian's
+    value there, which is the field Gaussian Opacity Fields takes a level set
+    of. Returned negated (``level - density``) so the convention matches
+    :func:`extract_level_set`'s: negative inside the surface.
+
+    Args:
+        splats: Trained Gaussian parameters, as in a gsplat checkpoint's
+            ``"splats"`` entry.
+        device: Torch device to evaluate on.
+        batch_size: Query points per batch.
+
+    Returns:
+        A callable ``(P, 3) -> (P,)`` suitable for :func:`extract_level_set`.
+
+    Raises:
+        ValueError: If ``splats`` carries per-image appearance embeddings --
+            the same refusal :func:`_splat_colors` makes, and for the same
+            reason: per-image appearance does not map onto one canonical
+            surface.
+    """
+    # Reuses the appearance-embedding refusal rather than re-deriving it.
+    _splat_colors(splats)
+
+    means = splats["means"].to(device)
+    quats = splats["quats"].to(device)
+    scales = torch.exp(splats["scales"]).to(device)
+    opacities = torch.sigmoid(splats["opacities"]).to(device)
+
+    quats = quats / quats.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+    w, x, y, z = quats.unbind(-1)
+    rotation = torch.stack(
+        [
+            1 - 2 * (y**2 + z**2),
+            2 * (x * y - w * z),
+            2 * (x * z + w * y),
+            2 * (x * y + w * z),
+            1 - 2 * (x**2 + z**2),
+            2 * (y * z - w * x),
+            2 * (x * z - w * y),
+            2 * (y * z + w * x),
+            1 - 2 * (x**2 + y**2),
+        ],
+        dim=-1,
+    ).reshape(-1, 3, 3)
+
+    def field(points: np.ndarray) -> np.ndarray:
+        query = torch.as_tensor(np.asarray(points), dtype=means.dtype, device=device)
+        out = torch.empty(len(query), dtype=means.dtype, device=device)
+        for start in range(0, len(query), batch_size):
+            chunk = query[start : start + batch_size]
+            # (B, N, 3) in each Gaussian's own frame, then the Mahalanobis
+            # exponent of an axis-aligned Gaussian there.
+            delta = chunk[:, None, :] - means[None, :, :]
+            local = torch.einsum("nij,bnj->bni", rotation.transpose(1, 2), delta)
+            exponent = -0.5 * ((local / scales[None, :, :]) ** 2).sum(-1)
+            out[start : start + batch_size] = (
+                opacities[None, :] * torch.exp(exponent)
+            ).sum(-1)
+        return out.detach().cpu().numpy()
+
+    return field

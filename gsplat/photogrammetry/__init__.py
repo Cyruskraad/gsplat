@@ -57,6 +57,8 @@ from .dense_mvs import run_dense_mvs
 from .mesh_extraction import (
     cull_unobserved_faces,
     derive_reconstruction_parameters,
+    extract_level_set,
+    gaussian_density_field,
     extract_mesh_poisson,
     extract_mesh_tsdf,
     refine_mesh_photometric,
@@ -131,6 +133,8 @@ __all__ = [
     "simplify_mesh_to_error",
     "cull_unobserved_faces",
     "derive_reconstruction_parameters",
+    "extract_level_set",
+    "gaussian_density_field",
     "merge_point_maps_to_tracks",
     "write_colmap_reconstruction",
     "refine_camera_poses_photometric",

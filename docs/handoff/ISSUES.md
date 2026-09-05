@@ -173,6 +173,32 @@ Each of these cost real time to discover. Do not re-derive them.
     regime, not a fault; the quality assertions live on a fixture that meets
     the premise.
 
+### Level-set extraction
+
+31. **Marching tetrahedra converges *quadratically*, not linearly.** The
+    obvious expectation — halve the cell, halve the error — is wrong: measured
+    mean radial error against an analytic sphere goes
+    **0.002855 → 0.000685 → 0.000175** as the resolution doubles 16 → 32 → 64,
+    a factor of ~4 each time. Linear interpolation along an edge places the
+    crossing to second order for a smooth field. This matters for the *test*:
+    a first-order bound is satisfied by a second-order method, so asserting
+    the wrong law passes while silently tolerating a regression to linear.
+32. **Vertices must be identified by the grid edge they lie on.** Emit one per
+    tetrahedron instead and the two tetrahedra either side of a face produce
+    coincident-but-distinct vertices: the mesh renders identically and has a
+    boundary everywhere. Downstream that is not cosmetic — `compute_uvatlas`
+    *segfaults* on non-manifold input (trap 9), so it takes out the whole
+    texturing stage with exit 139.
+33. **open3d's global RNG is shared state, and seeding it breaks other
+    tests.** `o3d.utility.random.seed()` (used to make point sampling
+    reproducible) also seeds `compute_uvatlas`, which is non-deterministic
+    (trap 10). A test asserting "doubling the atlas doubles the PSF sigma"
+    passed in isolation and in its own file, then **failed only in a full-suite
+    run**, because a different file's seeding changed how tightly the charts
+    packed and therefore the texel count. Assert the underlying rule
+    (`sigma × texel_world_size` is the source pixel's footprint, invariant to
+    the atlas) rather than a ratio that depends on packing.
+
 ### Photometric mesh refinement
 
 26. **Visibility must be decided at the surface, then reused for every
