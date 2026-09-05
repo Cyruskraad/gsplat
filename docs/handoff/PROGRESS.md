@@ -9,7 +9,7 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **156 tests pass.** Every guard mutation-checked — the fix reverted, a test
+- **161 tests pass.** Every guard mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
   perturbed points: removed **96.5%** of the reprojection error.
@@ -27,23 +27,29 @@ looks right.
   **Read that carefully: those four runs drove the *library* functions, not
   `extract_mesh.py`.** They are why the texturing work is trustworthy and also
   why a `TypeError` in the CLI's call to `bake_mesh_texture` survived five
-  commits — the library was exercised, its caller never was. Do not read "the
-  full delivery path, end to end" as "the CLI runs".
+  commits — the library was exercised, its caller never was.
+- **`extract_mesh.main()` itself now runs, on CPU** (`c8717d6`), on a synthetic
+  capture written to disk by `examples/make_synthetic_capture.py`, with every
+  delivery option on: cull → fit-target decimate → view-selected atlas + seam
+  levelling → 16-bit normal map → AO → OBJ + MTL + PNGs, read back. Also the
+  Poisson path end to end. This is what converted the block below from
+  "reviewed" to "executed", and it immediately found a silent frame mismatch
+  (see `ISSUES.md` §5).
 - `black --check --required-version 22.3.0`, `py_compile`, and an `import` of
   every changed example script.
 
 ### Reviewed by code inspection only
 
-- **Every CLI guard and warning in `extract_mesh.py`** — `--normal_map`/`--ao_map`,
+- **The TSDF path only.** `--method tsdf` renders depth maps through gsplat's
+  CUDA kernels, so neither it nor `--voxel_size`/`--sdf_trunc`/`--renderer` has
+  run. Everything else in `extract_mesh.py` now executes on CPU (above).
+  The guards that used to live here — `--normal_map`/`--ao_map`,
   `--texture_view_selection`, `--texture_seam_smoothness`, `--cull_unobserved`
-  and its histogram warning, `--texture_texels_per_pixel` and its clamp warning,
-  `--texture_pages`, and the `--target_fit_ratio`/`--target_triangles` mutual
-  exclusion. **All of them sit after an `assert cfg.ckpt`, so reaching any of
-  them needs a real checkpoint.** They are mutually consistent and modelled on
-  the already-shipped `--normal_map` guard, but none has been executed.
-  **`--texture_seam_smoothness` was in this list and was fatally broken** — it
-  crashed the whole run (see `ISSUES.md` section 5), which is the measure of
-  how much "mutually consistent by inspection" is worth here.
+  and its histogram warning, `--texture_texels_per_pixel`, `--texture_pages`,
+  the `--target_fit_ratio`/`--target_triangles` exclusion — were described as
+  "mutually consistent and modelled on the shipped `--normal_map` guard". Two
+  of them were in fact broken (a `TypeError` and a frame mismatch), which is
+  the measure of what inspection was worth.
 - The GPU stages themselves: `train`, `extract_mesh`, `dense_mvs` end to end.
 - Both AI-prior recipes against a *real* model. The Mask R-CNN recipe's full API
   path was executed with a randomly-initialised model and its output loaded

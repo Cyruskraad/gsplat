@@ -146,9 +146,28 @@ reaching `main()` needs a GPU checkpoint even on the `poisson` path, which never
 opens the file. **Until a checkpoint-free entry exists, `extract_mesh.py`'s
 `main()` is untested end to end and can hold another one of these.**
 
+**Fixing that gap immediately found a sixth, worse bug.** With `main()`
+runnable (`--method mesh --mesh_path`, or `--method poisson` on a cloud alone),
+the very first end-to-end run exposed a **silent frame mismatch**: `Parser` is
+built with `normalize=True`, which moves the cameras, but the Poisson path read
+its dense cloud straight off disk in the sparse model's raw frame. Nothing
+raises — the mesh is simply textured from cameras that do not line up with it.
+Measured: reading the mesh raw, **14.6%** of (vertex, view) pairs land in
+frame; through `parser.transform`, **100%**. Skip the transform and
+`--cull_unobserved` discards **68.6%** of faces while the script's own "the
+poses or the scale are wrong" warning fires — a diagnostic written for exactly
+this case and never once seen, because `main()` could not run. TSDF was
+unaffected: its splats come from a checkpoint trained through the same
+normalization. `Parser` applies this transform to its own `dense_points_path`
+and says why in a comment; the CLI just did not.
+
 **The lesson: after mutation-checking a mechanism, mutate the *caller* too.** If
 the suite stays green, the wiring is untested no matter how good the unit test
-looks.
+looks. Two concrete instances from closing this one, both caught only by
+mutating: a frame test that re-derived the transform inline stayed green when
+`extract_mesh.py` stopped applying it, and the mesh-path guard did not cover
+the Poisson path — dropping the transform there alone left the whole suite
+passing, so it needed its own test.
 
 Two more testing notes from experience here:
 
@@ -162,6 +181,15 @@ Two more testing notes from experience here:
 - **Do not trust a script's "ok" if you did not see it.** A doc-edit heredoc
   once failed silently because its output went to a backgrounded task file and
   only the pytest tail was read. `grep` for the text afterwards.
+- **Check your reader before reporting a bug in the writer.** A 16-bit normal
+  map reads back as `uint8` through `imageio` — its Pillow backend cannot write
+  16-bit RGB PNG and also silently down-converts one on *read*. The file is
+  genuinely `uint16`; OpenCV reads it as such. That looked like a third bug for
+  a few minutes and was not one.
+- **A perfect synthetic shape can be degenerate.** A dense cloud sampled
+  exactly on a sphere makes Qhull raise `QH6239` (cocircular/cospherical) inside
+  Poisson's Delaunay step. `make_synthetic_capture.py` adds radial noise by
+  default, which is also what a real MVS cloud looks like.
 
 ## 6. What to do next
 

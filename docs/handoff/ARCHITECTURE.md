@@ -25,6 +25,7 @@ Everything below is new on this branch unless marked *(modified)*.
 | `extract_mesh.py` | 612 | The delivery stage; 32 flags, the richest CLI |
 | `run_pipeline.py` | 529 | Orchestrator — runs the per-stage scripts as subprocesses |
 | `summarize_photogrammetry_stats.py` | 105 | Reads `stats/*.json` written by hand-run stages |
+| `make_synthetic_capture.py` | 330 | Writes a multi-view-consistent capture to disk: `images/` + a real `sparse/0/` + a dense `.ply` + the ground-truth mesh |
 | `bundle_adjust.py` | 98 | |
 | `dense_mvs.py` | 90 | |
 
@@ -33,7 +34,7 @@ Also modified: `examples/simple_trainer_2dgs.py` (`--extract_mesh`,
 (`mono_depth_dir`, `mask_dir`), `.github/workflows/core_tests.yml` (installs
 the suite's deps).
 
-### Tests — 156 across 9 files
+### Tests — 161 across 9 files
 
 | File | Tests | Lines |
 |---|---:|---:|
@@ -43,7 +44,7 @@ the suite's deps).
 | `tests/test_photogrammetry_metrics.py` | 14 | 228 |
 | `tests/test_colmap_dataset.py` | 13 | 568 |
 | `tests/test_extract_mesh_io.py` | 5 | 152 |
-| `tests/test_extract_mesh_cli.py` | 3 | 170 |
+| `tests/test_extract_mesh_cli.py` | 8 | 420 |
 | `tests/test_neural_sfm.py` | 4 | 243 |
 | `tests/test_bundle_adjustment.py` | 3 | 166 |
 
