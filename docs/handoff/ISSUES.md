@@ -25,12 +25,10 @@ one GPU run against a real capture. Nothing in the code is waiting on more code.
 
 - PR [#3](https://github.com/Cyruskraad/gsplat/pull/3) is an **open draft**,
   mergeable clean, with **no reviews and no comments**. It needs a human.
-- **The PR body is stale.** It was last refreshed at `92554d9` and is 4 commits
-  behind: it says "130 tests" (it is 153) and does not mention culling,
-  evidence-based atlas sizing, multi-page atlases, or the one-command
-  forwarding fix. `docs/photogrammetry_status.md` and this directory *are*
-  current. Refreshing means rebuilding from the live body via
-  `pull_request_read` — a saved draft in the scratchpad has drifted from it.
+- **Keep the PR body current.** It was refreshed at `4d379ed` and again at
+  `181a786`. If it drifts again, rebuild it from the *live* body via
+  `pull_request_read` — a saved draft in the scratchpad has drifted from it
+  before, and rewriting from the draft silently reverts whatever landed since.
 
 ## 3. Known limitations (deliberate, documented, not bugs)
 
@@ -128,7 +126,7 @@ Each of these cost real time to discover. Do not re-derive them.
 
 ## 5. The recurring testing failure — read this before writing tests
 
-**Four times on this branch, a test proved a *mechanism* worked while the
+**Five times on this branch, a test proved a *mechanism* worked while the
 *call site* went unpinned.** Each time the mutation passed the entire suite:
 
 | Mutation that escaped | Why the existing test missed it | What closed it |
@@ -137,6 +135,16 @@ Each of these cost real time to discover. Do not re-derive them.
 | Sum projected areas instead of max | Every scaling test uses *ratios*, and a consistent over-count cancels out of a ratio | A test pinning absolute evidence against view count |
 | `bake_texture_atlas_pages(occluder=None)` | The occlusion test supplies its own occluder either way | A test driving the page bake itself |
 | Return an unmeasured decimation result | The first attempt produced the same mesh by coincidence | A stronger mutation (return an over-decimated mesh) |
+| `extract_mesh.py` passing `seam_smoothness=` to `bake_mesh_texture()`, which has no such parameter | `bake_texture_atlas_view_selected` was tested directly and works; the flag guard checks the *outer* seam only (that every `--flag` `run_pipeline.py` emits is a `Config` field) | `tests/test_extract_mesh_cli.py` — a static check that every keyword `extract_mesh.py` passes to a `gsplat.photogrammetry` function exists on its real signature |
+
+The fifth is the one worth dwelling on: it was **not** a subtle behavioural
+regression but a `TypeError` on the default path, so from `fa70683` to `181a786`
+*every* texture-baking run of `extract_mesh.py` — and `run_pipeline.py`'s whole
+delivery stage — crashed. It survived because no test has ever called
+`extract_mesh.main()`: `assert cfg.ckpt` runs before the method dispatch, so
+reaching `main()` needs a GPU checkpoint even on the `poisson` path, which never
+opens the file. **Until a checkpoint-free entry exists, `extract_mesh.py`'s
+`main()` is untested end to end and can hold another one of these.**
 
 **The lesson: after mutation-checking a mechanism, mutate the *caller* too.** If
 the suite stays green, the wiring is untested no matter how good the unit test
@@ -157,8 +165,14 @@ Two more testing notes from experience here:
 
 ## 6. What to do next
 
-Ordered by value. Everything unblocked has been done; be honest about that
-rather than inventing work.
+Ordered by value.
+
+**This section previously read "everything unblocked has been done". That was
+wrong, and the way it was wrong is the useful part:** it was written from the
+set of *planned features*, not from the state of the code, and a live
+`TypeError` that crashed every texture-baking run sat under it for five commits
+(see section 5). Check the code before repeating the claim — run the CLI, do
+not just read it.
 
 **Blocked on a human or hardware** (the real critical path):
 

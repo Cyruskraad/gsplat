@@ -9,7 +9,7 @@ looks right.
 
 ### Executed, on CPU, with real `pycolmap`/`open3d`/`scikit-learn`/`opencv`
 
-- **153 tests pass.** Every guard mutation-checked — the fix reverted, a test
+- **156 tests pass.** Every guard mutation-checked — the fix reverted, a test
   confirmed to genuinely fail.
 - **Bundle adjustment**, non-dry-run, against a synthetic COLMAP model with
   perturbed points: removed **96.5%** of the reprojection error.
@@ -23,6 +23,12 @@ looks right.
     byte-identical;
   - every sizing decision measured: 6960 faces → cull 3480 → fit-decimate 592 →
     atlas 512 chosen from the evidence.
+
+  **Read that carefully: those four runs drove the *library* functions, not
+  `extract_mesh.py`.** They are why the texturing work is trustworthy and also
+  why a `TypeError` in the CLI's call to `bake_mesh_texture` survived five
+  commits — the library was exercised, its caller never was. Do not read "the
+  full delivery path, end to end" as "the CLI runs".
 - `black --check --required-version 22.3.0`, `py_compile`, and an `import` of
   every changed example script.
 
@@ -35,6 +41,9 @@ looks right.
   exclusion. **All of them sit after an `assert cfg.ckpt`, so reaching any of
   them needs a real checkpoint.** They are mutually consistent and modelled on
   the already-shipped `--normal_map` guard, but none has been executed.
+  **`--texture_seam_smoothness` was in this list and was fatally broken** — it
+  crashed the whole run (see `ISSUES.md` section 5), which is the measure of
+  how much "mutually consistent by inspection" is worth here.
 - The GPU stages themselves: `train`, `extract_mesh`, `dense_mvs` end to end.
 - Both AI-prior recipes against a *real* model. The Mask R-CNN recipe's full API
   path was executed with a randomly-initialised model and its output loaded
