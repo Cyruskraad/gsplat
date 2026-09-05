@@ -21,16 +21,23 @@ start of a session rather than assuming; the check is seconds.
 **The single highest-value action available to a human is enabling Actions**, or
 one GPU run against a real capture. Nothing in the code is waiting on more code.
 
-## 2. Open state on the PR
+## 2. Open state on the PRs
 
-- PR [#3](https://github.com/Cyruskraad/gsplat/pull/3) is an **open draft**,
-  mergeable clean, with **no reviews and no comments**. It needs a human.
-- **The PR body is stale.** It was last refreshed at `92554d9` and is 4 commits
-  behind: it says "130 tests" (it is 153) and does not mention culling,
-  evidence-based atlas sizing, multi-page atlases, or the one-command
-  forwarding fix. `docs/photogrammetry_status.md` and this directory *are*
-  current. Refreshing means rebuilding from the live body via
-  `pull_request_read` — a saved draft in the scratchpad has drifted from it.
+There are now **two** open drafts, and they stack:
+
+- PR [#3](https://github.com/Cyruskraad/gsplat/pull/3): `jb0pod` → `main`, 34
+  commits. **Its body is stale** — last refreshed at `92554d9`, it says "130
+  tests" and does not mention culling, evidence-based atlas sizing, multi-page
+  atlases, or the one-command forwarding fix. Refreshing means rebuilding from
+  the live body via `pull_request_read`; a saved draft in the scratchpad has
+  drifted from it.
+- PR [#4](https://github.com/Cyruskraad/gsplat/pull/4): the most recent
+  session's five commits, based on `jb0pod` **not** `main` (there is no
+  `gsplat.photogrammetry` on `main` at all), so its diff is only the new work.
+
+Neither has any review or comment. Both need a human. If #3 merges first, #4
+can be retargeted at `main` without conflict; if the two are reviewed together,
+read #3's diff first — #4 assumes all of it.
 
 ## 3. Known limitations (deliberate, documented, not bugs)
 
@@ -333,21 +340,51 @@ rather than inventing work.
 **Blocked on a human or hardware** (the real critical path):
 
 1. **Enable GitHub Actions**, then confirm `core_tests.yml` actually runs the
-   suite. Highest value by a distance.
-2. **Get PR #3 reviewed**, or feedback on scope/direction.
-3. **One GPU run on a real capture.** This settles the open question the metrics
-   were built to answer: *is view selection worth enabling on real data?*
-   `atlas_sharpness` and `seam_discontinuity` exist to answer it.
-4. Run either AI-prior recipe against a real model, with weights.
+   suite. Highest value by a distance — 194 tests have never run anywhere but
+   by hand.
+2. **Get PRs #3 and #4 reviewed**, or feedback on scope/direction.
+3. **One GPU run on a real capture.** This has become the critical measurement
+   for more than one question. It settles *is view selection worth enabling*,
+   which `atlas_sharpness` and `seam_discontinuity` were built to answer; and
+   it is now the only way to test the three stages that have never seen a real
+   photograph — photometric camera refinement, photometric mesh refinement,
+   and texture super-resolution. Every number behind them comes from ray-cast
+   renders of a mesh, where the geometry is exact and the only error is the one
+   deliberately injected. **Real captures violate that**: the surface is
+   approximate, lighting is not Lambertian, and exposure varies. Expect the
+   measured factors to shrink; the question is whether they survive at all.
+4. **A GPU run of `gaussian_density_field`.** It has never executed. Everything
+   downstream of it is verified against an analytic field, so this is a
+   genuinely small remaining risk — but it is not zero, and it is the one part
+   of the level-set path nobody has run.
+5. Run either AI-prior recipe against a real model, with weights.
 
 **Unblocked, if you want more code** (all genuinely optional):
 
-5. **View selection combined with multi-page atlases** — currently refused. The
-   MRF already labels mesh-wide; the work is making seam levelling run across
-   page boundaries and the page bake honour labels. The most substantial
-   remaining feature.
-6. Non-square atlases; multi-material chart grouping.
-7. **Refresh the PR body** (see §2).
-8. Tuning the defaults — `--texture_size` 2048, dilation 4 texels, normal-map
-   cage 2% of the bbox diagonal. None has been tuned against a real scene, so
-   this really wants #3 first.
+6. **View selection combined with multi-page atlases** — still refused. The MRF
+   already labels mesh-wide; the work is making seam levelling run across page
+   boundaries and the page bake honour labels. Super-resolution refuses
+   multi-page for a different and more fundamental reason (its PSF is a blur in
+   atlas space and cannot reach a texel's neighbours on another page).
+7. **Wire `extract_level_set` into `extract_mesh.py`** as a third `--method`.
+   It is exported and tested but no CLI reaches it, because the field half
+   cannot run here — so wiring it now would add a flag that fails on this
+   machine at the first call. Do it alongside item 4.
+8. **Super-resolution's forward model.** It uses one mean PSF per view; a
+   per-texel footprint (which varies with distance and obliquity across a
+   single view) is the obvious next term, and § 4.22 shows exactly where the
+   current model's error shows up — pointwise, against view selection.
+9. Non-square atlases; multi-material chart grouping.
+10. Refresh PR #3's body (see § 2).
+11. Tuning the defaults — `--texture_size` 2048, dilation 4 texels, normal-map
+    cage 2% of the bbox diagonal, and now `--texture_super_resolve_lambda` 0.1
+    and `--refine_mesh_step` 0.5. None has been tuned against a real scene, so
+    this really wants #3 first.
+
+**A note on what this branch keeps finding.** Three separate received wisdoms
+were tested here and *failed*: open3d's own colour-map optimiser (§ 4.17),
+"coarse-to-fine is not optional" for camera refinement (§ 4.19) and again for
+mesh refinement (§ 4.29). And two metrics turned out to be misleading in the
+direction opposite to the documented one (§ 4.20, § 4.31). The pattern is
+consistent enough to be worth stating: **on this project, measure the claim
+before you build on it, and measure the ceiling as well as the change.**

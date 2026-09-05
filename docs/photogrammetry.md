@@ -555,6 +555,95 @@ point cloud of its own to reconstruct from. It writes mesh quality stats to
 `results/garden_2dgs/stats/mesh_step<step>.json`, next to `eval()`'s own
 `stats/val_step<step>.json` render-quality reports.
 
+### Fixing the registration, instead of working around it
+
+Blending views blurs a texture; picking one displaces it; seam levelling
+repairs what picking breaks. All three work around the same cause -- **two
+views of a surface point are never registered to sub-pixel accuracy after
+SfM**. Bundle adjustment minimises reprojection error over sparse feature
+tracks, which leaves a residual that is small in feature terms and large in
+texture terms.
+
+`--photometric_align` addresses the cause (Zhou & Koltun, *Color Map
+Optimization*, SIGGRAPH 2014). It alternates baking the surface colour with the
+poses you have and moving each camera until its own image agrees with that
+colour:
+
+```bash
+python examples/extract_mesh.py --ckpt ... --data_dir ... --result_dir ... \
+    --texture_mode atlas --photometric_align
+```
+
+Measured on a synthetic sphere at 45' of residual pose error, against a
+perfectly-registered ceiling: blending's retained contrast goes from **59% to
+92%** (the ceiling is 93%), atlas L1 from **0.180 to 0.057**, and the pointwise
+ranking between blending and view selection **flips to the one exact poses
+produce**. The tradeoff those two options represent is a symptom of
+misregistration, not a property of the methods.
+
+It needs no GPU. Residuals before and after land in `mesh_metrics.json`.
+
+**Its working range is a pose error that displaces a projection by less than
+half the texture detail's wavelength.** Past that the objective aliases and the
+solve cannot tell which way to move; it warns when the residual does not
+improve.
+
+`--refine_mesh` is the same idea applied to the surface (Vu et al., TPAMI 2012
+-- the stage OpenMVS ships as `RefineMesh`): each vertex moves along its normal
+to maximise multi-view photoconsistency, regularised by a *tangential*
+Laplacian so the smoothing redistributes vertices over the surface rather than
+shrinking it. On a sphere perturbed by 0.03, mean radial error against the
+analytic surface goes **0.0244 to 0.0125** and cloud-to-mesh **0.0207 to
+0.0094**. The two compose in the obvious order -- cameras against the surface,
+then the surface against the cameras -- and `run_pipeline.py` runs them that
+way.
+
+### Super-resolving the texture
+
+Once the views are registered, neither blending nor picking is the right
+operator. `--texture_super_resolve` solves for the texture whose *reprojection*
+best explains every view at once (Goldlücke et al., IJCV 2014): a MAP
+deconvolution that models each camera's point spread function, where the PSF
+width is measured from the capture -- a view that sees the surface up close has
+a narrow PSF and contributes sharp information, a distant one contributes
+mostly low frequencies.
+
+Against blending it is a clean win on both axes at once, which nothing else
+here manages: **contrast 64% to 91%** of ground truth and **L1 0.108 to
+0.076**. Against `--texture_view_selection` it is reliably sharper but
+pointwise a coin flip depending on the regime, so it is **opt-in and not a
+strict replacement** -- single-view sampling reads the source pixels with no
+forward model at all, and every approximation in this one's PSF model surfaces
+as pointwise error. Run `--photometric_align` first: deconvolution sharpens
+whatever the views agree on, including their disagreements.
+
+### Delivering a mesh you already have, without a GPU
+
+`--mesh_path` culls, decimates, textures and maps an existing `.obj`/`.ply`,
+with no checkpoint and no GPU:
+
+```bash
+python examples/extract_mesh.py --data_dir data/scene --data_factor 1 \
+    --mesh_path scene.obj --result_dir out \
+    --texture_mode atlas --cull_unobserved --normal_map --ao_map
+```
+
+The mesh is expected in the same world coordinates as the COLMAP model under
+`--data_dir`, and is mapped into the normalized frame the dataset's cameras
+use. `--method poisson --dense_points ...` likewise needs no checkpoint.
+
+To try any of this without a capture, `examples/make_synthetic_capture.py`
+writes a complete one -- images ray-cast from a textured mesh, a real
+`sparse/0/` COLMAP model, a dense cloud and the ground-truth mesh:
+
+```bash
+python examples/make_synthetic_capture.py --data_dir /tmp/capture \
+    --pose_error_arcmin 45 --exposure 0.15
+```
+
+`--pose_error_arcmin` perturbs the *reported* pose while leaving the render
+untouched, which is exactly what residual SfM error is.
+
 ### One-command end-to-end pipeline
 
 Steps 1-4 above (plus a baseline stats pass on the input SfM model, and

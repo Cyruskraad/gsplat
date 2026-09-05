@@ -24,19 +24,25 @@ running log this directory summarises),
 
 A `gsplat.photogrammetry` subpackage adding the classic photogrammetry loop
 around gsplat's existing Gaussian-splat training: **SfM → bundle adjustment →
-dense MVS → training → mesh extraction → cull → decimate → texture → normal/AO
-maps → OBJ**, orchestrated by one command, with automatic quality metrics at
-every stage. It lives on one branch, as one draft PR, and has never run on a
-GPU or a real capture — everything is verified against analytic ground truth on
-CPU.
+dense MVS → training → mesh extraction → refine → cull → decimate → texture →
+normal/AO maps → OBJ**, orchestrated by one command, with automatic quality
+metrics at every stage. It has never run on a GPU or a real capture —
+everything is verified against analytic ground truth on CPU.
+
+The most recent session added the two stages that fix *causes* rather than
+symptoms — photometric camera refinement and photometric mesh refinement — plus
+multi-view texture super-resolution, derived reconstruction parameters, and a
+CPU-testable level-set extractor. It also fixed a `TypeError` that had made
+**every texture-baking run of `extract_mesh.py` crash**, undetected because no
+test had ever called that script's `main()`.
 
 | | |
 |---|---|
-| Branch | `claude/photogrammetry-techniques-plan-jb0pod` |
-| Head | `b342d5d` (33 commits, 34 files, +15024 / −10 against `main`) |
-| PR | [#3](https://github.com/Cyruskraad/gsplat/pull/3) — **open draft**, mergeable clean, **no reviews, no comments, no CI** |
-| Tests | **153 passing** across 8 files |
-| Bugs found and fixed | 13, each mutation-checked |
+| Branch | `claude/gsplat-photogrammetry-next-0tdvws`, branched from `claude/photogrammetry-techniques-plan-jb0pod` |
+| Head | `ea9dce7` (39 commits against `main`; 5 of them this session, +5071 / −43 against `jb0pod`) |
+| PRs | [#3](https://github.com/Cyruskraad/gsplat/pull/3) (`jb0pod` → `main`) and [#4](https://github.com/Cyruskraad/gsplat/pull/4) (this session, → `jb0pod`) — both **open drafts**, **no reviews, no comments, no CI** |
+| Tests | **194 passing** across 10 files |
+| Bugs found and fixed | 18, each mutation-checked |
 | Blocking | GitHub Actions disabled at repo level; no GPU/CUDA/`colmap`; no model weights |
 
 ---
@@ -49,11 +55,27 @@ CPU.
 python -m pytest tests/test_bundle_adjustment.py tests/test_mesh_extraction.py \
     tests/test_neural_sfm.py tests/test_colmap_dataset.py \
     tests/test_photogrammetry_metrics.py tests/test_photogrammetry_pipeline.py \
-    tests/test_texturing.py tests/test_extract_mesh_io.py -q
+    tests/test_texturing.py tests/test_extract_mesh_io.py \
+    tests/test_extract_mesh_cli.py tests/test_photometric_alignment.py -q
 ```
 
-Expect **153 passed** (~2m20s). Needs `pycolmap`, `open3d`, `scikit-learn`,
-`opencv-python-headless`, `imageio`, `piexif`, `pytest-check`.
+Expect **194 passed** (~3m10s). Needs `torch`, `pycolmap`, `open3d`,
+`scikit-learn`, `opencv-python-headless`, `imageio`, `piexif`, `pytest-check`.
+
+**Run the whole set, not one file.** One test in this suite already failed
+*only* under a full run, because open3d's global RNG is shared between files
+(`ISSUES.md` § 4.33).
+
+**And run the delivery CLI**, which needs no GPU and no checkpoint since this
+session — it is the call-site pin that a green unit suite does not give you:
+
+```bash
+python examples/make_synthetic_capture.py --data_dir /tmp/capture
+python examples/extract_mesh.py --data_dir /tmp/capture --data_factor 1 \
+    --test_every 10000 --mesh_path /tmp/capture/mesh/surface.obj \
+    --result_dir /tmp/out --texture_mode atlas --cull_unobserved \
+    --texture_view_selection --normal_map --ao_map
+```
 
 **2. Check whether any blocker has lifted** — this decides what is worth doing:
 
