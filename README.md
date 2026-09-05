@@ -17,6 +17,7 @@ gsplat is an open-source library for CUDA accelerated rasterization of gaussians
 
 Changes on `main` since the [v1.5.3](https://github.com/nerfstudio-project/gsplat/releases/tag/v1.5.3) tag (not yet on PyPI).
 
+- [Sep 2026] **Photogrammetry pipeline** (`gsplat.photogrammetry`) -- closes the SfM -> mesh loop: torch-native bundle adjustment over COLMAP point tracks, dense MVS point-cloud densification (via COLMAP's own patch-match stereo + fusion), mesh extraction (TSDF fusion of rendered 2DGS/3DGS depth maps, or Poisson reconstruction) with texture baking, per-stage automatic quality metrics (reconstruction/track quality, reprojection error, cloud-to-mesh fit, mesh/point-cloud stats, AI-prior coverage) orchestrated end-to-end by `examples/run_pipeline.py` into one `pipeline_report.json`, and AI-assisted extras (monocular depth priors, neural-SfM import, transient/dynamic-object masking) that consume precomputed external model output rather than bundling any model-running code. See [docs/photogrammetry.md](docs/photogrammetry.md).
 - [Aug 2026] **Spherical-harmonics updates** -- split diffuse and view-dependent operators, fused view-direction computation, and optimized backward kernels.
 - [Jul 2026] **Sparse 3DGS rasterization** -- active-tile rendering with forward/backward support and sparse Gaussian ID, count, and top-contributor queries.
 - [Jul 2026] **Multi-GPU dense 3DGS** -- distributed support for the dense rendering path.

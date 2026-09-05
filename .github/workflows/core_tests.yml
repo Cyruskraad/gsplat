@@ -43,6 +43,17 @@ jobs:
           # collection doesn't ImportError on a fresh build. The tests also
           # have `pytest.importorskip` guards as a belt-and-braces.
           BUILD_NO_CUDA=1 pip install .[examples]
+          # The gsplat.photogrammetry test suite is CPU-only, but its
+          # `pytest.importorskip` guards mean that without these it silently
+          # skips four of its six files rather than failing -- 26 of 58 tests
+          # actually run. These are what the other 32 need:
+          #   pycolmap     test_colmap_dataset, test_neural_sfm,
+          #                test_photogrammetry_pipeline (reconstruction_stats)
+          #   open3d       test_mesh_extraction, test_photogrammetry_metrics
+          #   scikit-learn test_neural_sfm's track merging
+          #   opencv/piexif  test_colmap_dataset's undistortion fixtures
+          pip install "pycolmap>=3.10.0" "open3d>=0.18.0" scikit-learn \
+            opencv-python-headless piexif
       - name: Code Formatting Check
         run: lint/format-code.sh --check --full
       - name: Run Tests.

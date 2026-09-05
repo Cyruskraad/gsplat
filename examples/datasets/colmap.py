@@ -107,6 +107,28 @@ def _camera_distortion(camera: Any) -> tuple[np.ndarray, str]:
     )
 
 
+def _load_dense_pointcloud(path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Load a dense point cloud (e.g. COLMAP's fused ``dense.ply``) via Open3D.
+
+    Returns (xyz [P, 3] float32, rgb [P, 3] uint8).
+    """
+    try:
+        import open3d as o3d
+    except ImportError as e:
+        raise ImportError(
+            "Loading a dense point cloud (`dense_points_path`) requires "
+            "open3d. Install it with `pip install gsplat[mesh]` (or "
+            "`pip install open3d`)."
+        ) from e
+    pcd = o3d.io.read_point_cloud(path)
+    xyz = np.asarray(pcd.points, dtype=np.float32)
+    if pcd.has_colors():
+        rgb = (np.asarray(pcd.colors) * 255.0).clip(0, 255).astype(np.uint8)
+    else:
+        rgb = np.full((xyz.shape[0], 3), 128, dtype=np.uint8)
+    return xyz, rgb
+
+
 def _image_w2c(image: Any) -> np.ndarray:
     cam_from_world = image.cam_from_world
     if callable(cam_from_world):
@@ -127,6 +149,9 @@ class Parser:
         normalize: bool = False,
         test_every: int = 8,
         load_exposure: bool = False,
+        colmap_dir: Optional[str] = None,
+        dense_points_path: Optional[str] = None,
+        dense_mode: str = "augment",
     ):
         self.data_dir = data_dir
         self.factor = factor
@@ -134,9 +159,10 @@ class Parser:
         self.test_every = test_every
         self.load_exposure = load_exposure
 
-        colmap_dir = os.path.join(data_dir, "sparse/0/")
-        if not os.path.exists(colmap_dir):
-            colmap_dir = os.path.join(data_dir, "sparse")
+        if colmap_dir is None:
+            colmap_dir = os.path.join(data_dir, "sparse/0/")
+            if not os.path.exists(colmap_dir):
+                colmap_dir = os.path.join(data_dir, "sparse")
         assert os.path.exists(
             colmap_dir
         ), f"COLMAP directory {colmap_dir} does not exist."
@@ -317,6 +343,36 @@ class Parser:
         self.point_indices = point_indices  # Dict[str, np.ndarray], image_name -> [M,]
         self.transform = transform  # np.ndarray, (4, 4)
 
+        # Optionally densify the sparse SfM point cloud with a dense MVS point
+        # cloud (see `gsplat.photogrammetry.dense_mvs.run_dense_mvs`), applying
+        # the same normalization transform as the sparse points so both stay
+        # aligned with `self.camtoworlds`.
+        if dense_points_path is not None:
+            dense_xyz, dense_rgb = _load_dense_pointcloud(dense_points_path)
+            dense_xyz = transform_points(transform, dense_xyz).astype(np.float32)
+            dense_err = np.full(
+                (dense_xyz.shape[0],),
+                float(np.median(self.points_err)) if len(self.points_err) else 0.0,
+                dtype=np.float32,
+            )
+            if dense_mode == "replace":
+                self.points = dense_xyz
+                self.points_rgb = dense_rgb
+                self.points_err = dense_err
+            elif dense_mode == "augment":
+                self.points = np.concatenate([self.points, dense_xyz], axis=0)
+                self.points_rgb = np.concatenate([self.points_rgb, dense_rgb], axis=0)
+                self.points_err = np.concatenate([self.points_err, dense_err], axis=0)
+            else:
+                raise ValueError(
+                    f"Unknown dense_mode: {dense_mode!r}. Use 'augment' or 'replace'."
+                )
+            print(
+                f"[Parser] Densified with {dense_xyz.shape[0]} points from "
+                f"{dense_points_path} (dense_mode={dense_mode}); "
+                f"total {self.points.shape[0]} points."
+            )
+
         # Create 0-based contiguous camera indices from COLMAP camera_ids.
         # This is useful for camera-based embeddings/modules.
         unique_camera_ids = sorted(set(camera_ids))
@@ -449,11 +505,15 @@ class Dataset:
         split: str = "train",
         patch_size: Optional[int] = None,
         load_depths: bool = False,
+        mono_depth_dir: Optional[str] = None,
+        mask_dir: Optional[str] = None,
     ):
         self.parser = parser
         self.split = split
         self.patch_size = patch_size
         self.load_depths = load_depths
+        self.mono_depth_dir = mono_depth_dir
+        self.mask_dir = mask_dir
         indices = np.arange(len(self.parser.image_names))
         if split == "train":
             self.indices = indices[indices % self.parser.test_every != 0]
@@ -472,6 +532,62 @@ class Dataset:
         camtoworlds = self.parser.camtoworlds[index]
         mask = self.parser.mask_dict[camera_id]
 
+        mono_depth = None
+        if self.mono_depth_dir is not None:
+            # Load and resize to the *original* (pre-undistortion) image
+            # resolution now, so it goes through the same undistortion remap
+            # + ROI crop as `image` below and stays pixel-aligned with it --
+            # a plain post-undistortion resize would leave it misaligned
+            # under any non-trivial lens distortion.
+            image_name = self.parser.image_names[index]
+            stem = os.path.splitext(os.path.basename(image_name))[0]
+            mono_depth_path = os.path.join(self.mono_depth_dir, f"{stem}.npy")
+            mono_depth = np.load(mono_depth_path)
+            mono_depth = mono_depth.astype(np.float32)
+            # Depth models commonly emit (1, H, W) or (H, W, 1) rather than a
+            # bare (H, W) -- e.g. a transformers depth-estimation pipeline's
+            # `predicted_depth`. Left alone, such an array silently survives
+            # the resize below as garbage: cv2 reads a (1, H, W) array as a
+            # 1-row image with W channels and happily returns (H, W, W). Drop
+            # singleton axes, and refuse anything still not 2D rather than
+            # feeding a corrupt depth prior into a long training run.
+            mono_depth = np.squeeze(mono_depth)
+            if mono_depth.ndim != 2:
+                raise ValueError(
+                    f"mono_depth map {mono_depth_path!r} has shape "
+                    f"{np.load(mono_depth_path).shape}, which is not a single "
+                    "(H, W) depth map. Save one 2D float array per image "
+                    "(np.squeeze the model's output if it has a leading "
+                    "batch/channel axis)."
+                )
+            if mono_depth.shape[:2] != image.shape[:2]:
+                mono_depth = cv2.resize(
+                    mono_depth,
+                    (image.shape[1], image.shape[0]),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+
+        transient_mask = None
+        if self.mask_dir is not None:
+            # A precomputed per-image mask excluding transient/dynamic
+            # content (people, vehicles, ...) from supervision -- nonzero =
+            # keep/static, 0 = exclude/transient, matching the convention of
+            # the fisheye ROI `mask` above. Same alignment rationale as
+            # `mono_depth`: resize to the *original* resolution first, then
+            # undergo the identical undistortion remap + ROI crop below.
+            image_name = self.parser.image_names[index]
+            stem = os.path.splitext(os.path.basename(image_name))[0]
+            transient_mask = imageio.imread(os.path.join(self.mask_dir, f"{stem}.png"))
+            if transient_mask.ndim == 3:
+                transient_mask = transient_mask[..., 0]
+            transient_mask = (transient_mask != 0).astype(np.uint8)
+            if transient_mask.shape[:2] != image.shape[:2]:
+                transient_mask = cv2.resize(
+                    transient_mask,
+                    (image.shape[1], image.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
         if len(params) > 0:
             # Images are distorted. Undistort them.
             mapx, mapy = (
@@ -481,6 +597,20 @@ class Dataset:
             image = cv2.remap(image, mapx, mapy, cv2.INTER_LINEAR)
             x, y, w, h = self.parser.roi_undist_dict[camera_id]
             image = image[y : y + h, x : x + w]
+            if mono_depth is not None:
+                mono_depth = cv2.remap(mono_depth, mapx, mapy, cv2.INTER_LINEAR)
+                mono_depth = mono_depth[y : y + h, x : x + w]
+            if transient_mask is not None:
+                transient_mask = cv2.remap(
+                    transient_mask, mapx, mapy, cv2.INTER_NEAREST
+                )
+                transient_mask = transient_mask[y : y + h, x : x + w]
+
+        if transient_mask is not None:
+            # Combine with the fisheye ROI mask, if any -- both are now in
+            # the same (post-undistortion-crop) resolution/frame.
+            transient_mask = transient_mask.astype(bool)
+            mask = transient_mask if mask is None else (mask & transient_mask)
 
         if self.patch_size is not None:
             # Random crop.
@@ -490,6 +620,12 @@ class Dataset:
             image = image[y : y + self.patch_size, x : x + self.patch_size]
             K[0, 2] -= x
             K[1, 2] -= y
+            if mono_depth is not None:
+                mono_depth = mono_depth[
+                    y : y + self.patch_size, x : x + self.patch_size
+                ]
+            if mask is not None:
+                mask = mask[y : y + self.patch_size, x : x + self.patch_size]
 
         data = {
             "K": torch.from_numpy(K).float(),
@@ -502,6 +638,8 @@ class Dataset:
         }
         if mask is not None:
             data["mask"] = torch.from_numpy(mask).bool()
+        if mono_depth is not None:
+            data["mono_depth"] = torch.from_numpy(mono_depth)
 
         # Add exposure if available for this image
         exposure = self.parser.exposure_values[index]

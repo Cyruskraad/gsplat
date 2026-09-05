@@ -1,0 +1,814 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Extract a textured triangle mesh from a trained 2DGS/3DGS checkpoint.
+
+Requires the optional `open3d` dependency: `pip install gsplat[mesh]`.
+
+Example:
+
+    python examples/extract_mesh.py \\
+        --ckpt results/garden_2dgs/ckpts/ckpt_29999_rank0.pt \\
+        --data_dir data/360_v2/garden --result_dir results/garden_2dgs
+
+writes `results/garden_2dgs/mesh.ply`. Pass `--method poisson
+--dense_points data/360_v2/garden/dense/dense.ply` to instead run Poisson
+reconstruction over a dense MVS point cloud (see `examples/dense_mvs.py`).
+
+Pass `--texture_mode atlas` to UV-unwrap the mesh and bake a texture atlas
+instead of per-vertex colors, writing `mesh.obj` + `mesh.mtl` + `mesh_0.png`
+(loadable with its texture in standard DCC tools and game engines).
+"""
+
+import json
+import os
+import warnings
+from dataclasses import dataclass
+from typing import Literal, Optional
+
+import imageio.v2 as imageio
+import numpy as np
+import open3d as o3d
+import torch
+import tyro
+from datasets.colmap import Dataset, Parser
+from datasets.normalize import transform_points
+
+from gsplat.photogrammetry.mesh_extraction import (
+    bake_ambient_occlusion,
+    bake_mesh_texture,
+    bake_normal_map,
+    cull_unobserved_faces,
+    extract_mesh_poisson,
+    extract_mesh_tsdf,
+    recommended_texture_size,
+    simplify_mesh,
+    simplify_mesh_to_error,
+)
+from gsplat.photogrammetry.level_set import (
+    extract_level_set,
+    gaussian_opacity_field,
+    validate_level_set_pipeline,
+)
+from gsplat.photogrammetry.mesh_refinement import refine_mesh_photometric
+from gsplat.photogrammetry.metrics import mesh_quality_stats, point_to_mesh_distance
+
+
+def _write_map(path: str, image: np.ndarray) -> None:
+    """Write a texture map, at 8 or 16 bits per channel.
+
+    imageio's default PNG backend is Pillow, which cannot write a **16-bit
+    RGB** PNG at all (it supports 16-bit grayscale only, and raises
+    ``TypeError: Cannot handle this data type``). OpenCV can, and is already a
+    dependency of the dataset loader, so 16-bit maps go through it.
+
+    OpenCV is BGR: the channels have to be reversed on the way out or the
+    normal map's X and Z are swapped -- an asset that loads fine and shades
+    wrong. `tests/test_extract_mesh_io.py` pins the round trip.
+    """
+    if image.dtype == np.uint16:
+        import cv2
+
+        if image.ndim == 3 and image.shape[2] == 3:
+            image = image[:, :, ::-1]
+        if not cv2.imwrite(path, image):
+            raise RuntimeError(f"Failed to write {path!r}.")
+        return
+    imageio.imwrite(path, image)
+
+
+@dataclass
+class Config:
+    # Path to a gsplat checkpoint (.pt) with a "splats" state dict of
+    # SH-color Gaussians (as saved by simple_trainer.py / simple_trainer_2dgs.py
+    # without --app_opt).
+    ckpt: str = ""
+    # Dataset root directory (used to build camera poses to render/bake from).
+    data_dir: str = "data/360_v2/garden"
+    # Downsample factor for the dataset.
+    data_factor: int = 4
+    # Every N images there is a test image; use a large value (e.g. 10_000) to
+    # put ~all images in the "train" split used for mesh extraction/baking.
+    test_every: int = 8
+    # Reconstruction method. "tsdf" fuses depth maps rendered from --ckpt;
+    # "poisson" reconstructs from --dense_points; "mesh" skips reconstruction
+    # and loads --mesh_path, so an existing mesh can be culled, decimated,
+    # textured and mapped without a checkpoint or a GPU.
+    method: Literal["tsdf", "poisson", "mesh", "level_set"] = "tsdf"
+    # Renderer used to produce depth maps for TSDF fusion.
+    renderer: Literal["2dgs", "3dgs"] = "2dgs"
+    # Path to a dense MVS point cloud (see examples/dense_mvs.py). Required
+    # for --method poisson; optional fallback source for TSDF is unused.
+    dense_points: Optional[str] = None
+    # Path to an existing mesh (.ply/.obj) to texture and deliver as-is.
+    # Required for --method mesh. The cloud-to-mesh fit reference is
+    # --dense_points when given, otherwise the sparse SfM cloud.
+    mesh_path: Optional[str] = None
+    # Which world frame --mesh_path is in. "colmap" is the raw frame of the
+    # sparse model (what an external MVS tool or `colmap` itself produces);
+    # "normalized" is the frame this script's own TSDF output is already in,
+    # since it is built from a checkpoint trained through Parser(normalize=True).
+    # Getting this wrong does not fail loudly -- it silently textures the mesh
+    # from cameras that do not line up with it.
+    mesh_frame: Literal["colmap", "normalized"] = "colmap"
+    # TSDF voxel size, in scene units. Left unset it is derived from the
+    # rendered depth maps -- a voxel becomes the world size of one source
+    # pixel at the depth it observes, which is the finest scale the evidence
+    # supports. A fixed value only suits one scene scale: the old default of
+    # 0.01 produced an empty mesh at 10x that scale and 4.9x the error at 0.1x.
+    voxel_size: Optional[float] = None
+    # TSDF truncation distance, in scene units. Left unset it is 4 voxels.
+    sdf_trunc: Optional[float] = None
+    # Maximum depth to integrate, in scene units. Left unset it is set just
+    # past the depths the maps actually contain, so it rejects outliers
+    # without cropping real geometry.
+    depth_trunc: Optional[float] = None
+    # Slide mesh vertices along their normals onto the photoconsistent
+    # surface (Vu et al., TPAMI 2012) before culling and decimating. Worth it
+    # above roughly a third of a source pixel of surface error and not below,
+    # where it adds about 0.15 px of noise instead -- see
+    # gsplat.photogrammetry.mesh_refinement. Off by default.
+    refine_mesh: bool = False
+    # Laplacian weight for --refine_mesh.
+    refine_smoothness: float = 1.0
+    # Visibility/tangent-frame recomputations for --refine_mesh.
+    refine_rounds: int = 6
+    # Grid cells along the longest axis for --method level_set. Cost and
+    # memory are cubic in this; start at 64 and check the reported residual
+    # before raising it.
+    level_set_resolution: int = 128
+    # Iso-value for --method level_set. The field is 0.5 - opacity, so 0.0 is
+    # the half-opacity surface. Run --level_set_selftest and then read the
+    # probe report in mesh_metrics.json before changing it.
+    level_set_level: float = 0.0
+    # Directory to dump level-set intermediates into (field samples coloured by
+    # value, the raw surface, the raw field array). For debugging a GPU run
+    # that produced something surprising.
+    level_set_debug_dir: Optional[str] = None
+    # Run the level-set self-test against analytic fields and exit. Needs no
+    # GPU and no checkpoint -- the first thing to run in a new environment, and
+    # the first thing to run when a real extraction misbehaves: if it fails,
+    # the bug is in gsplat, not in your scene.
+    level_set_selftest: bool = False
+    # Neighbourhood radius for Poisson normal estimation, in scene units.
+    # Left unset it is 5x the cloud's own k-nearest-neighbour spacing, the
+    # measured knee past which open3d's neighbour cap binds anyway.
+    poisson_normal_radius: Optional[float] = None
+    # Poisson reconstruction octree depth.
+    poisson_depth: int = 9
+    # Directory of precomputed per-image transient/dynamic-object masks (see
+    # docs/photogrammetry.md), one `<image_stem>.png` per training image:
+    # nonzero = keep (static content), 0 = exclude. Excluded pixels are
+    # dropped from TSDF fusion (--method tsdf only).
+    mask_dir: Optional[str] = None
+    # Directory to write mesh.ply to.
+    result_dir: str = "results/garden"
+    # Whether to bake texture from the training images.
+    bake_texture_: bool = True
+    # How to represent the baked texture. "vertex" writes per-vertex colors
+    # into a .ply; "atlas" UV-unwraps the mesh and bakes a texture image,
+    # writing a .obj + .mtl + .png that standard DCC tools and game engines
+    # load with the texture attached. "atlas" resolves detail finer than the
+    # mesh's vertex spacing; "vertex" is cheaper and works on any mesh.
+    texture_mode: Literal["vertex", "atlas"] = "vertex"
+    # Atlas width/height in texels (--texture_mode atlas only).
+    texture_size: int = 2048
+    # Choose --texture_size from the evidence instead of guessing it: allocate
+    # roughly this many texels per source pixel covering the surface, measured
+    # over the views that see it. 1.0 is the point where the atlas stops
+    # discarding detail the photographs contain and starts inventing texels no
+    # photograph can fill. Overrides --texture_size when set. Costs one extra
+    # UV unwrap, to measure how much of an atlas this mesh's charts cover
+    # (there is no defensible constant -- measured across test meshes it
+    # ranges 43%-73%).
+    texture_texels_per_pixel: Optional[float] = None
+    # Split the surface across this many atlas pages instead of one. Past 8192
+    # or 16384 texels a side an atlas stops being practical, and splitting is
+    # the only way to keep adding texels -- N pages of --texture_size carry
+    # what one page of N times the area would. Writes mesh_0.png ... mesh_N.png
+    # and a multi-material .mtl. Not combinable with --texture_view_selection.
+    texture_pages: int = 1
+    # Robust multi-view fusion: discard observations more than this many
+    # standard deviations from a point's own mean colour before averaging, so
+    # a specular highlight or a slightly misregistered camera doesn't get
+    # blended into the texture as ghosting. 0 disables it (plain weighted
+    # mean). Only helps where the bad views are a per-point minority -- use
+    # --mask_dir for content that occludes a surface in most views.
+    texture_outlier_sigma: float = 0.0
+    # Texture each face from a single chosen view instead of blending every
+    # view that sees it (Waechter et al., "Let There Be Color!", ECCV 2014).
+    # Blending is a low-pass filter -- views are never registered to sub-pixel
+    # accuracy after real SfM -- so this keeps detail that would otherwise be
+    # averaged away. It is a *tradeoff*, not a strict win: the result is
+    # sharper but pointwise less accurate, so it is off by default. Requires
+    # --texture_mode atlas. Complements --texture_outlier_sigma, which still
+    # governs the blended fallback regions.
+    texture_view_selection: bool = False
+    # Seam penalty for --texture_view_selection: how much worse a view the
+    # labelling will accept to avoid a colour discontinuity between two
+    # neighbouring faces. Higher means fewer, larger single-view regions.
+    texture_mrf_lambda: float = 1.0
+    # Seam levelling for --texture_view_selection: how smoothly the per-view
+    # colour correction is spread over each single-view region. Too small and
+    # the correction is a sharp patch around each seam; too large and it cannot
+    # close the seam at all. 0 disables levelling, which is only useful for
+    # measuring what it was doing.
+    texture_seam_smoothness: float = 0.1
+    # Remove faces no training camera ever saw before decimating and
+    # texturing. TSDF fusion returns a *closed* surface, so it invents the
+    # underside of anything resting on the ground and the back of anything the
+    # capture only circled halfway; none of it can be textured (those faces
+    # carry the seam-dilation fill colour) and all of it costs triangles and
+    # atlas area. Writes an observation histogram into mesh_metrics.json --
+    # a large spike at "seen by 0 views" on a capture that circled the subject
+    # means the poses or the scale are wrong, not that the back is unseen.
+    cull_unobserved: bool = False
+    # Keep a face only if at least this many views see it (--cull_unobserved
+    # only). Above 1 this also culls grazing, single-view geometry that is
+    # technically observed but poorly constrained.
+    cull_min_views: int = 1
+    # Decimate the extracted mesh to roughly this many triangles before
+    # texturing (quadric error metrics). TSDF/Poisson output is tessellated to
+    # the voxel grid rather than to the scene's complexity, so this is usually
+    # a large reduction. Combine with --normal_map to keep the detail.
+    target_triangles: Optional[int] = None
+    # Decimate to a *fit target* instead of a triangle count: the cloud-to-mesh
+    # distance you are willing to accept, in units of the reference cloud's own
+    # k-NN spacing (the same scale-free reading as the pipeline report's
+    # `mesh_fit_over_point_spacing`). 1.0 means "stay within the cloud's own
+    # sampling noise"; 2-4 gives a much lighter mesh for a viewer. Usually the
+    # better question to answer than a triangle budget, since how many
+    # triangles a scene needs depends on the scene. Mutually exclusive with
+    # --target_triangles.
+    target_fit_ratio: Optional[float] = None
+    # Bake the pre-decimation mesh's normals into a normal map on the textured
+    # mesh's UV atlas, so the decimated mesh still shades like the dense one.
+    # Requires --texture_mode atlas. Writes mesh_normal.png next to mesh.obj.
+    normal_map: bool = False
+    # Normal-map space. "tangent" is what engines expect; "object" is simpler
+    # and immune to UV-seam tangent artifacts, fine for a static scanned asset.
+    normal_map_space: Literal["tangent", "object"] = "tangent"
+    # Bits per channel in the normal map. An 8-bit map cannot represent a
+    # normal deviation finer than 2/255 (~0.0078, about 0.45 degrees of tilt)
+    # however dense the source mesh is, so on a lightly decimated mesh it adds
+    # quantization noise instead of recovering detail -- measured on a sphere
+    # decimated 6240 -> 3000 triangles, 16 bits is 2.5x more accurate. Costs a
+    # file twice the size, and not every downstream tool reads 16-bit PNGs.
+    normal_map_bits: Literal[8, 16] = 8
+    # Bake an ambient-occlusion map onto the same UV atlas: how much of the sky
+    # each point can see, so creases and contact points darken. Requires
+    # --texture_mode atlas. Writes mesh_ao.png next to mesh.obj.
+    ao_map: bool = False
+    # Rays per texel for --ao_map. Noise falls as 1/sqrt(n); 64 previews, a few
+    # hundred is smooth (and proportionally slower).
+    ao_samples: int = 64
+    # Torch device.
+    device: str = "cuda"
+
+
+def main(cfg: Config) -> None:
+    if cfg.level_set_selftest:
+        results = validate_level_set_pipeline()
+        if not results["passed"]:
+            raise RuntimeError(
+                "The level-set self-test failed against analytic fields, so "
+                "the extractor is broken independently of any scene: "
+                f"{results['failures']}"
+            )
+        return
+
+    # Each method needs a different input, and the check has to be per-method:
+    # a blanket `assert cfg.ckpt` made --method poisson demand a checkpoint it
+    # never opens, and made main() unreachable without a GPU -- which is how a
+    # TypeError in the texture call survived five commits (see
+    # docs/handoff/ISSUES.md section 5).
+    required = {
+        "tsdf": ("ckpt", cfg.ckpt),
+        "poisson": ("dense_points", cfg.dense_points),
+        "mesh": ("mesh_path", cfg.mesh_path),
+        "level_set": ("ckpt", cfg.ckpt),
+    }
+    if cfg.method not in required:
+        raise ValueError(f"Unknown method: {cfg.method!r}")
+    flag, value = required[cfg.method]
+    if not value:
+        raise ValueError(
+            f"--method {cfg.method} requires --{flag}. The three input sources "
+            "are --ckpt (--method tsdf), --dense_points (--method poisson) and "
+            "--mesh_path (--method mesh)."
+        )
+
+    parser = Parser(
+        data_dir=cfg.data_dir,
+        factor=cfg.data_factor,
+        normalize=True,
+        test_every=cfg.test_every,
+    )
+    dataset = Dataset(parser, split="train", mask_dir=cfg.mask_dir)
+
+    extraction_stats: dict = {}
+    if cfg.method == "tsdf":
+        ckpt = torch.load(cfg.ckpt, map_location=cfg.device)
+        splats = {k: v.to(cfg.device) for k, v in ckpt["splats"].items()}
+        mesh = extract_mesh_tsdf(
+            splats,
+            dataset,
+            renderer=cfg.renderer,
+            voxel_size=cfg.voxel_size,
+            sdf_trunc=cfg.sdf_trunc,
+            depth_trunc=cfg.depth_trunc,
+            stats_out=extraction_stats,
+            device=cfg.device,
+        )
+        # No dense MVS cloud on this path -- fall back to the sparse SfM
+        # cloud as the cloud-to-mesh fit reference.
+        reference_points = parser.points
+    elif cfg.method == "poisson":
+        pcd = o3d.io.read_point_cloud(cfg.dense_points)
+        # A dense MVS cloud is in the sparse model's raw frame, but `Parser`
+        # was asked to normalize, so `dataset`'s cameras are not. Reconstructing
+        # without this transform yields a mesh that does not line up with the
+        # cameras that must texture it -- silently, since nothing raises.
+        # `Parser` applies exactly this transform to its own `dense_points_path`
+        # for the same reason.
+        points_xyz = transform_points(parser.transform, np.asarray(pcd.points))
+        points_rgb = np.asarray(pcd.colors) if pcd.has_colors() else None
+        mesh = extract_mesh_poisson(
+            points_xyz,
+            points_rgb,
+            depth=cfg.poisson_depth,
+            normal_radius=cfg.poisson_normal_radius,
+            stats_out=extraction_stats,
+        )
+        reference_points = points_xyz
+    elif cfg.method == "level_set":
+        ckpt = torch.load(cfg.ckpt, map_location=cfg.device)
+        splats = {k: v.to(cfg.device) for k, v in ckpt["splats"].items()}
+        field_fn, field_info = gaussian_opacity_field(splats, device=cfg.device)
+        print(
+            f"[extract_mesh] built an opacity field over "
+            f"{field_info['num_gaussians']} Gaussians. This path has never run "
+            "against a real checkpoint -- check the residual below before "
+            "trusting the result."
+        )
+        mesh, level_stats = extract_level_set(
+            field_fn,
+            np.asarray(field_info["bounds"]),
+            resolution=cfg.level_set_resolution,
+            level=cfg.level_set_level,
+            debug_dir=cfg.level_set_debug_dir,
+            diagnostics=extraction_stats,
+        )
+        for message in level_stats["warnings"]:
+            warnings.warn(f"level-set extraction: {message}", RuntimeWarning)
+        residual = level_stats.get("residual", {}).get("mean_abs_over_cell")
+        print(
+            f"[extract_mesh] level set: {level_stats['num_triangles']} triangles, "
+            f"watertight={level_stats['is_watertight']}, surface sits "
+            f"{residual if residual is None else round(residual, 4)} cells from "
+            "the requested level"
+        )
+        reference_points = parser.points
+    else:
+        mesh = o3d.io.read_triangle_mesh(cfg.mesh_path)
+        if len(mesh.triangles) == 0:
+            raise ValueError(
+                f"--mesh_path {cfg.mesh_path!r} loaded no triangles. Check the "
+                "path and that open3d can read the format (.ply/.obj)."
+            )
+        if cfg.mesh_frame == "colmap":
+            mesh.vertices = o3d.utility.Vector3dVector(
+                transform_points(parser.transform, np.asarray(mesh.vertices))
+            )
+        mesh.compute_vertex_normals()
+        # No reconstruction happened, so there is no cloud of its own. Prefer a
+        # dense cloud if one was given; otherwise the sparse SfM points are the
+        # only evidence available to measure fit against. Both end up in the
+        # same frame as the mesh above.
+        if cfg.dense_points:
+            reference_points = transform_points(
+                parser.transform,
+                np.asarray(o3d.io.read_point_cloud(cfg.dense_points).points),
+            )
+        else:
+            reference_points = parser.points
+
+    print(
+        f"[extract_mesh] extracted mesh with {len(mesh.vertices)} vertices, "
+        f"{len(mesh.triangles)} triangles"
+    )
+    if extraction_stats.get("derived"):
+        print(
+            "[extract_mesh] TSDF sized from the depth maps: voxel "
+            f"{extraction_stats['voxel_size']:.5g}, truncation "
+            f"{extraction_stats['sdf_trunc']:.5g}, depth cutoff "
+            f"{extraction_stats['depth_trunc']:.5g} scene units"
+        )
+    elif extraction_stats.get("normal_radius_derived"):
+        print(
+            "[extract_mesh] Poisson normals estimated over "
+            f"{extraction_stats['normal_radius']:.5g} scene units "
+            f"({extraction_stats['point_spacing']:.5g} point spacing)"
+        )
+
+    refine_stats = None
+    if cfg.refine_mesh:
+        # Before culling and decimating: both spend a budget based on where the
+        # surface is, so moving it first means they are not spent on the wrong
+        # geometry.
+        mesh, refine_stats = refine_mesh_photometric(
+            mesh,
+            dataset,
+            smoothness=cfg.refine_smoothness,
+            outer_rounds=cfg.refine_rounds,
+        )
+        print(
+            "[extract_mesh] photometric refinement moved vertices by "
+            f"{refine_stats['mean_abs_displacement']:.5g} scene units on "
+            f"average ({refine_stats['mean_abs_displacement'] / refine_stats['pixel_world_size']:.2f} "
+            "source pixels); cross-view disagreement "
+            f"{refine_stats['photoconsistency_before']:.5f} -> "
+            f"{refine_stats['photoconsistency_after']:.5f}"
+        )
+        if (
+            refine_stats["photoconsistency_after"]
+            >= refine_stats["photoconsistency_before"]
+        ):
+            warnings.warn(
+                "Photometric refinement did not reduce cross-view "
+                "disagreement, so it moved the surface without improving the "
+                "fit. That usually means the mesh was already within about a "
+                "third of a source pixel, where this costs accuracy rather "
+                "than buying it -- consider dropping --refine_mesh.",
+                RuntimeWarning,
+            )
+
+    if (cfg.normal_map or cfg.ao_map) and cfg.texture_mode != "atlas":
+        raise ValueError(
+            "--normal_map/--ao_map need UV coordinates to bake into, so they "
+            "require --texture_mode atlas (which also switches the output to "
+            ".obj)."
+        )
+    if cfg.texture_pages > 1 and cfg.texture_mode != "atlas":
+        raise ValueError(
+            "--texture_pages splits a UV atlas across several images, so it "
+            "requires --texture_mode atlas."
+        )
+    if cfg.texture_view_selection and cfg.texture_mode != "atlas":
+        raise ValueError(
+            "--texture_view_selection chooses a view per *face* and bakes it "
+            "into an atlas, so it requires --texture_mode atlas. Per-vertex "
+            "colors have nothing to select a view for."
+        )
+
+    # Cull before decimating: the triangle budget should be spent on surface
+    # that will actually be seen, and the atlas should not reserve area for
+    # faces that can never carry a colour.
+    cull_stats = None
+    if cfg.cull_unobserved:
+        if not cfg.bake_texture_:
+            raise ValueError(
+                "--cull_unobserved decides what to keep from the training "
+                "views, so it needs the dataset that --no-bake_texture_ opts "
+                "out of. Drop one of the two."
+            )
+        if len(mesh.triangles) == 0:
+            print(
+                "[extract_mesh] WARNING: nothing to cull -- the extracted mesh "
+                "has no triangles."
+            )
+        else:
+            mesh, cull_stats = cull_unobserved_faces(
+                mesh, dataset, min_views=cfg.cull_min_views
+            )
+            print(
+                f"[extract_mesh] culled {cull_stats['num_culled']} of "
+                f"{cull_stats['num_faces_before']} faces "
+                f"({cull_stats['fraction_culled']:.1%}) that fewer than "
+                f"{cfg.cull_min_views} of {cull_stats['num_views_used']} views "
+                "could see"
+            )
+            unseen = cull_stats["observation_histogram"][0]
+            if unseen > 0.5 * cull_stats["num_faces_before"]:
+                warnings.warn(
+                    f"{unseen} of {cull_stats['num_faces_before']} faces were "
+                    "seen by no view at all. On a capture that circled the "
+                    "subject that usually means the poses or the scale are "
+                    "wrong rather than that the subject has a large unseen "
+                    "back -- check the mesh against the cameras before "
+                    "shipping this.",
+                    RuntimeWarning,
+                )
+
+    if cfg.target_triangles is not None and cfg.target_fit_ratio is not None:
+        raise ValueError(
+            "--target_triangles and --target_fit_ratio are two ways of asking "
+            "the same question (how small a mesh?) and disagree about the "
+            "answer. Pass one: a triangle budget, or the cloud-to-mesh fit you "
+            "will accept."
+        )
+
+    # Decimate before texturing, so the atlas is built on the mesh that ships.
+    # Keep the dense mesh: it is what --normal_map bakes detail from.
+    dense_mesh = mesh
+    decimation_stats = None
+    if cfg.target_fit_ratio is not None:
+        if len(mesh.triangles) == 0:
+            print(
+                "[extract_mesh] WARNING: nothing to decimate -- the extracted "
+                "mesh has no triangles."
+            )
+        else:
+            mesh, decimation_stats = simplify_mesh_to_error(
+                mesh, reference_points, error_over_spacing=cfg.target_fit_ratio
+            )
+            print(
+                f"[extract_mesh] decimated {decimation_stats['triangles_before']}"
+                f" -> {decimation_stats['triangles_after']} triangles "
+                f"({decimation_stats['reduction']:.1%} fewer) in "
+                f"{decimation_stats['num_probes']} probes; cloud-to-mesh "
+                f"{decimation_stats['error_before']:.5g} -> "
+                f"{decimation_stats['error_after']:.5g} against a budget of "
+                f"{decimation_stats['max_error']:.5g} "
+                f"({cfg.target_fit_ratio} x the cloud's "
+                f"{decimation_stats['point_spacing']:.5g} spacing)"
+            )
+            if not decimation_stats["target_met"]:
+                warnings.warn(
+                    "The mesh already misses --target_fit_ratio before any "
+                    f"decimation (cloud-to-mesh "
+                    f"{decimation_stats['error_before']:.5g} > "
+                    f"{decimation_stats['max_error']:.5g}), so it was left "
+                    "alone -- decimating can only move it further from the "
+                    "cloud. Either the extraction is a poor fit (check "
+                    "--voxel_size / --poisson_depth) or the target is tighter "
+                    "than this reconstruction can be.",
+                    RuntimeWarning,
+                )
+    elif cfg.target_triangles is not None:
+        before = len(mesh.triangles)
+        mesh = simplify_mesh(mesh, target_triangles=cfg.target_triangles)
+        after = len(mesh.triangles)
+        decimation_stats = {
+            "triangles_before": before,
+            "triangles_after": after,
+            "reduction": 1.0 - (after / before) if before else 0.0,
+            "target_triangles": cfg.target_triangles,
+        }
+        print(
+            f"[extract_mesh] decimated {before} -> {after} triangles "
+            f"({decimation_stats['reduction']:.1%} fewer)"
+        )
+
+    texture_size = cfg.texture_size
+    texture_size_stats = None
+    if cfg.texture_texels_per_pixel is not None:
+        if cfg.texture_mode != "atlas":
+            raise ValueError(
+                "--texture_texels_per_pixel sizes a UV atlas, so it requires "
+                "--texture_mode atlas. Per-vertex colors have no texels to "
+                "budget."
+            )
+        texture_size, texture_size_stats = recommended_texture_size(
+            mesh, dataset, texels_per_pixel=cfg.texture_texels_per_pixel
+        )
+        print(
+            f"[extract_mesh] atlas size {texture_size} chosen from "
+            f"{texture_size_stats['total_source_pixels']:.3g} source pixels of "
+            f"evidence at {texture_size_stats['packing_efficiency']:.0%} packing "
+            f"(exact {texture_size_stats['exact_size']:.0f}, requested "
+            f"--texture_size {cfg.texture_size})"
+        )
+        if texture_size_stats["clamped"]:
+            warnings.warn(
+                f"The atlas size was clamped to {texture_size}; the evidence "
+                f"supports {texture_size_stats['exact_size']:.0f}.",
+                RuntimeWarning,
+            )
+
+    texture = None
+    view_selection_stats: dict = {}
+    if cfg.bake_texture_:
+        mesh, texture = bake_mesh_texture(
+            mesh,
+            dataset,
+            mode=cfg.texture_mode,
+            texture_size=texture_size,
+            outlier_sigma=(
+                cfg.texture_outlier_sigma if cfg.texture_outlier_sigma > 0 else None
+            ),
+            num_pages=cfg.texture_pages,
+            view_selection=cfg.texture_view_selection,
+            mrf_smoothness=cfg.texture_mrf_lambda,
+            seam_smoothness=(
+                cfg.texture_seam_smoothness if cfg.texture_seam_smoothness > 0 else None
+            ),
+            stats_out=view_selection_stats,
+        )
+        if texture is not None:
+            print(
+                f"[extract_mesh] baked a {texture.shape[1]}x{texture.shape[0]} "
+                "UV texture atlas from training images"
+            )
+        else:
+            print("[extract_mesh] baked per-vertex texture from training images")
+        if view_selection_stats:
+            mrf = view_selection_stats["mrf"]
+            sharp = view_selection_stats["atlas_sharpness"]["mean_gradient"]
+            blended_sharp = view_selection_stats["blended_atlas_sharpness"][
+                "mean_gradient"
+            ]
+            print(
+                f"[extract_mesh] view selection: {mrf['num_views_used']} views "
+                f"over {mrf['num_faces']} faces, {mrf['num_seams']} seams, "
+                f"{view_selection_stats['fallback_fraction']:.1%} of texels fell "
+                "back to blending"
+            )
+            print(
+                f"[extract_mesh] atlas sharpness {sharp:.4f} vs {blended_sharp:.4f} "
+                f"blended ({sharp / blended_sharp - 1.0:+.1%})"
+                if blended_sharp > 0
+                else f"[extract_mesh] atlas sharpness {sharp:.4f}"
+            )
+            if blended_sharp > 0 and sharp <= blended_sharp:
+                warnings.warn(
+                    "View selection produced a *less* sharp atlas than blending "
+                    f"({sharp:.4f} vs {blended_sharp:.4f}). That usually means "
+                    "the views are already well registered, in which case "
+                    "blending is the better choice here -- it is pointwise more "
+                    "accurate. Consider dropping --texture_view_selection.",
+                    RuntimeWarning,
+                )
+            if mrf["num_unlabelled"]:
+                print(
+                    f"[extract_mesh] {mrf['num_unlabelled']} faces could not be "
+                    "textured from any single view and kept the blended color"
+                )
+            if "seam_discontinuity" in view_selection_stats:
+                before = view_selection_stats["seam_discontinuity_before"]["mean"]
+                after = view_selection_stats["seam_discontinuity"]["mean"]
+                levelling = view_selection_stats["seam_levelling"]
+                print(
+                    f"[extract_mesh] seam levelling: discontinuity {before:.4f} "
+                    f"-> {after:.4f} over {levelling['num_seam_edges']} seam "
+                    f"edges ({levelling['iterations']} CG iterations)"
+                )
+                if after >= before:
+                    warnings.warn(
+                        f"Seam levelling did not reduce the seam discontinuity "
+                        f"({before:.4f} -> {after:.4f}). "
+                        "--texture_seam_smoothness is probably wrong for this "
+                        "scene: too large and the correction cannot bend enough "
+                        "to close a seam, too small and it fits sampling noise "
+                        "instead of the exposure difference.",
+                        RuntimeWarning,
+                    )
+                if not levelling["converged"]:
+                    warnings.warn(
+                        "Seam levelling's conjugate-gradient solve hit its "
+                        f"iteration cap with relative residual "
+                        f"{levelling['residual']:.2e}; the correction applied is "
+                        "the partial solution. A very small "
+                        "--texture_seam_smoothness conditions this badly.",
+                        RuntimeWarning,
+                    )
+
+    normal_map_stats = None
+    if cfg.normal_map:
+        # Runs after the color atlas so it reuses those UVs -- open3d's
+        # unwrapper is non-deterministic, so a second unwrap would give the
+        # normal map a different layout from the albedo.
+        mesh, normal_map, normal_map_stats = bake_normal_map(
+            dense_mesh,
+            mesh,
+            texture_size=texture_size,
+            space=cfg.normal_map_space,
+            bits=cfg.normal_map_bits,
+        )
+        print(
+            f"[extract_mesh] baked a {cfg.normal_map_space}-space normal map "
+            f"({normal_map_stats['hit_fraction']:.1%} of texels hit the dense "
+            "mesh)"
+        )
+        if normal_map_stats["hit_fraction"] < 0.5:
+            print(
+                "[extract_mesh] WARNING: most texels missed the dense mesh, so "
+                "the normal map is mostly flat. The ray cage "
+                f"({normal_map_stats['cage']:.4g} scene units) is probably too "
+                "small to span the gap between the two meshes."
+            )
+
+    ao_stats = None
+    if cfg.ao_map:
+        # Self-occlusion on the mesh that ships, unlike the normal map's
+        # dense-vs-decimated bake. Casting against the dense mesh would need a
+        # cage large enough to clear the decimation gap (most of a simplified
+        # surface sits *inside* the mesh it came from), and that cage erases
+        # occlusion detail finer than itself -- so it costs the fine cues it
+        # was meant to add. AO's real signal is large cavities and creases,
+        # which survive decimation. Pass `occluder_mesh` via the Python API if
+        # you want the dense bake anyway. Shares the albedo's UVs regardless.
+        mesh, ao_image, ao_stats = bake_ambient_occlusion(
+            mesh,
+            texture_size=texture_size,
+            num_samples=cfg.ao_samples,
+        )
+        print(
+            f"[extract_mesh] baked an ambient-occlusion map "
+            f"(mean={ao_stats['mean_ao']:.3f}, min={ao_stats['min_ao']:.3f}, "
+            f"{ao_stats['num_samples']} rays/texel)"
+        )
+        if ao_stats["mean_ao"] > 0.999:
+            print(
+                "[extract_mesh] NOTE: nothing occluded anything, so the AO map "
+                "is uniformly white. Expected for a convex shape; otherwise the "
+                f"occlusion distance ({ao_stats['max_distance']:.4g} scene "
+                "units) may be too small."
+            )
+
+    os.makedirs(cfg.result_dir, exist_ok=True)
+    # A UV atlas needs a format that can carry UVs and a texture image; .ply
+    # cannot, so an atlas mesh is written as .obj (+ .mtl + .png alongside).
+    out_path = os.path.join(
+        cfg.result_dir, "mesh.obj" if texture is not None else "mesh.ply"
+    )
+    o3d.io.write_triangle_mesh(out_path, mesh)
+    print(f"[extract_mesh] wrote {out_path}")
+
+    if normal_map_stats is not None:
+        normal_path = os.path.join(cfg.result_dir, "mesh_normal.png")
+        _write_map(normal_path, normal_map)
+        # open3d's OBJ writer emits map_Kd but nothing for a normal map, so
+        # reference it here -- otherwise the .png ships beside an .mtl that
+        # never mentions it and every importer ignores it.
+        mtl_path = os.path.splitext(out_path)[0] + ".mtl"
+        if os.path.exists(mtl_path):
+            with open(mtl_path, "a") as f:
+                f.write(f"norm {os.path.basename(normal_path)}\n")
+                f.write(f"map_Bump {os.path.basename(normal_path)}\n")
+        print(f"[extract_mesh] wrote {normal_path} (referenced from {mtl_path})")
+
+    if ao_stats is not None:
+        ao_path = os.path.join(cfg.result_dir, "mesh_ao.png")
+        _write_map(ao_path, ao_image)
+        # There is no standard MTL key for an AO map (it is an engine-side
+        # input, not a Wavefront material property), so reference it as a
+        # comment rather than inventing a key importers would choke on.
+        mtl_path = os.path.splitext(out_path)[0] + ".mtl"
+        if os.path.exists(mtl_path):
+            with open(mtl_path, "a") as f:
+                f.write(f"# ambient occlusion map: {os.path.basename(ao_path)}\n")
+        print(f"[extract_mesh] wrote {ao_path}")
+
+    stats = mesh_quality_stats(mesh)
+    if extraction_stats:
+        stats["extraction"] = extraction_stats
+    if refine_stats is not None:
+        stats["refinement"] = refine_stats
+    if texture_size_stats is not None:
+        stats["texture_size"] = texture_size_stats
+    if cull_stats is not None:
+        stats["culling"] = cull_stats
+    if decimation_stats is not None:
+        stats["decimation"] = decimation_stats
+    if normal_map_stats is not None:
+        stats["normal_map"] = normal_map_stats
+    if ao_stats is not None:
+        stats["ambient_occlusion"] = ao_stats
+    if view_selection_stats:
+        stats["view_selection"] = view_selection_stats
+    if len(mesh.triangles) == 0:
+        # Extraction produced nothing usable. Say so plainly instead of
+        # letting the cloud-to-mesh measurement fail against an empty surface.
+        stats["point_to_mesh"] = None
+        print(
+            "[extract_mesh] WARNING: the extracted mesh has no triangles, so "
+            "there is no cloud-to-mesh fit to measure. Check --voxel_size / "
+            "--sdf_trunc (TSDF) or --poisson_depth for this scene."
+        )
+    else:
+        stats["point_to_mesh"] = point_to_mesh_distance(reference_points, mesh)
+        print(
+            f"[extract_mesh] watertight={stats['is_watertight']} "
+            f"components={stats['num_connected_components']} "
+            f"cloud-to-mesh mean={stats['point_to_mesh']['mean']:.4f}"
+        )
+    stats_path = os.path.join(cfg.result_dir, "mesh_metrics.json")
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"[extract_mesh] wrote stats to {stats_path}")
+
+
+if __name__ == "__main__":
+    main(tyro.cli(Config))

@@ -32,7 +32,14 @@ import tyro
 import viser
 from datasets.colmap import Dataset, Parser
 from datasets.traj import generate_interpolated_path
-from gsplat.losses import depth_l1_loss, l1_loss, ssim_loss
+from gsplat.losses import (
+    depth_l1_loss,
+    l1_loss,
+    masked_l1,
+    masked_ssim,
+    pearson_depth_loss,
+    ssim_loss,
+)
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
 from torchmetrics.image import PeakSignalNoiseRatio, StructuralSimilarityIndexMeasure
@@ -73,6 +80,18 @@ class Config:
     data_dir: str = "data/360_v2/garden"
     # Downsample factor for the dataset
     data_factor: int = 4
+    # COLMAP sparse model to train against, overriding the default
+    # <data_dir>/sparse/0. Point this at a bundle-adjusted model (see
+    # examples/bundle_adjust.py) or an imported neural-SfM one (see
+    # gsplat.photogrammetry.neural_sfm) to train on refined poses.
+    colmap_dir: Optional[str] = None
+    # Path to a dense MVS point cloud (see examples/dense_mvs.py) used to
+    # densify Gaussian initialization -- init_type="sfm" picks up the denser
+    # point set automatically.
+    dense_points_path: Optional[str] = None
+    # How to use dense_points_path: "augment" the sparse SfM points with it,
+    # or "replace" them entirely.
+    dense_mode: Literal["augment", "replace"] = "augment"
     # Directory to save results
     result_dir: str = "results/garden"
     # Every N images there is a test image
@@ -179,6 +198,29 @@ class Config:
     # Weight for depth loss
     depth_lambda: float = 1e-2
 
+    # Enable dense monocular depth-prior supervision, via a directory of
+    # precomputed per-image relative depth maps (e.g. from Depth Anything
+    # V2, run externally -- gsplat does not run any depth model itself, see
+    # docs/photogrammetry.md). Additive to depth_loss, not a replacement.
+    mono_depth_loss: bool = False
+    # Weight for the monocular depth-prior loss
+    mono_depth_lambda: float = 0.1
+    # Directory of precomputed monocular depth maps, one `<image_stem>.npy`
+    # (float32, any resolution) per training image. Required if
+    # mono_depth_loss is enabled.
+    mono_depth_dir: Optional[str] = None
+
+    # Directory of precomputed per-image transient/dynamic-object masks
+    # (e.g. people, vehicles -- segmented externally, gsplat does not run
+    # any segmentation model itself, see docs/photogrammetry.md), one
+    # `<image_stem>.png` per training image, any resolution: nonzero = keep
+    # (static content), 0 = exclude (transient content). Used whenever set
+    # -- no separate enable flag, since there's no reason to load masks and
+    # not use them. Excluded regions are dropped from the photometric and
+    # mono-depth losses (via gsplat.losses.masked_l1/masked_ssim) and from
+    # TSDF mesh fusion in Runner.extract_mesh().
+    mask_dir: Optional[str] = None
+
     # Enable normal consistency loss. (Currently for 2DGS only)
     normal_loss: bool = False
     # Weight for normal loss
@@ -200,6 +242,24 @@ class Config:
     tb_every: int = 100
     # Save training images to tensorboard
     tb_save_image: bool = False
+
+    # Extract a textured mesh (TSDF fusion of rendered depth maps) at the end
+    # of training / eval. Requires the optional `open3d` dependency
+    # (`pip install gsplat[mesh]`). See gsplat.photogrammetry.mesh_extraction.
+    extract_mesh: bool = False
+    # Bake texture onto the extracted mesh from the training images
+    mesh_bake_texture: bool = True
+    # How to represent the baked texture. "vertex" writes per-vertex colors
+    # into a .ply; "atlas" UV-unwraps the mesh and bakes a texture image,
+    # writing a .obj + .mtl + .png that standard DCC tools and game engines
+    # load with the texture attached (see gsplat.photogrammetry.mesh_extraction)
+    mesh_texture_mode: Literal["vertex", "atlas"] = "vertex"
+    # Atlas width/height in texels (--mesh_texture_mode atlas only)
+    mesh_texture_size: int = 2048
+    # TSDF voxel size, in scene units
+    mesh_voxel_size: float = 0.01
+    # TSDF truncation distance, in scene units
+    mesh_sdf_trunc: float = 0.04
 
     def adjust_steps(self, factor: float):
         self.eval_steps = [int(i * factor) for i in self.eval_steps]
@@ -303,18 +363,30 @@ class Runner:
         # Tensorboard
         self.writer = SummaryWriter(log_dir=f"{cfg.result_dir}/tb")
 
+        if cfg.mono_depth_loss:
+            assert cfg.mono_depth_dir is not None, (
+                "cfg.mono_depth_dir must be set when cfg.mono_depth_loss is "
+                "enabled (a directory of precomputed <image_stem>.npy depth "
+                "maps -- see docs/photogrammetry.md)."
+            )
+
         # Load data: Training data should contain initial points and colors.
         self.parser = Parser(
             data_dir=cfg.data_dir,
             factor=cfg.data_factor,
             normalize=cfg.normalize_world_space,
             test_every=cfg.test_every,
+            colmap_dir=cfg.colmap_dir,
+            dense_points_path=cfg.dense_points_path,
+            dense_mode=cfg.dense_mode,
         )
         self.trainset = Dataset(
             self.parser,
             split="train",
             patch_size=cfg.patch_size,
             load_depths=cfg.depth_loss,
+            mono_depth_dir=cfg.mono_depth_dir if cfg.mono_depth_loss else None,
+            mask_dir=cfg.mask_dir,
         )
         self.valset = Dataset(self.parser, split="val")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
@@ -608,7 +680,9 @@ class Runner:
                 near_plane=cfg.near_plane,
                 far_plane=cfg.far_plane,
                 image_ids=image_ids,
-                render_mode="RGB+ED" if cfg.depth_loss else "RGB+D",
+                render_mode=(
+                    "RGB+ED" if (cfg.depth_loss or cfg.mono_depth_loss) else "RGB+D"
+                ),
                 distloss=self.cfg.dist_loss,
             )
             if renders.shape[-1] == 4:
@@ -628,14 +702,38 @@ class Runner:
                 info=info,
             )
             masks = data["mask"].to(device) if "mask" in data else None
-            if masks is not None:
-                pixels = pixels * masks[..., None]
-                colors = colors * masks[..., None]
 
             # loss
-            l1loss = l1_loss(colors, pixels).mean()
-            ssimloss = ssim_loss(colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2))
+            colors_chw = colors.permute(0, 3, 1, 2)
+            pixels_chw = pixels.permute(0, 3, 1, 2)
+            if masks is not None:
+                # Mask-aware reduction (mean over the `mask != 0` region
+                # only) rather than zeroing pixels/colors and taking an
+                # unmasked mean -- the latter dilutes the loss by the
+                # masked-out fraction, which matters once masks cover a
+                # non-trivial part of the frame (e.g. a transient-object
+                # mask, vs. the small fisheye ROI border this path also
+                # serves).
+                mask_chw = masks.unsqueeze(1)  # [1, 1, H, W]
+                l1loss = masked_l1(colors_chw, pixels_chw, mask_chw)
+                ssimloss = masked_ssim(colors_chw, pixels_chw, mask_chw)
+            else:
+                l1loss = l1_loss(colors, pixels).mean()
+                ssimloss = ssim_loss(colors_chw, pixels_chw)
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+            if cfg.mono_depth_loss:
+                # Dense, scale/shift-invariant supervision against a
+                # precomputed monocular depth prior -- must run before the
+                # cfg.depth_loss block below, which overwrites `depths` with
+                # a sparse point-sampled version.
+                mono_depth_gt = data["mono_depth"].to(device)  # [1, H, W]
+                valid_mask = alphas.squeeze(-1) > 0.5  # [1, H, W]
+                if masks is not None:
+                    valid_mask = valid_mask & masks
+                mono_depth_loss_val = pearson_depth_loss(
+                    depths.squeeze(-1), mono_depth_gt, mask=valid_mask
+                )
+                loss += mono_depth_loss_val * cfg.mono_depth_lambda
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -778,6 +876,8 @@ class Runner:
             if step in [i - 1 for i in cfg.eval_steps] or step == max_steps - 1:
                 self.eval(step)
                 self.render_traj(step)
+                if cfg.extract_mesh:
+                    self.extract_mesh(step)
 
             if not cfg.disable_viewer:
                 self.viewer.lock.release()
@@ -981,6 +1081,79 @@ class Runner:
         print(f"Video saved to {video_dir}/traj_{step}.mp4")
 
     @torch.no_grad()
+    def extract_mesh(self, step: int):
+        """Extract a textured mesh via TSDF fusion of rendered depth maps.
+
+        Single-command shortcut for what `examples/extract_mesh.py --method
+        tsdf` does standalone. Poisson reconstruction and the dense-MVS point
+        cloud path aren't available here (this trainer has no dense point
+        cloud to reconstruct from) -- use the standalone script for those.
+        """
+        # open3d (required by extract_mesh_tsdf/bake_texture) is only
+        # imported lazily inside gsplat.photogrammetry.mesh_extraction, which
+        # raises its own actionable ImportError if it's missing.
+        from gsplat.photogrammetry.mesh_extraction import (
+            bake_mesh_texture,
+            extract_mesh_tsdf,
+        )
+        from gsplat.photogrammetry.metrics import (
+            mesh_quality_stats,
+            point_to_mesh_distance,
+        )
+
+        print("Running mesh extraction...")
+        cfg = self.cfg
+        mesh = extract_mesh_tsdf(
+            self.splats,
+            self.trainset,
+            renderer="2dgs",
+            sh_degree=cfg.sh_degree,
+            voxel_size=cfg.mesh_voxel_size,
+            sdf_trunc=cfg.mesh_sdf_trunc,
+            near_plane=cfg.near_plane,
+            far_plane=cfg.far_plane,
+            device=self.device,
+        )
+        print(
+            f"[extract_mesh] {len(mesh.vertices)} vertices, {len(mesh.triangles)} triangles"
+        )
+        texture = None
+        if cfg.mesh_bake_texture:
+            mesh, texture = bake_mesh_texture(
+                mesh,
+                self.trainset,
+                mode=cfg.mesh_texture_mode,
+                texture_size=cfg.mesh_texture_size,
+            )
+            if texture is not None:
+                print(
+                    f"[extract_mesh] baked a {texture.shape[1]}x{texture.shape[0]} "
+                    "UV texture atlas from training images"
+                )
+
+        import open3d as o3d
+
+        # A UV atlas needs a format that can carry UVs and a texture image;
+        # .ply cannot, so an atlas mesh is written as .obj (+ .mtl + .png).
+        mesh_ext = "obj" if texture is not None else "ply"
+        mesh_path = f"{cfg.result_dir}/mesh_{step}.{mesh_ext}"
+        o3d.io.write_triangle_mesh(mesh_path, mesh)
+        print(f"Mesh saved to {mesh_path}")
+
+        # Mesh quality + cloud-to-mesh fit against the sparse SfM cloud,
+        # written next to this run's stats/val_step*.json render-quality
+        # reports (see Runner.eval()).
+        mesh_stats = mesh_quality_stats(mesh)
+        mesh_stats["point_to_mesh"] = point_to_mesh_distance(self.parser.points, mesh)
+        print(
+            f"[extract_mesh] watertight={mesh_stats['is_watertight']} "
+            f"components={mesh_stats['num_connected_components']} "
+            f"cloud-to-mesh mean={mesh_stats['point_to_mesh']['mean']:.4f}"
+        )
+        with open(f"{self.stats_dir}/mesh_step{step:04d}.json", "w") as f:
+            json.dump(mesh_stats, f)
+
+    @torch.no_grad()
     def _viewer_render_fn(
         self, camera_state: CameraState, render_tab_state: RenderTabState
     ):
@@ -1064,6 +1237,8 @@ def main(cfg: Config):
             runner.splats[k].data = ckpt["splats"][k]
         runner.eval(step=ckpt["step"])
         runner.render_traj(step=ckpt["step"])
+        if cfg.extract_mesh:
+            runner.extract_mesh(step=ckpt["step"])
     else:
         runner.train()
 
