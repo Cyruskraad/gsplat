@@ -76,14 +76,16 @@ Fresh verification performed on the workstation on 2026-09-12:
 - `python -m pytest -q tests/test_strategy.py` completed with **3 passed**.
 - The working tree was clean before documentation was added.
 
-After this documentation commit is published, the branch must satisfy all of
-the following before it is described as synchronized:
+The final synchronization check on 2026-09-12 confirmed all of the following:
 
 ```text
 local HEAD == origin/codex/gsplat-hq-fixed-light
 remote workstation HEAD == origin/codex/gsplat-hq-fixed-light
 git status --porcelain == empty in both checkouts
 ```
+
+The authenticated laptop clone, GitHub tracking branch, and Linux workstation
+checkout all resolved to the same branch tip with zero commits ahead or behind.
 
 ## Separate mug reconstruction work
 
@@ -94,4 +96,3 @@ model has passed the semantic-mask, frozen-split, multi-seed, and cavity-quality
 release gates. The older 498,643-Gaussian delivery therefore remains an audited
 baseline rather than a newly promoted final model. Its source changes and
 generated artifacts must not be conflated with this AngelDemon gsplat branch.
-
