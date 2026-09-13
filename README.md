@@ -69,6 +69,11 @@ To build gsplat from source on Windows, please check [this instruction](docs/INS
 
 ## Evaluation
 
+The `codex/gsplat-hq-fixed-light` branch also contains a reproducible masked
+object-reconstruction workflow. See the
+[fixed-light pipeline guide](docs/fixed-light-reconstruction-pipeline.md) and
+the [dated project status](docs/project-status-2026-09-12.md).
+
 This repo comes with a standalone script that reproduces the official Gaussian Splatting with exactly the same performance on PSNR, SSIM, LPIPS, and converged number of Gaussians. Powered by gsplat’s efficient CUDA implementation, the training takes up to **4x less GPU memory** with up to **15% less time** to finish than the official implementation. Full report can be found in the [evaluation results](https://docs.gsplat.studio/main/tests/eval.html).
 
 ```bash

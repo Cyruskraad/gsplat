@@ -75,12 +75,176 @@ from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
 
+def _resize_metric_pair(
+    prediction: Tensor, target: Tensor, maximum_size: int
+) -> Tuple[Tensor, Tensor]:
+    height, width = prediction.shape[-2:]
+    longest = max(height, width)
+    if maximum_size <= 0 or longest <= maximum_size:
+        return prediction, target
+    scale = maximum_size / longest
+    size = (max(1, round(height * scale)), max(1, round(width * scale)))
+    return (
+        F.interpolate(prediction, size=size, mode="area"),
+        F.interpolate(target, size=size, mode="area"),
+    )
+
+
+def _masked_psnr(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+    weights = mask[..., None].to(prediction.dtype)
+    denominator = torch.clamp(weights.sum() * prediction.shape[-1], min=1.0)
+    mse = torch.sum((prediction - target) ** 2 * weights) / denominator
+    return -10.0 * torch.log10(torch.clamp(mse, min=1e-10))
+
+
+def _binary_boundary_fscore(alpha: Tensor, target: Tensor) -> Tensor:
+    prediction = (alpha[..., 0] >= 0.5).float().unsqueeze(1)
+    truth = target.float().unsqueeze(1)
+
+    def boundary(binary: Tensor) -> Tensor:
+        eroded = 1.0 - F.max_pool2d(1.0 - binary, kernel_size=3, stride=1, padding=1)
+        return torch.clamp(binary - eroded, min=0.0)
+
+    predicted_boundary = boundary(prediction)
+    target_boundary = boundary(truth)
+    predicted_neighborhood = F.max_pool2d(
+        predicted_boundary, kernel_size=3, stride=1, padding=1
+    )
+    target_neighborhood = F.max_pool2d(
+        target_boundary, kernel_size=3, stride=1, padding=1
+    )
+    precision = torch.sum(predicted_boundary * target_neighborhood) / torch.clamp(
+        predicted_boundary.sum(), min=1.0
+    )
+    recall = torch.sum(target_boundary * predicted_neighborhood) / torch.clamp(
+        target_boundary.sum(), min=1.0
+    )
+    return 2.0 * precision * recall / torch.clamp(precision + recall, min=1e-8)
+
+
+def _composite_on_background(
+    colors: Tensor, alphas: Tensor, background: Tensor
+) -> Tuple[Tensor, Tensor]:
+    """Return a numerically valid image/alpha pair after raster compositing."""
+
+    safe_alphas = torch.clamp(alphas, 0.0, 1.0)
+    composite = colors + background * (1.0 - safe_alphas)
+    return torch.clamp(composite, 0.0, 1.0), safe_alphas
+
+
+def _erode_binary_mask(mask: Tensor, pixels: int) -> Tensor:
+    if pixels <= 0:
+        return mask
+    values = mask.float().unsqueeze(1)
+    kernel = 2 * pixels + 1
+    eroded = 1.0 - F.max_pool2d(
+        1.0 - values, kernel_size=kernel, stride=1, padding=pixels
+    )
+    return eroded[:, 0] >= 0.5
+
+
+def _binary_boundary_band(mask: Tensor, pixels: int) -> Tensor:
+    if pixels <= 0:
+        return torch.zeros_like(mask)
+    values = mask.float().unsqueeze(1)
+    kernel = 2 * pixels + 1
+    dilated = F.max_pool2d(values, kernel_size=kernel, stride=1, padding=pixels)
+    eroded = 1.0 - F.max_pool2d(
+        1.0 - values, kernel_size=kernel, stride=1, padding=pixels
+    )
+    return (dilated[:, 0] - eroded[:, 0]) > 0.0
+
+
+def _weights_only_safe(value):
+    """Copy checkpoint state while converting NumPy scalars to safe primitives."""
+
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {key: _weights_only_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_weights_only_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_weights_only_safe(item) for item in value)
+    return value
+
+
+def _scale_restored_learning_rates(optimizers, schedulers, scale: float) -> None:
+    if scale <= 0:
+        raise ValueError("resume_lr_scale must be positive")
+    if scale == 1.0:
+        return
+    for optimizer in optimizers.values():
+        for group in optimizer.param_groups:
+            group["lr"] *= scale
+            if "initial_lr" in group:
+                group["initial_lr"] *= scale
+    for scheduler in schedulers:
+        if hasattr(scheduler, "base_lrs"):
+            scheduler.base_lrs = [value * scale for value in scheduler.base_lrs]
+        if hasattr(scheduler, "_last_lr"):
+            scheduler._last_lr = [value * scale for value in scheduler._last_lr]
+
+
+def _validation_better(
+    candidate: Dict[str, float], current: Optional[Dict[str, float]], minimum_alpha_iou: float
+) -> bool:
+    if candidate.get("alpha_iou", 0.0) < minimum_alpha_iou:
+        return False
+    if current is None:
+        return True
+    lpips_delta = candidate["masked_lpips"] - current["masked_lpips"]
+    if lpips_delta < -0.005:
+        return True
+    if lpips_delta <= 0.005:
+        psnr_delta = candidate["masked_psnr"] - current["masked_psnr"]
+        if psnr_delta > 0.2:
+            return True
+        if psnr_delta >= -0.2 and candidate["num_GS"] < current["num_GS"]:
+            return True
+    return False
+
+
+class _EarlyStopper:
+    def __init__(self, patience: int, lpips_delta: float, psnr_delta: float) -> None:
+        self.patience = patience
+        self.lpips_delta = lpips_delta
+        self.psnr_delta = psnr_delta
+        self.best_lpips = math.inf
+        self.best_psnr = -math.inf
+        self.stale = 0
+
+    def observe(self, stats: Dict[str, float]) -> bool:
+        lpips = stats["masked_lpips"]
+        psnr = stats["masked_psnr"]
+        first = not math.isfinite(self.best_lpips)
+        lpips_progress = lpips <= self.best_lpips - self.lpips_delta
+        psnr_progress = psnr >= self.best_psnr + self.psnr_delta
+        progress = first or lpips_progress or psnr_progress
+        if first or lpips_progress:
+            self.best_lpips = lpips
+        if first or psnr_progress:
+            self.best_psnr = psnr
+        self.stale = 0 if progress else self.stale + 1
+        return self.patience > 0 and self.stale >= self.patience
+
+
 @dataclass
 class Config:
     # Disable viewer
     disable_viewer: bool = False
     # Path to the .pt files. If provide, it will skip training and run evaluation only.
     ckpt: Optional[List[str]] = None
+    # Resume training or native-resolution refinement from one checkpoint.
+    resume: Optional[str] = None
+    # Restore optimizer, scheduler, and strategy state for interrupted runs.
+    resume_optimizer: bool = True
+    # Scale restored optimizer/scheduler learning rates (native refinement: 0.25).
+    resume_lr_scale: float = 1.0
+    # Save the best validation checkpoint using the object-aware ranking policy.
+    save_best: bool = False
+    # Evaluate the sealed manifest test split instead of validation in eval-only mode.
+    eval_test: bool = False
     # Name of compression strategy to use
     compression: Optional[Literal["png"]] = None
     # Render trajectory path: "interp", "ellipse", "spiral", or "raw" (use captured poses as-is)
@@ -96,6 +260,12 @@ class Config:
     result_dir: str = "results/garden"
     # Every N images there is a test image
     test_every: int = 8
+    # Optional white-foreground object masks, matched by relative image stem.
+    object_mask_dir: Optional[str] = None
+    # Optional explicit JSON train/validation/test split manifest.
+    split_manifest: Optional[str] = None
+    # Train on every registered view while retaining manifest val/test loaders.
+    train_all_views: bool = False
     # Random crop size for training  (experimental)
     patch_size: Optional[int] = None
     # A global scaler that applies to the scene size related parameters
@@ -169,6 +339,19 @@ class Config:
     init_scale: float = 1.0
     # Weight for SSIM loss
     ssim_lambda: float = 0.2
+    # Weight for full-frame alpha supervision when object masks are present.
+    alpha_loss_weight: float = 0.1
+    # Erode the RGB foreground target to avoid ambiguous edge-color supervision.
+    rgb_mask_erosion_pixels: int = 0
+    # Give alpha BCE twice the relative weight inside this silhouette band.
+    alpha_boundary_band_pixels: int = 0
+    # Validation evaluations allowed without LPIPS or PSNR progress.
+    early_stop_patience: int = 0
+    early_stop_lpips_min_delta: float = 0.005
+    early_stop_psnr_min_delta: float = 0.1
+    minimum_alpha_iou: float = 0.98
+    # Bound the long edge used by SSIM and LPIPS evaluation.
+    metric_max_size: int = 1600
 
     # Near plane clipping distance
     near_plane: float = 0.01
@@ -429,6 +612,7 @@ class Runner:
             )
             self.trainset = NCoreDataset(self.parser, split="train")
             self.valset = NCoreDataset(self.parser, split="val")
+            self.testset = self.valset
             self.ncore_camera_data = [
                 self.parser.camera_render_data[cam_id]
                 for cam_id in self.parser.camera_ids
@@ -447,14 +631,17 @@ class Runner:
                 normalize=cfg.normalize_world_space,
                 test_every=cfg.test_every,
                 load_exposure=cfg.load_exposure,
+                object_mask_dir=cfg.object_mask_dir,
+                split_manifest=cfg.split_manifest,
             )
             self.trainset = Dataset(
                 self.parser,
-                split="train",
+                split="all" if cfg.train_all_views else "train",
                 patch_size=cfg.patch_size,
                 load_depths=cfg.depth_loss,
             )
             self.valset = Dataset(self.parser, split="val")
+            self.testset = Dataset(self.parser, split="test")
         self.scene_scale = self.parser.scene_scale * 1.1 * cfg.global_scale
         print("Scene scale:", self.scene_scale)
 
@@ -502,6 +689,20 @@ class Runner:
         self.splats = self.scene.splats
         self.stage = Stage()
         self.stage.add_scene(self.scene, self.rasterize_splats)
+        self.resume_step = -1
+        self.resume_payload = None
+        if cfg.resume is not None:
+            self.resume_payload = torch.load(
+                cfg.resume, map_location=self.device, weights_only=True
+            )
+            for key in self.splats.keys():
+                self.splats[key].data = self.resume_payload["splats"][key]
+            self.resume_step = int(self.resume_payload["step"])
+            self.scene = GaussianScene.from_splats(self.splats, id="scene")
+            self.splats = self.scene.splats
+            self.stage = Stage()
+            self.stage.add_scene(self.scene, self.rasterize_splats)
+            print(f"Resumed splats from {cfg.resume} at step {self.resume_step}")
         print("Model initialized. Number of GS:", len(self.splats["means"]))
 
         # Densification Strategy
@@ -515,6 +716,12 @@ class Runner:
             self.strategy_state = self.cfg.strategy.initialize_state()
         else:
             assert_never(self.cfg.strategy)
+        if (
+            self.resume_payload is not None
+            and cfg.resume_optimizer
+            and "strategy_state" in self.resume_payload
+        ):
+            self.strategy_state = self.resume_payload["strategy_state"]
 
         # Compression Strategy
         self.compression_method = None
@@ -630,6 +837,12 @@ class Runner:
 
         # Track if Gaussians are frozen (for controller distillation)
         self._gaussians_frozen = False
+        self.best_validation: Optional[Dict[str, float]] = None
+        self.early_stopper = _EarlyStopper(
+            cfg.early_stop_patience,
+            cfg.early_stop_lpips_min_delta,
+            cfg.early_stop_psnr_min_delta,
+        )
 
     def freeze_gaussians(self):
         """Freeze all Gaussian parameters for controller distillation.
@@ -644,6 +857,36 @@ class Runner:
             param.requires_grad = False
 
         self._gaussians_frozen = True
+
+    def _checkpoint_payload(self, step: int, schedulers=()) -> Dict[str, object]:
+        data: Dict[str, object] = {
+            "step": step,
+            "scene_id": self.scene.id,
+            "splats": self.splats.state_dict(),
+            "optimizers": {
+                key: optimizer.state_dict() for key, optimizer in self.optimizers.items()
+            },
+            "schedulers": [scheduler.state_dict() for scheduler in schedulers],
+            "strategy_state": self.strategy_state,
+        }
+        if self.cfg.pose_opt:
+            data["pose_adjust"] = (
+                self.pose_adjust.module.state_dict()
+                if self.world_size > 1
+                else self.pose_adjust.state_dict()
+            )
+        if self.cfg.app_opt:
+            data["app_module"] = (
+                self.app_module.module.state_dict()
+                if self.world_size > 1
+                else self.app_module.state_dict()
+            )
+        if self.post_processing_module is not None:
+            data["post_processing"] = self.post_processing_module.state_dict()
+        return _weights_only_safe(data)
+
+    def _save_checkpoint(self, step: int, path: str, schedulers=()) -> None:
+        torch.save(self._checkpoint_payload(step, schedulers), path)
         print("[Distillation] Gaussian parameters frozen")
 
     def rasterize_splats(
@@ -804,7 +1047,7 @@ class Runner:
                 yaml.dump(vars(cfg), f)
 
         max_steps = cfg.max_steps
-        init_step = 0
+        init_step = self.resume_step + 1
 
         schedulers = [
             # means has a learning rate schedule, that end at 0.01 of the initial value
@@ -843,6 +1086,19 @@ class Runner:
                 max_optimization_iters=max_steps,
             )
             schedulers.extend(ppisp_schedulers)
+
+        if self.resume_payload is not None and cfg.resume_optimizer:
+            optimizer_states = self.resume_payload.get("optimizers", {})
+            for key, optimizer in self.optimizers.items():
+                if key in optimizer_states:
+                    optimizer.load_state_dict(optimizer_states[key])
+            for scheduler, state in zip(
+                schedulers, self.resume_payload.get("schedulers", [])
+            ):
+                scheduler.load_state_dict(state)
+            _scale_restored_learning_rates(
+                self.optimizers, schedulers, cfg.resume_lr_scale
+            )
 
         trainloader = torch.utils.data.DataLoader(
             self.trainset,
@@ -887,6 +1143,9 @@ class Runner:
             )
             image_ids = data["image_id"].to(device)
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
+            object_masks = (
+                data["object_mask"].to(device) if "object_mask" in data else None
+            )
             exposure = (
                 data["exposure"].to(device) if "exposure" in data else None
             )  # [B,]
@@ -927,9 +1186,17 @@ class Runner:
             else:
                 colors, depths = renders, None
 
-            if cfg.random_bkgd:
+            if cfg.random_bkgd or object_masks is not None:
                 bkgd = torch.rand(1, 3, device=device)
-                colors = colors + bkgd * (1.0 - alphas)
+                colors, alphas = _composite_on_background(colors, alphas, bkgd)
+                if object_masks is not None:
+                    rgb_object_masks = _erode_binary_mask(
+                        object_masks, cfg.rgb_mask_erosion_pixels
+                    )
+                    pixels = (
+                        pixels * rgb_object_masks[..., None]
+                        + bkgd * (~rgb_object_masks)[..., None]
+                    )
 
             # While Gaussians are frozen for PPISP controller distillation the render
             # output has requires_grad=False, so densification bookkeeping (e.g.
@@ -944,7 +1211,42 @@ class Runner:
                 )
 
             # loss
-            if masks is not None:
+            alpha_loss = None
+            if object_masks is not None:
+                bbox = data["object_bbox"][0]
+                x0, y0, x1, y1 = [int(value) for value in bbox.tolist()]
+                colors_crop = colors[:, y0:y1, x0:x1]
+                pixels_crop = pixels[:, y0:y1, x0:x1]
+                if masks is not None:
+                    valid_crop = masks[:, y0:y1, x0:x1]
+                    valid_weights = valid_crop[..., None].to(colors_crop.dtype)
+                    l1loss = torch.sum(
+                        torch.abs(colors_crop - pixels_crop) * valid_weights
+                    ) / torch.clamp(valid_weights.sum() * 3, min=1.0)
+                    colors_ssim = colors_crop * valid_weights
+                    pixels_ssim = pixels_crop * valid_weights
+                else:
+                    l1loss = l1_loss(colors_crop, pixels_crop).mean()
+                    colors_ssim = colors_crop
+                    pixels_ssim = pixels_crop
+                alpha_errors = F.binary_cross_entropy(
+                    torch.clamp(alphas[..., 0], min=1e-6, max=1.0 - 1e-6),
+                    object_masks.float(),
+                    reduction="none",
+                )
+                if cfg.alpha_boundary_band_pixels > 0:
+                    boundary_band = _binary_boundary_band(
+                        object_masks, cfg.alpha_boundary_band_pixels
+                    )
+                    alpha_errors = alpha_errors * (1.0 + boundary_band.float())
+                if masks is not None:
+                    valid_weights = masks.to(alpha_errors.dtype)
+                    alpha_loss = torch.sum(alpha_errors * valid_weights) / torch.clamp(
+                        valid_weights.sum(), min=1.0
+                    )
+                else:
+                    alpha_loss = alpha_errors.mean()
+            elif masks is not None:
                 # Exclude masked pixels (e.g. ego vehicle) from L1.
                 # For SSIM (patch-based), zero out both sides at masked locations
                 # so masked patches don't pull colors toward an arbitrary value.
@@ -959,6 +1261,8 @@ class Runner:
                 colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
             )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+            if alpha_loss is not None:
+                loss += cfg.alpha_loss_weight * alpha_loss
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -1020,6 +1324,8 @@ class Runner:
                 self.writer.add_scalar("train/loss", loss.item(), step)
                 self.writer.add_scalar("train/l1loss", l1loss.item(), step)
                 self.writer.add_scalar("train/ssimloss", ssimloss.item(), step)
+                if alpha_loss is not None:
+                    self.writer.add_scalar("train/alpha_loss", alpha_loss.item(), step)
                 self.writer.add_scalar("train/num_GS", len(self.splats["means"]), step)
                 self.writer.add_scalar("train/mem", mem, step)
                 if cfg.depth_loss:
@@ -1050,25 +1356,10 @@ class Runner:
                     "w",
                 ) as f:
                     json.dump(stats, f)
-                data = {
-                    "step": step,
-                    "scene_id": self.scene.id,
-                    "splats": self.splats.state_dict(),
-                }
-                if cfg.pose_opt:
-                    if world_size > 1:
-                        data["pose_adjust"] = self.pose_adjust.module.state_dict()
-                    else:
-                        data["pose_adjust"] = self.pose_adjust.state_dict()
-                if cfg.app_opt:
-                    if world_size > 1:
-                        data["app_module"] = self.app_module.module.state_dict()
-                    else:
-                        data["app_module"] = self.app_module.state_dict()
-                if self.post_processing_module is not None:
-                    data["post_processing"] = self.post_processing_module.state_dict()
-                torch.save(
-                    data, f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt"
+                self._save_checkpoint(
+                    step,
+                    f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt",
+                    schedulers,
                 )
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
@@ -1177,8 +1468,29 @@ class Runner:
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
-                self.eval(step)
+                stats = self.eval(step)
+                stop_training = False
+                if world_rank == 0 and stats is not None:
+                    if cfg.save_best and _validation_better(
+                        stats, self.best_validation, cfg.minimum_alpha_iou
+                    ):
+                        self.best_validation = dict(stats)
+                        self._save_checkpoint(
+                            step, f"{self.ckpt_dir}/best_rank{self.world_rank}.pt", schedulers
+                        )
+                        with open(
+                            f"{self.stats_dir}/best_validation.json", "w"
+                        ) as handle:
+                            json.dump(self.best_validation, handle, indent=2)
+                    stop_training = self.early_stopper.observe(stats)
+                    if stop_training:
+                        print(
+                            f"Early stopping at step {step}: "
+                            f"{self.early_stopper.stale} evaluations without progress."
+                        )
                 self.render_traj(step)
+                if stop_training:
+                    break
 
             # run compression
             if cfg.compression is not None and step in [i - 1 for i in cfg.eval_steps]:
@@ -1199,23 +1511,26 @@ class Runner:
 
     @torch.no_grad()
     def eval(self, step: int, stage: str = "val"):
-        """Entry for evaluation."""
-        print("Running evaluation...")
+        """Evaluate full-frame and object-aware metrics and return their summary."""
+        print(f"Running {stage} evaluation...")
         cfg = self.cfg
         device = self.device
         world_rank = self.world_rank
-        world_size = self.world_size
-
-        valloader = torch.utils.data.DataLoader(
-            self.valset, batch_size=1, shuffle=False, num_workers=1
+        dataset = self.testset if stage == "test" else self.valset
+        loader = torch.utils.data.DataLoader(
+            dataset, batch_size=1, shuffle=False, num_workers=1
         )
         ellipse_time = 0
         metrics = defaultdict(list)
-        for i, data in enumerate(valloader):
+        per_view = []
+        for i, data in enumerate(loader):
             camtoworlds = data["camtoworld"].to(device)
             Ks = data["K"].to(device)
             pixels = data["image"].to(device) / 255.0
             masks = data["mask"].to(device) if "mask" in data else None
+            object_masks = (
+                data["object_mask"].to(device) if "object_mask" in data else None
+            )
             height, width = pixels.shape[1:3]
 
             # Exposure metadata is available for any image with EXIF data (train or val)
@@ -1223,7 +1538,7 @@ class Runner:
 
             torch.cuda.synchronize()
             tic = time.time()
-            colors, _, _ = self.stage.render(
+            colors, alphas, _ = self.stage.render(
                 self.scene.id,
                 camtoworlds=camtoworlds,
                 Ks=Ks,
@@ -1241,7 +1556,34 @@ class Runner:
             ellipse_time += max(time.time() - tic, 1e-10)
 
             colors = torch.clamp(colors, 0.0, 1.0)
-            canvas_list = [pixels, colors]
+            if object_masks is not None:
+                neutral = torch.full((1, 3), 0.5, device=device)
+                rendered, alphas = _composite_on_background(colors, alphas, neutral)
+                target = (
+                    pixels * object_masks[..., None]
+                    + neutral * (~object_masks)[..., None]
+                )
+                bbox = data["object_bbox"][0]
+                x0, y0, x1, y1 = [int(value) for value in bbox.tolist()]
+                masked_psnr = _masked_psnr(colors, pixels, object_masks)
+                prediction_mask = alphas[..., 0] >= 0.5
+                intersection = torch.logical_and(prediction_mask, object_masks).sum()
+                union = torch.logical_or(prediction_mask, object_masks).sum()
+                alpha_iou = intersection.float() / torch.clamp(union.float(), min=1.0)
+                boundary_fscore = _binary_boundary_fscore(alphas, object_masks)
+            else:
+                rendered = colors
+                target = pixels
+                x0, y0, x1, y1 = 0, 0, width, height
+                masked_psnr = self.psnr(
+                    colors.permute(0, 3, 1, 2), pixels.permute(0, 3, 1, 2)
+                )
+                alpha_iou = torch.tensor(1.0, device=device)
+                boundary_fscore = torch.tensor(1.0, device=device)
+
+            error = torch.mean(torch.abs(rendered - target), dim=-1, keepdim=True)
+            alpha_canvas = alphas.expand(-1, -1, -1, 3)
+            canvas_list = [target, rendered, error.expand_as(rendered), alpha_canvas]
 
             if world_rank == 0:
                 # write images
@@ -1252,52 +1594,100 @@ class Runner:
                     canvas,
                 )
 
-                pixels_p = pixels.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                colors_p = colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                metrics["psnr"].append(self.psnr(colors_p, pixels_p))
-                metrics["ssim"].append(self.ssim(colors_p, pixels_p))
-                metrics["lpips"].append(self.lpips(colors_p, pixels_p))
+                target_p = target.permute(0, 3, 1, 2)
+                rendered_p = rendered.permute(0, 3, 1, 2)
+                rendered_metric, target_metric = _resize_metric_pair(
+                    rendered_p, target_p, cfg.metric_max_size
+                )
+                metrics["psnr"].append(self.psnr(rendered_metric, target_metric))
+                metrics["ssim"].append(self.ssim(rendered_metric, target_metric))
+                metrics["lpips"].append(self.lpips(rendered_metric, target_metric))
+
+                full_rendered = colors.permute(0, 3, 1, 2)
+                full_target = pixels.permute(0, 3, 1, 2)
+                full_rendered, full_target = _resize_metric_pair(
+                    full_rendered, full_target, cfg.metric_max_size
+                )
+                metrics["full_frame_psnr"].append(
+                    self.psnr(full_rendered, full_target)
+                )
+                metrics["full_frame_ssim"].append(
+                    self.ssim(full_rendered, full_target)
+                )
+                metrics["full_frame_lpips"].append(
+                    self.lpips(full_rendered, full_target)
+                )
+
+                crop_rendered = rendered[:, y0:y1, x0:x1].permute(0, 3, 1, 2)
+                crop_target = target[:, y0:y1, x0:x1].permute(0, 3, 1, 2)
+                crop_rendered, crop_target = _resize_metric_pair(
+                    crop_rendered, crop_target, cfg.metric_max_size
+                )
+                metrics["masked_psnr"].append(masked_psnr)
+                metrics["masked_ssim"].append(self.ssim(crop_rendered, crop_target))
+                metrics["masked_lpips"].append(self.lpips(crop_rendered, crop_target))
+                metrics["alpha_iou"].append(alpha_iou)
+                metrics["boundary_fscore"].append(boundary_fscore)
+                view_metrics = {
+                    key: float(values[-1].item()) for key, values in metrics.items()
+                }
+                view_metrics["image_name"] = data.get("image_name", [str(i)])[0]
+                per_view.append(view_metrics)
                 # Compute color-corrected metrics for fair comparison across methods
                 if cfg.use_color_correction_metric:
                     if cfg.color_correct_method == "affine":
-                        cc_colors = color_correct_affine(colors, pixels)
+                        cc_colors = color_correct_affine(rendered, target)
                     else:
-                        cc_colors = color_correct_quadratic(colors, pixels)
+                        cc_colors = color_correct_quadratic(rendered, target)
                     cc_colors_p = cc_colors.permute(0, 3, 1, 2)  # [1, 3, H, W]
-                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, pixels_p))
-                    metrics["cc_ssim"].append(self.ssim(cc_colors_p, pixels_p))
-                    metrics["cc_lpips"].append(self.lpips(cc_colors_p, pixels_p))
+                    cc_colors_p, cc_target_p = _resize_metric_pair(
+                        cc_colors_p, target_p, cfg.metric_max_size
+                    )
+                    metrics["cc_psnr"].append(self.psnr(cc_colors_p, cc_target_p))
+                    metrics["cc_ssim"].append(self.ssim(cc_colors_p, cc_target_p))
+                    metrics["cc_lpips"].append(self.lpips(cc_colors_p, cc_target_p))
 
         if world_rank == 0:
-            ellipse_time /= len(valloader)
+            ellipse_time /= len(loader)
 
             stats = {k: torch.stack(v).mean().item() for k, v in metrics.items()}
+            for key, values in metrics.items():
+                stacked = torch.stack(values)
+                stats[f"{key}_median"] = torch.median(stacked).item()
+                if key.endswith("lpips"):
+                    stats[f"{key}_worst"] = torch.max(stacked).item()
+                else:
+                    stats[f"{key}_worst"] = torch.min(stacked).item()
             stats.update(
                 {
                     "ellipse_time": ellipse_time,
+                    "render_fps": 1.0 / max(ellipse_time, 1e-10),
                     "num_GS": len(self.splats["means"]),
+                    "peak_vram_gib": torch.cuda.max_memory_allocated() / 1024**3,
+                    "step": step,
                 }
             )
-            if cfg.use_color_correction_metric:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"CC_PSNR: {stats['cc_psnr']:.3f}, CC_SSIM: {stats['cc_ssim']:.4f}, CC_LPIPS: {stats['cc_lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
-            else:
-                print(
-                    f"PSNR: {stats['psnr']:.3f}, SSIM: {stats['ssim']:.4f}, LPIPS: {stats['lpips']:.3f} "
-                    f"Time: {stats['ellipse_time']:.3f}s/image "
-                    f"Number of GS: {stats['num_GS']}"
-                )
+            print(
+                f"Masked PSNR: {stats['masked_psnr']:.3f}, "
+                f"SSIM: {stats['masked_ssim']:.4f}, "
+                f"LPIPS: {stats['masked_lpips']:.3f}, "
+                f"Alpha IoU: {stats['alpha_iou']:.4f}, "
+                f"Time: {stats['ellipse_time']:.3f}s/image, "
+                f"Number of GS: {stats['num_GS']}"
+            )
             # save stats as json
             with open(f"{self.stats_dir}/{stage}_step{step:04d}.json", "w") as f:
-                json.dump(stats, f)
+                json.dump(stats, f, indent=2)
+            with open(
+                f"{self.stats_dir}/{stage}_step{step:04d}_per_view.json", "w"
+            ) as f:
+                json.dump(per_view, f, indent=2)
             # save stats to tensorboard
             for k, v in stats.items():
                 self.writer.add_scalar(f"{stage}/{k}", v, step)
             self.writer.flush()
+            return stats
+        return None
 
     @torch.no_grad()
     def render_traj(self, step: int):
@@ -1544,7 +1934,7 @@ def main(local_rank: int, world_rank, world_size: int, cfg: Config):
             if pp_state is not None:
                 runner.post_processing_module.load_state_dict(pp_state)
         step = ckpts[0]["step"]
-        runner.eval(step=step)
+        runner.eval(step=step, stage="test" if cfg.eval_test else "val")
         runner.render_traj(step=step)
         if cfg.compression is not None:
             runner.run_compression(step=step)
