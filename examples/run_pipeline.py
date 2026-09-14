@@ -116,6 +116,10 @@ class Config:
     # view that sees it -- sharper, but pointwise less accurate, and it
     # requires --texture_mode atlas. See examples/extract_mesh.py.
     texture_view_selection: bool = False
+    # Solve for the texture whose reprojection best explains every view (a MAP
+    # deconvolution modelling the camera PSF) instead of blending them.
+    # Requires --texture_mode atlas. See examples/extract_mesh.py.
+    texture_super_resolve: bool = False
     # Remove faces no training camera ever saw before decimating and texturing.
     # TSDF fusion returns a closed surface, so it invents the underside and the
     # unvisited back of the subject. See examples/extract_mesh.py.
@@ -437,6 +441,8 @@ def _run_stages(cfg: Config, report: PipelineReport, selected: List[str]) -> Non
                 ]
                 if cfg.texture_view_selection:
                     cmd += ["--texture_view_selection"]
+                if cfg.texture_super_resolve:
+                    cmd += ["--texture_super_resolve"]
                 if cfg.cull_unobserved:
                     cmd += ["--cull_unobserved"]
                 if cfg.texture_pages > 1:

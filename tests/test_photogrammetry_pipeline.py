@@ -925,6 +925,20 @@ def test_pipeline_reaches_the_whole_delivery_path(tmp_path):
         assert expected in line, (expected, line)
 
 
+def test_pipeline_forwards_super_resolution(tmp_path):
+    """`--texture_super_resolve` has to be reachable from the one command too.
+
+    Kept out of the delivery-path set above because it is refused alongside
+    `--texture_pages`: the deconvolution's PSF is a blur in atlas space and
+    cannot reach a texel whose neighbours live on another page.
+    """
+    line = _dry_run_extract_mesh_command(
+        tmp_path,
+        ["--texture_mode", "atlas", "--texture_super_resolve"],
+    )
+    assert "--texture_super_resolve" in line, line
+
+
 def test_pipeline_passes_unnamed_flags_through_verbatim(tmp_path):
     """The escape hatch, so a new extract_mesh option is never unreachable.
 

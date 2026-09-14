@@ -482,3 +482,52 @@ def test_a_failing_level_set_selftest_stops_the_run(monkeypatch, tmp_path):
     )
     with pytest.raises(RuntimeError, match="self-test failed"):
         extract_mesh.main(extract_mesh.Config(level_set_selftest=True))
+
+
+def test_super_resolution_runs_from_the_cli_and_reports_its_solve(tmp_path):
+    """`--texture_super_resolve` end to end, pinned on the solve's own numbers.
+
+    The static guard above proves the *keyword* exists on
+    `bake_mesh_texture`'s signature. It cannot prove the dispatcher acts on it:
+    a branch that accepted `super_resolve` and then ran the plain blend would
+    satisfy it exactly. So this asserts what only the deconvolution produces --
+    a measured PSF width and a conjugate-gradient solve -- landing in
+    `mesh_metrics.json` under its own key.
+    """
+    import json
+
+    capture = _capture(tmp_path)
+    result_dir = _run(tmp_path, capture, texture_super_resolve=True)
+
+    assert os.path.exists(os.path.join(result_dir, "mesh.obj"))
+    stats = json.loads(open(os.path.join(result_dir, "mesh_metrics.json")).read())
+    # Under "super_resolution", not "view_selection": the two bakes report
+    # different things and the CLI records which one ran.
+    assert "view_selection" not in stats
+    solve = stats["super_resolution"]
+    assert solve["mean_psf_sigma_texels"] > 0.0
+    assert solve["num_views_used"] > 0
+    assert 0.0 < solve["solver"]["residual"] < 1.0, solve["solver"]
+    # The solve changed the atlas: running the plain blend instead would make
+    # these two the same number.
+    assert (
+        solve["atlas_sharpness"]["mean_gradient"]
+        != solve["blended_atlas_sharpness"]["mean_gradient"]
+    )
+
+
+def test_super_resolution_and_view_selection_are_refused_together(tmp_path):
+    """Two answers to the same question, so the CLI must not accept both.
+
+    View selection picks one view per face; super-resolution solves for the
+    texture that explains all of them. Applying both is not a blend of the two
+    ideas, it is one silently overriding the other.
+    """
+    capture = _capture(tmp_path)
+    with pytest.raises(ValueError, match="same question"):
+        _run(
+            tmp_path,
+            capture,
+            texture_super_resolve=True,
+            texture_view_selection=True,
+        )
