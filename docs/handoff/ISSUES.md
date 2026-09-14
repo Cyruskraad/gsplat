@@ -231,6 +231,44 @@ that first and revisit this after.
 `tests/test_photometric_alignment.py` pins both claims, so a future fix fails
 the tests loudly instead of the finding rotting into folklore.
 
+### Independently replicated, from a second implementation
+
+A parallel session built this module separately (PR #4, now closed) and reached
+the **opposite** conclusion — it shipped the feature on a headline of
+"55.9' → 24.8', a 2.26x recovery at 45'". That claim does not survive contact
+with a second random draw. Re-running *that* implementation on its *own* test
+fixture (sphere resolution 12, 8 views, 96 px), varying only the seed of the
+injected perturbation:
+
+| perturbation seed | from 0' | from 15' | from 45' |
+|---|---|---|---|
+| 0 (the one shipped) | → 7.3' | 18.6' → 10.2' | 55.9' → **24.8'** |
+| 1 | → 7.3' | 18.4' → **24.3'** | 55.2' → **64.5'** |
+| 2 | → 7.3' | 20.4' → 16.7' | 61.1' → 39.1' |
+
+Seed 1 is **worse after refining than before**, at both starting errors, and
+its shipped assertion (`after < before / 1.8`) fails outright there. Sweeping
+the starting error on a slightly different fixture gives final/initial ratios
+of 0.00 / 0.58 / 0.95 / 1.05 / 1.09 / 1.32 at 0' / 5' / 15' / 30' / 45' / 90' —
+no recovery, plus consistent harm below ~15'. **Both implementations agree on
+the behaviour; only the choice of seed separated the conclusions.** The
+decision not to ship is the right one.
+
+One point where the replication *disagrees*, worth keeping because it narrows
+the diagnosis: on that mesh-rendered fixture the joint objective (fused colour
+re-estimated at each pose) scores **0.034 at the ground truth against 0.054 at
+the converged pose** — the truth *is* preferred, the opposite sign to the 0.061
+vs 0.038 above. So "the minimum is in the wrong place" is not universal; on a
+fixture whose geometry exactly matches the render it is an optimisation failure
+rather than a modelling bias. The appearance model is still the best candidate
+for the general case (it explains why the two fixtures differ: the analytic-vs-
+tessellated gap is exactly a legitimate per-view difference the model cannot
+express), but the evidence for it is the fixture *dependence*, not one score.
+
+This is also why the "what would fix it" note above is now partly actionable:
+`bake_texture_atlas_super_resolved` models precisely that per-view pixel
+footprint. Revisiting this on top of it is the obvious next experiment.
+
 ## 5c. Photometric mesh refinement works, modestly — know its break-even
 
 `refine_mesh_photometric` (Vu et al., TPAMI 2012) **is** exported and on the
