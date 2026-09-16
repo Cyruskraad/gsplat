@@ -22,6 +22,7 @@ same sandwich product transforms all of them.
 - :mod:`gsplat.contrib.ga.primitives` -- incidence: join, meet, and metric residuals
 - :mod:`gsplat.contrib.ga.camera`     -- pinhole cameras with motor extrinsics
 - :mod:`gsplat.contrib.ga.sfm`        -- structure-from-motion stages
+- :mod:`gsplat.contrib.ga.baseline`   -- the quaternion/se(3) control arm
 """
 
 from gsplat.contrib.ga import algebra, camera, motor, primitives

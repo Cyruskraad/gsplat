@@ -92,6 +92,56 @@ it perturbs an ordinary `theta` by only `1e-24 / (2*theta)`. Using `1e-12` there
 instead — the obvious choice — would put a ~1e-12 error floor on every rotation,
 large enough to show up in exp/log round trips.
 
+## Bundle adjustment and the control arm
+
+`sfm/ba.py` optimizes motor cameras and 3D points by Levenberg-Marquardt,
+reduced by the Schur complement. Poses take a **left bivector increment**,
+`M <- exp(delta) M`: minimal, unconstrained, and free of the quaternion sign
+ambiguity, because the increment lives in the tangent algebra rather than on a
+manifold embedded in a larger space.
+
+`baseline/ba.py` is the control: the same problem with quaternion + translation
+poses and an se(3) increment. Two choices keep the comparison honest.
+
+- **The solver is shared, not reimplemented.** Both arms call
+  `sfm/_lm.py::schur_lm`, so damping schedule, stopping rule and linear algebra
+  are identical and the parameterization is the only variable.
+- **The control's pose math is written from scratch** — its own quaternion
+  product, rotation and Rodrigues exponential. A control that wraps the code
+  under test cannot detect a bug in it.
+
+### Results so far (synthetic, 8 cameras, 300 points, float64)
+
+Starting from poses and points perturbed off ground truth (29.0 px initial
+reprojection RMSE):
+
+| | final RMSE | iterations | time |
+| --- | --- | --- | --- |
+| GA motor | 8.2e-14 px | 6 | 0.08 s |
+| quaternion control | 5.1e-14 px | 6 | 0.04 s |
+
+- **Gate 1 (the arms agree):** final costs differ by 1e-23; structure agrees to
+  6e-16 after similarity alignment; **rotations agree to 2e-15 with no alignment
+  at all**, which is the sharpest form of the check since a similarity gauge
+  leaves rotations untouched.
+- **Gate 2 (runtime):** GA is **2.05x** the control, inside the 3x budget set
+  before the work started.
+
+This is the expected result, and it is the point. The two are the same estimator
+in different coordinates, so agreement is the passing condition — if they ever
+diverged beyond the gauge, the GA code would have a bug. No accuracy advantage
+is claimed, because none is available.
+
+### A note on the gauge
+
+Bundle adjustment is invariant to a global similarity, so the normal equations
+are rank-deficient by 7. Pinning camera 0 removes 6; **scale is the one left**.
+So raw camera centres between the two arms differ by ~2e-5 while structure
+agrees to ~1e-16 — a constant factor, not a discrepancy, and it vanishes under
+`align_similarity`. Near an optimum this good the scale direction of the Hessian
+is nearly flat, which is why the factor is loosely pinned rather than exact.
+Compare reconstructions only after aligning them.
+
 ## Testing
 
 The GA layer is plain PyTorch and its tests are CPU-only by design, unlike

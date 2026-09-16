@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Structure-from-motion stages built on the PGA core (experimental)."""
+"""Quaternion/se(3) control arm for the geometric-algebra experiments."""
 
-from gsplat.contrib.ga.sfm import ba, triangulate
+from gsplat.contrib.ga.baseline import ba
 
-__all__ = ["ba", "triangulate"]
+__all__ = ["ba"]
