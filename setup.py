@@ -155,6 +155,14 @@ def get_extras_require() -> dict:
         "lidar": [
             "scipy",
         ],
+        # geometric-algebra structure-from-motion (experimental, see
+        # gsplat/contrib/ga). `kingdon` is the PGA backend; `clifford` is an
+        # independent implementation used as a test oracle, not at runtime.
+        # Install with `pip install gsplat[ga]`.
+        "ga": [
+            "kingdon>=1.3",
+            "clifford",
+        ],
         # examples / tutorial dependencies. The dynamic-surgical trainer and
         # the EndoNeRF parser/dataset import these at module top, but they
         # are not needed to use the core gsplat library — install with

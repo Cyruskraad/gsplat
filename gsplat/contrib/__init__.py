@@ -24,4 +24,6 @@ Contents:
 
 - :mod:`gsplat.contrib.dynamic` — deformable / 4D Gaussian Splatting
   (HexPlane field, MLP deformation network, :class:`DynamicStrategy`).
+- :mod:`gsplat.contrib.ga` — geometric-algebra (PGA) geometry and
+  structure-from-motion. Requires the ``ga`` extra; not imported by default.
 """
