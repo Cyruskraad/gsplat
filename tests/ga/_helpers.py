@@ -172,3 +172,58 @@ def bundle_problem(
         point_idx,
     )
     return ga_problem, qt_problem, (motors, intrinsics, world)
+
+
+def line_scene(views: int = 6, lines: int = 40, seed: int = 0, spread: float = 0.5):
+    """A multi-view scene of 3D *line* features with known ground truth.
+
+    Returns ``(problem, true_motors, true_world_lines)`` where ``problem`` holds
+    the exact cameras and lines, so it can be perturbed by the caller.
+    """
+    import torch as _torch
+
+    from gsplat.contrib.ga import camera as _camera
+    from gsplat.contrib.ga import motor as _motor
+    from gsplat.contrib.ga.sfm import ba as _ba
+
+    gen = _torch.Generator().manual_seed(seed)
+    intrinsics = _torch.tensor(
+        [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]], dtype=_torch.float64
+    ).expand(views, 3, 3).contiguous()
+    stand_off = _torch.zeros(views, 6, dtype=_torch.float64)
+    stand_off[:, 5] = -4.0
+    motors = _motor.motor_compose(
+        _motor.motor_exp(stand_off),
+        _motor.motor_exp(_torch.randn(views, 6, generator=gen, dtype=_torch.float64) * 0.2),
+    )
+    line_motors = _motor.motor_exp(
+        _torch.randn(lines, 6, generator=gen, dtype=_torch.float64) * spread
+    )
+    base = _ba.canonical_line()
+    world_lines = _motor.motor_apply_line(line_motors, base.expand(lines, 6))
+
+    camera_idx = _torch.arange(views).repeat_interleave(lines)
+    line_idx = _torch.arange(lines).repeat(views)
+    image_lines = _camera.project_line(
+        motors[camera_idx], intrinsics[camera_idx], world_lines[line_idx]
+    )
+    problem = _ba.LineBundleProblem(
+        motors, intrinsics, line_motors, image_lines, camera_idx, line_idx
+    )
+    return problem, motors, world_lines
+
+
+def recover_similarity(source, target):
+    """Umeyama similarity ``(rotation, scale, src_mean, dst_mean)`` mapping source onto target."""
+    import torch as _torch
+
+    src_mean, dst_mean = source.mean(0), target.mean(0)
+    src_c, dst_c = source - src_mean, target - dst_mean
+    covariance = dst_c.T @ src_c / source.shape[0]
+    u, s, vh = _torch.linalg.svd(covariance)
+    d = _torch.ones(3, dtype=source.dtype)
+    if _torch.det(u @ vh) < 0:
+        d[-1] = -1.0
+    rotation = u @ _torch.diag(d) @ vh
+    scale = float((s * d).sum() / (src_c.pow(2).sum() / source.shape[0]))
+    return rotation, scale, src_mean, dst_mean

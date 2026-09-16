@@ -23,8 +23,9 @@ stopping rule and linear algebra.
 
 The caller supplies three callbacks over an opaque state:
 
-- ``residual_and_jacobians(state) -> (r, J_cam, J_pt)`` shaped ``(M, 2)``,
-  ``(M, 2, 6)``, ``(M, 2, 3)``
+- ``residual_and_jacobians(state) -> (r, J_cam, J_struct)`` shaped ``(M, R)``,
+  ``(M, R, 6)``, ``(M, R, S)``, for residual width ``R`` and structure-block
+  width ``S`` (3 for a point, 6 for a line carried by a motor)
 - ``apply_step(state, delta_cam, delta_pt) -> state``
 - ``cost(state) -> scalar``
 
@@ -54,6 +55,7 @@ def schur_lm(
     num_points: int,
     camera_idx: torch.Tensor,
     point_idx: torch.Tensor,
+    structure_dim: int = 3,
     iterations: int = 30,
     fixed_cameras: tuple[int, ...] = (0,),
     damping: float = 1e-4,
@@ -72,7 +74,7 @@ def schur_lm(
         fixed[index] = True
     gauge_mask = fixed.repeat_interleave(6)
 
-    eye3 = torch.eye(3, dtype=dtype, device=device)
+    eye_s = torch.eye(structure_dim, dtype=dtype, device=device)
     current = cost(state)
     history = [float(current)]
     lam = damping
@@ -81,9 +83,11 @@ def schur_lm(
         residual, jac_cam, jac_pt = residual_and_jacobians(state)
 
         u_blocks = torch.zeros(num_cameras, 6, 6, dtype=dtype, device=device)
-        v_blocks = torch.zeros(num_points, 3, 3, dtype=dtype, device=device)
+        v_blocks = torch.zeros(
+            num_points, structure_dim, structure_dim, dtype=dtype, device=device
+        )
         g_cam = torch.zeros(num_cameras, 6, dtype=dtype, device=device)
-        g_pt = torch.zeros(num_points, 3, dtype=dtype, device=device)
+        g_pt = torch.zeros(num_points, structure_dim, dtype=dtype, device=device)
 
         u_blocks.index_add_(0, camera_idx, jac_cam.transpose(-2, -1) @ jac_cam)
         v_blocks.index_add_(0, point_idx, jac_pt.transpose(-2, -1) @ jac_pt)
@@ -96,9 +100,13 @@ def schur_lm(
 
         # The camera-point coupling block, scattered into (V, 6, P, 3).
         contributions = jac_cam.transpose(-2, -1) @ jac_pt
-        flat = torch.zeros(num_cameras * num_points, 6, 3, dtype=dtype, device=device)
+        flat = torch.zeros(
+            num_cameras * num_points, 6, structure_dim, dtype=dtype, device=device
+        )
         flat.index_add_(0, camera_idx * num_points + point_idx, contributions)
-        w_blocks = flat.reshape(num_cameras, num_points, 6, 3).permute(0, 2, 1, 3)
+        w_blocks = flat.reshape(num_cameras, num_points, 6, structure_dim).permute(
+            0, 2, 1, 3
+        )
 
         accepted = False
         for _ in range(12):
@@ -108,7 +116,7 @@ def schur_lm(
             v_damped = (
                 v_blocks
                 + lam * torch.diag_embed(torch.diagonal(v_blocks, dim1=-2, dim2=-1))
-                + 1e-9 * eye3
+                + 1e-9 * eye_s
             )
             v_inv = torch.linalg.pinv(v_damped)
 

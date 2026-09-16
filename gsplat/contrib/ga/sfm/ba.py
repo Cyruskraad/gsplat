@@ -48,11 +48,16 @@ from dataclasses import dataclass, replace
 import torch
 
 from gsplat.contrib.ga import camera as _cam
+from gsplat.contrib.ga import primitives as _prim
 from gsplat.contrib.ga import motor as _mot
 from gsplat.contrib.ga.sfm import _lm
 
 __all__ = [
     "BundleProblem",
+    "LineBundleProblem",
+    "canonical_line",
+    "line_residuals",
+    "bundle_adjust_lines",
     "reprojection_residuals",
     "bundle_adjust",
     "align_similarity",
@@ -230,3 +235,166 @@ def align_similarity(
     scale = float((s * d).sum() / variance.clamp_min(_EPS))
     aligned = scale * (src_c @ rotation.T) + dst_mean
     return aligned, float((aligned - target).norm(dim=-1).pow(2).mean().sqrt())
+
+
+#: The canonical line every reconstructed line is a motor away from: the z axis.
+#: A PGA line has six coefficients but only four degrees of freedom, so it is
+#: carried by a motor rather than parameterized directly -- the same motor
+#: machinery the cameras use, with the same bivector increment. The two extra
+#: parameters are the screw motions that slide a line along itself, which leave
+#: it unchanged; they are null directions of the normal equations and are
+#: absorbed by the solver's damping, exactly like the global gauge.
+def canonical_line(dtype: torch.dtype = torch.float64, device=None) -> torch.Tensor:
+    return _prim.line_from_point_direction(
+        torch.zeros(3, dtype=dtype, device=device),
+        torch.tensor([0.0, 0.0, 1.0], dtype=dtype, device=device),
+    )
+
+
+@dataclass
+class LineBundleProblem:
+    """Bundle adjustment over 3D *line* features.
+
+    Attributes:
+        motors: camera-from-world motors ``(V, 8)``.
+        intrinsics: pinhole ``K`` per camera ``(V, 3, 3)``.
+        line_motors: ``(L, 8)``; line ``i`` is ``line_motors[i]`` applied to
+            :func:`canonical_line`.
+        image_lines: observed homogeneous 2D lines ``(M, 3)``.
+        camera_idx, line_idx: ``(M,)`` indices per observation.
+    """
+
+    motors: torch.Tensor
+    intrinsics: torch.Tensor
+    line_motors: torch.Tensor
+    image_lines: torch.Tensor
+    camera_idx: torch.Tensor
+    line_idx: torch.Tensor
+
+    @property
+    def num_cameras(self) -> int:
+        return self.motors.shape[0]
+
+    @property
+    def num_lines(self) -> int:
+        return self.line_motors.shape[0]
+
+    @property
+    def num_observations(self) -> int:
+        return self.image_lines.shape[0]
+
+    def world_lines(self) -> torch.Tensor:
+        """The reconstructed lines ``(L, 6)`` in world coordinates."""
+        base = canonical_line(self.line_motors.dtype, self.line_motors.device)
+        return _mot.motor_apply_line(
+            self.line_motors, base.expand(self.num_lines, 6)
+        )
+
+
+def _line_observation_residual(
+    delta_cam: torch.Tensor,
+    delta_line: torch.Tensor,
+    camera_motor: torch.Tensor,
+    line_motor: torch.Tensor,
+    plane: torch.Tensor,
+    base_line: torch.Tensor,
+) -> torch.Tensor:
+    """Residual of one line observation at increments ``(delta_cam, delta_line)``.
+
+    Written as a function of the increments so ``torch.func.jacrev`` can
+    differentiate it directly. That is the practical dividend of claim C1: the
+    line residual reuses the point residual's wedge, and its Jacobian comes from
+    autograd rather than from a second hand-derivation.
+    """
+    line = _mot.motor_apply_line(
+        _mot.motor_compose(_mot.motor_exp(delta_line), line_motor), base_line
+    )
+    cam_line = _mot.motor_apply_line(
+        _mot.motor_compose(_mot.motor_exp(delta_cam), camera_motor), line
+    )
+    return _prim.line_plane_residual(cam_line, plane)
+
+
+def line_residuals(problem: LineBundleProblem) -> torch.Tensor:
+    """Per-observation line residuals ``(M, 4)``; the norm of each is an offset."""
+    planes = _cam.image_line_plane(
+        problem.intrinsics[problem.camera_idx], problem.image_lines
+    )
+    world = problem.world_lines()[problem.line_idx]
+    cam_lines = _mot.motor_apply_line(problem.motors[problem.camera_idx], world)
+    return _prim.line_plane_residual(cam_lines, planes)
+
+
+def _line_residual_and_jacobians(problem: LineBundleProblem):
+    from torch.func import jacrev, vmap
+
+    num = problem.num_observations
+    dtype, device = problem.image_lines.dtype, problem.image_lines.device
+    base = canonical_line(dtype, device)
+    planes = _cam.image_line_plane(
+        problem.intrinsics[problem.camera_idx], problem.image_lines
+    )
+    camera_motors = problem.motors[problem.camera_idx]
+    line_motors = problem.line_motors[problem.line_idx]
+    zeros = torch.zeros(num, 6, dtype=dtype, device=device)
+
+    residual = vmap(_line_observation_residual, in_dims=(0, 0, 0, 0, 0, None))(
+        zeros, zeros, camera_motors, line_motors, planes, base
+    )
+    jac_cam = vmap(jacrev(_line_observation_residual, argnums=0), in_dims=(0, 0, 0, 0, 0, None))(
+        zeros, zeros, camera_motors, line_motors, planes, base
+    )
+    jac_line = vmap(jacrev(_line_observation_residual, argnums=1), in_dims=(0, 0, 0, 0, 0, None))(
+        zeros, zeros, camera_motors, line_motors, planes, base
+    )
+    return residual, jac_cam, jac_line
+
+
+def bundle_adjust_lines(
+    problem: LineBundleProblem,
+    iterations: int = 30,
+    fixed_cameras: tuple[int, ...] = (0,),
+    damping: float = 1e-4,
+    tolerance: float = 1e-12,
+) -> tuple[LineBundleProblem, dict]:
+    """Refine cameras and 3D lines, using the same solver as the point arm.
+
+    Only the residual and the structure-block width differ from
+    :func:`bundle_adjust` -- there is no separate line solver, no Pluecker
+    bookkeeping and no second Jacobian derivation. That is the concrete form of
+    the claim that motivates doing this in geometric algebra.
+    """
+
+    def apply_step(state: LineBundleProblem, delta_cam, delta_line) -> LineBundleProblem:
+        return replace(
+            state,
+            motors=_mot.motor_normalize(
+                _mot.motor_compose(_mot.motor_exp(delta_cam), state.motors)
+            ),
+            line_motors=_mot.motor_normalize(
+                _mot.motor_compose(_mot.motor_exp(delta_line), state.line_motors)
+            ),
+        )
+
+    def cost(state: LineBundleProblem) -> torch.Tensor:
+        return line_residuals(state).pow(2).sum()
+
+    state, stats = _lm.schur_lm(
+        problem,
+        _line_residual_and_jacobians,
+        apply_step,
+        cost,
+        num_cameras=problem.num_cameras,
+        num_points=problem.num_lines,
+        camera_idx=problem.camera_idx,
+        point_idx=problem.line_idx,
+        structure_dim=6,
+        iterations=iterations,
+        fixed_cameras=fixed_cameras,
+        damping=damping,
+        tolerance=tolerance,
+    )
+    stats["rmse"] = float(
+        (torch.as_tensor(stats["final_cost"]) / max(state.num_observations, 1)).sqrt()
+    )
+    return state, stats

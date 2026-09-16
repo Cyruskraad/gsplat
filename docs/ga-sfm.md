@@ -132,6 +132,48 @@ in different coordinates, so agreement is the passing condition — if they ever
 diverged beyond the gauge, the GA code would have a bug. No accuracy advantage
 is claimed, because none is available.
 
+## Claim C1: points and lines through one residual
+
+This is the part that is actually *about* geometric algebra rather than about
+reimplementing bundle adjustment.
+
+In a vector-algebra pipeline, adding line features means Pluecker coordinates, a
+separate triangulation, and a second Jacobian derivation. Here a point is grade
+3 and a line is grade 2 of the same algebra, and the residual for both is the
+same wedge against the observed plane:
+
+```python
+plane ^ point   # -> one coefficient; the signed point-plane distance
+plane ^ line    # -> four coefficients; their norm is the line-plane offset
+```
+
+`primitives.incidence_residual(plane, entity)` is the single entry point,
+dispatching only on the trailing dimension. Concretely, the line arm reuses:
+
+- the same wedge, at a different grade;
+- the same motor sandwich to move a line into the camera frame — lines are
+  carried by motors off a canonical z-axis, so they take the *same* bivector
+  increment the cameras take;
+- the same solver (`_lm.schur_lm`), with only the structure-block width changing
+  from 3 to 6;
+- Jacobians from `torch.func.vmap(jacrev(...))` straight through the kingdon
+  products, so the second residual needed **no** hand-derivation at all.
+
+Line bundle adjustment converges to a 2.3e-14 residual on synthetic data (6
+cameras, 40 lines), recovering camera rotations and line directions to ~3e-14
+with no alignment, and full geometry to ~1e-13 once the gauge is removed.
+
+### Conditioning, and how to tell a gauge from a bug
+
+The line system is rank-deficient *by design*, and by exactly a known amount:
+one direction for global scale (the similarity gauge, less the six removed by
+pinning a camera), plus two per line, because a four-degree-of-freedom line is
+carried by a six-parameter motor and the screws that slide a line along itself
+leave it unchanged. Measured nullity matches `1 + 2L` exactly at (6, 40),
+(3, 20) and (10, 60) cameras/lines, with **zero excess** — which is what
+separates "expected parameterization redundancy" from "genuine geometric
+ambiguity". `tests/ga/test_lines.py::TestConditioning` keeps that honest.
+
 ### A note on the gauge
 
 Bundle adjustment is invariant to a global similarity, so the normal equations
@@ -140,7 +182,13 @@ So raw camera centres between the two arms differ by ~2e-5 while structure
 agrees to ~1e-16 — a constant factor, not a discrepancy, and it vanishes under
 `align_similarity`. Near an optimum this good the scale direction of the Hessian
 is nearly flat, which is why the factor is loosely pinned rather than exact.
-Compare reconstructions only after aligning them.
+Compare reconstructions only after aligning them. This is easy advice to give
+and easy to forget: during development the line reconstruction looked ~0.57 off
+ground truth and appeared to be a bug, when the similarity had simply not been
+removed. Aligning on the *cameras* and then applying that same transform to the
+*lines* brought the gap to ~1e-13 — a stronger check than aligning each
+independently, since a wrong reconstruction would not survive a transform
+derived from something else.
 
 ## Testing
 

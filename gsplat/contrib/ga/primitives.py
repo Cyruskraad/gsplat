@@ -42,9 +42,25 @@ __all__ = [
     "point_line_residual",
     "point_line_distance",
     "closest_point_on_line",
+    "line_plane_residual",
+    "line_plane_distance",
+    "incidence_residual",
+    "mv_join_point_line",
 ]
 
 _EPS = 1e-12
+
+
+def _coeff(mv, name: str, like: torch.Tensor) -> torch.Tensor:
+    """One blade coefficient of ``mv``, broadcast to ``like``'s shape.
+
+    kingdon drops structurally-zero blades, so a missing blade is the normal
+    case rather than an error.
+    """
+    value = getattr(mv, name, None)
+    if not isinstance(value, torch.Tensor):
+        return torch.full_like(like, float(value if value is not None else 0.0))
+    return torch.broadcast_to(value, like.shape)
 
 
 def _like(*tensors: torch.Tensor) -> torch.Tensor:
@@ -116,11 +132,7 @@ def point_plane_distance(point: torch.Tensor, plane: torch.Tensor) -> torch.Tens
     """
     plane = normalize_plane(plane)
     mv = _alg.plane_mv(plane) ^ _alg.point_mv(point)
-    like = _like(point, plane)
-    value = getattr(mv, "e0123", None)
-    if not isinstance(value, torch.Tensor):
-        return torch.full_like(like, float(value if value is not None else 0.0))
-    return torch.broadcast_to(value, like.shape)
+    return _coeff(mv, "e0123", _like(point, plane))
 
 
 def point_line_residual(point: torch.Tensor, line: torch.Tensor) -> torch.Tensor:
@@ -154,3 +166,59 @@ def closest_point_on_line(point: torch.Tensor, line: torch.Tensor) -> torch.Tens
     origin = torch.linalg.cross(direction, line_moment(line), dim=-1)
     delta = point - origin
     return origin + (delta * direction).sum(-1, keepdim=True) * direction
+
+
+def line_plane_residual(line: torch.Tensor, plane: torch.Tensor) -> torch.Tensor:
+    """Vector residual ``(..., 4)`` measuring how far a line is from lying in a plane.
+
+    The wedge ``plane ^ line`` is a grade-3 object that vanishes exactly when the
+    line lies in the plane, and whose magnitude is the geometric offset once both
+    operands are normalized. As with :func:`point_line_residual`, the underlying
+    coefficients are returned rather than their norm, so the term stays smooth at
+    zero.
+
+    Note this is *the same wedge* as :func:`point_plane_distance`, with an
+    operand of a different grade. That is the whole argument for doing structure
+    from motion in this algebra: point and line features are not two residuals
+    to derive and maintain separately, they are one expression evaluated on
+    different objects.
+    """
+    plane = normalize_plane(plane)
+    line = normalize_line(line)
+    mv = _alg.plane_mv(plane) ^ _alg.line_mv(line)
+    like = _like(plane, line)
+    return torch.stack(
+        [_coeff(mv, name, like) for name in ("e012", "e013", "e023", "e123")], dim=-1
+    )
+
+
+def line_plane_distance(line: torch.Tensor, plane: torch.Tensor) -> torch.Tensor:
+    """Offset between a line and a plane; zero exactly when the line lies in it."""
+    return torch.linalg.vector_norm(line_plane_residual(line, plane), dim=-1)
+
+
+def incidence_residual(plane: torch.Tensor, entity: torch.Tensor) -> torch.Tensor:
+    """Residual of ``plane ^ entity`` for a point ``(..., 3)`` or a line ``(..., 6)``.
+
+    One entry point for both feature types, dispatching only on the trailing
+    dimension. Adding plane features later means adding a branch here, not a new
+    Jacobian derivation.
+    """
+    if entity.shape[-1] == 3:
+        return point_plane_distance(entity, plane).unsqueeze(-1)
+    if entity.shape[-1] == 6:
+        return line_plane_residual(entity, plane)
+    raise ValueError(
+        f"expected a point (..., 3) or a line (..., 6), got shape {tuple(entity.shape)}"
+    )
+
+
+def mv_join_point_line(point: torch.Tensor, line: torch.Tensor) -> torch.Tensor:
+    """The plane ``(..., 4)`` spanned by a point and a line.
+
+    The same join that :func:`point_line_residual` takes the normal of; exposed
+    separately because projecting a 3D line into an image wants the whole plane,
+    not just its distance interpretation.
+    """
+    mv = _alg.point_mv(point) & _alg.line_mv(line)
+    return _alg.mv_to_plane(mv, like=_like(point, line))

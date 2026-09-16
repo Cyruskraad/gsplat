@@ -155,3 +155,44 @@ def pixel_ray_planes(
         _prim.normalize_plane(_mot.motor_apply_plane(inverse, plane_u)),
         _prim.normalize_plane(_mot.motor_apply_plane(inverse, plane_v)),
     )
+
+
+def image_line_plane(intrinsics: torch.Tensor, image_lines: torch.Tensor) -> torch.Tensor:
+    """Camera-frame interpretation plane ``(..., 4)`` of an observed 2D image line.
+
+    ``image_lines`` are homogeneous 2D lines ``(a, b, c)`` with ``a*u + b*v + c = 0``.
+    Every ray through a pixel on that line lies in one plane through the pinhole
+    -- the interpretation plane -- and a correctly reconstructed 3D line must lie
+    in it. Since a pixel ``(u, v, 1)`` is ``K d`` for camera-frame direction
+    ``d``, the condition ``(a,b,c) . K d == 0`` makes the plane normal
+    ``K^T (a,b,c)``, through the origin.
+
+    Returned in the *camera* frame deliberately: the line residual is a geometric
+    relation, so it can be evaluated after transforming the world line into the
+    camera rather than transforming the plane out to the world. That keeps the
+    pose dependence in one place.
+    """
+    normal = torch.einsum(
+        "...ji,...j->...i", intrinsics, image_lines
+    )
+    plane = torch.cat([normal, torch.zeros_like(normal[..., :1])], dim=-1)
+    return _prim.normalize_plane(plane)
+
+
+def project_line(
+    motor: torch.Tensor, intrinsics: torch.Tensor, lines: torch.Tensor
+) -> torch.Tensor:
+    """Project world lines ``(..., 6)`` to homogeneous 2D image lines ``(..., 3)``.
+
+    The inverse of :func:`image_line_plane`: carry the line into the camera with
+    the same sandwich used for points and planes, take the plane it spans with
+    the pinhole, and push that plane's normal through ``K^-T``.
+    """
+    if motor.dim() == 1 and lines.dim() > 1:
+        motor = motor.expand(*lines.shape[:-1], 8)
+    cam_line = _mot.motor_apply_line(motor, lines)
+    # The plane through the pinhole containing the line: join the origin to it.
+    origin = torch.zeros(*cam_line.shape[:-1], 3, dtype=lines.dtype, device=lines.device)
+    plane = _prim.mv_join_point_line(origin, cam_line)
+    normal = plane[..., :3]
+    return torch.linalg.solve(intrinsics.transpose(-2, -1), normal.unsqueeze(-1)).squeeze(-1)
