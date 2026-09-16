@@ -13,6 +13,6 @@
 # limitations under the License.
 """Structure-from-motion stages built on the PGA core (experimental)."""
 
-from gsplat.contrib.ga.sfm import ba, triangulate
+from gsplat.contrib.ga.sfm import ba, triangulate, twoview
 
-__all__ = ["ba", "triangulate"]
+__all__ = ["ba", "triangulate", "twoview"]

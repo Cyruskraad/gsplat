@@ -190,6 +190,68 @@ removed. Aligning on the *cameras* and then applying that same transform to the
 independently, since a wrong reconstruction would not survive a transform
 derived from something else.
 
+## Two-view relative pose
+
+`sfm/twoview.py` estimates the motor relating two calibrated views: normalized
+eight-point for the initial essential matrix, cheirality to pick among its four
+decompositions, then robust Levenberg-Marquardt on Sampson error over the
+motor's bivector increment, with Jacobians taken by autograd straight through
+the algebra.
+
+**What GA contributes here is the representation, not the objective.** The
+eight-point algorithm is an eigenproblem in linear algebra and Sampson error is
+classical. Motors, rays-as-lines, and autograd Jacobians instead of a
+hand-derived essential-matrix parameterization are the GA parts; saying
+otherwise would be false advertising.
+
+### Measured envelope (300 correspondences, `threshold_px=1.5`, 200 iterations)
+
+| pixel noise | outliers | inliers found | rotation err | translation-dir err |
+| --- | --- | --- | --- | --- |
+| 0 | 0% | 300 | 0.0000° | 0.0000° |
+| 0.5 px | 0% | 300 | 0.037° | 0.248° |
+| 0.5 px | 10% | 267 | 0.322° | 1.915° |
+| 0.5 px | 20% | 240 | 0.740° | 2.120° |
+| 1.0 px | 20% | 80 | 6.93° | 83.4° |
+| 0.5 px | 40% | 58 | 6.91° | 85.5° |
+
+**Open limitation, stated plainly.** Past 20% outliers at 0.5px noise the
+estimate collapses to a consistent ~7°/85° failure. Raising the RANSAC budget
+from 200 to 800 iterations changes those numbers *bit for bit*, so it is not a
+sampling shortage — there is a single strong wrong attractor that the robust
+refinement falls into. A five-point minimal solver and a proper MSAC score are
+the obvious next steps; neither is geometric-algebra work, which is why this is
+recorded as a limit rather than polished away.
+
+### Three corrections worth keeping
+
+**One gross outlier breaks the eight-point fit.** On a 300-point pair, a single
+corrupted correspondence moves it from 0.18° to 6.4° of rotation error. It is
+an unweighted linear least squares with no breakdown resistance, so the
+consensus set can never be trusted as-is.
+
+**All four decompositions of `E` satisfy the epipolar constraint exactly.** No
+residual, algebraic or geometric, can distinguish them — only cheirality can.
+Voting on a minimal sample lets a couple of outliers flip the choice to a
+mirrored branch, producing a pose that *scores well* and is ~90° wrong. The vote
+runs on many points (capped at 64 for cost).
+
+**The ray-gap objective is not biased — an earlier version of this document said
+it was.** That claim came from watching a descent walk away from ground truth on
+a scene with 20% outliers. Measured properly it does not hold: on clean data the
+gap ranks the truth best (0.000305 vs 0.000471). What actually happens is that
+an *unweighted* fit over contaminated data prefers a wrong pose, and Sampson
+error does exactly the same on the same scene (3.44 vs 3.74). Restricted to true
+correspondences both rank truth ahead by three orders of magnitude. The lesson
+was about robust weighting, not about which residual is prettier. Sampson is
+still used for estimation, on the ordinary grounds that it is standard and
+scale-free.
+
+Relatedly, the Huber scale is pinned to the caller's inlier threshold rather
+than estimated by MAD: a MAD-scaled fit converged to 1.8° from a start 0.77° off
+but to 84° from one 1.35° off, because the looser residual spread admitted the
+outliers.
+
 ## Testing
 
 The GA layer is plain PyTorch and its tests are CPU-only by design, unlike

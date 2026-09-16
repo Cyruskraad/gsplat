@@ -227,3 +227,83 @@ def recover_similarity(source, target):
     rotation = u @ _torch.diag(d) @ vh
     scale = float((s * d).sum() / (src_c.pow(2).sum() / source.shape[0]))
     return rotation, scale, src_mean, dst_mean
+
+
+def two_view_scene(
+    points: int = 300,
+    seed: int = 0,
+    pixel_noise: float = 0.0,
+    outlier_fraction: float = 0.0,
+    image_size: tuple[float, float] = (640.0, 480.0),
+):
+    """A calibrated two-view pair with known relative pose.
+
+    Camera A sits at the identity, so world coordinates *are* camera A's frame
+    and the returned ``true_relative`` motor carries frame B back to frame A.
+
+    Returns ``(points_a, points_b, intrinsics, true_relative, inlier_mask)``.
+    """
+    import torch as _torch
+
+    from gsplat.contrib.ga import camera as _camera
+    from gsplat.contrib.ga import motor as _motor
+
+    gen = _torch.Generator().manual_seed(seed)
+    intrinsics = _torch.tensor(
+        [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]], dtype=_torch.float64
+    )
+    true_relative = _motor.motor_exp(
+        _torch.tensor([0.06, -0.09, 0.03, 0.35, -0.15, 0.05], dtype=_torch.float64)
+    )
+    pose_b = _motor.motor_inverse(true_relative)
+
+    world = _torch.randn(points, 3, generator=gen, dtype=_torch.float64)
+    world[:, 2] += 6.0
+    identity = _motor.motor_identity(dtype=_torch.float64)
+    points_a, _ = _camera.project(
+        identity.expand(points, 8), intrinsics.expand(points, 3, 3), world
+    )
+    points_b, _ = _camera.project(
+        pose_b.expand(points, 8), intrinsics.expand(points, 3, 3), world
+    )
+
+    if pixel_noise:
+        points_a = points_a + _torch.randn(
+            points_a.shape, generator=gen, dtype=_torch.float64
+        ) * pixel_noise
+        points_b = points_b + _torch.randn(
+            points_b.shape, generator=gen, dtype=_torch.float64
+        ) * pixel_noise
+
+    inliers = _torch.ones(points, dtype=_torch.bool)
+    count = int(points * outlier_fraction)
+    if count:
+        index = _torch.randperm(points, generator=gen)[:count]
+        points_b[index] = _torch.rand(
+            count, 2, generator=gen, dtype=_torch.float64
+        ) * _torch.tensor(image_size, dtype=_torch.float64)
+        inliers[index] = False
+
+    return points_a, points_b, intrinsics, true_relative, inliers
+
+
+def pose_errors(estimate, reference):
+    """``(rotation_deg, translation_direction_deg)`` between two relative motors.
+
+    Two-view translation is only defined up to scale *and* sign, so the
+    direction error folds the sign away.
+    """
+    import torch as _torch
+
+    from gsplat.contrib.ga import motor as _motor
+
+    est = _motor.motor_to_matrix(estimate)
+    ref = _motor.motor_to_matrix(reference)
+    cos_angle = ((_torch.trace(est[:3, :3].T @ ref[:3, :3]) - 1.0) / 2.0).clamp(-1.0, 1.0)
+    rotation = float(_torch.arccos(cos_angle) * 180.0 / _torch.pi)
+
+    cosine = _torch.nn.functional.cosine_similarity(
+        est[:3, 3].unsqueeze(0), ref[:3, 3].unsqueeze(0)
+    ).abs().clamp(max=1.0)
+    direction = float(_torch.arccos(cosine) * 180.0 / _torch.pi)
+    return rotation, direction

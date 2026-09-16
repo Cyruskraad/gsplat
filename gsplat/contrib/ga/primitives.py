@@ -46,6 +46,7 @@ __all__ = [
     "line_plane_distance",
     "incidence_residual",
     "mv_join_point_line",
+    "line_line_gap",
 ]
 
 _EPS = 1e-12
@@ -222,3 +223,17 @@ def mv_join_point_line(point: torch.Tensor, line: torch.Tensor) -> torch.Tensor:
     """
     mv = _alg.point_mv(point) & _alg.line_mv(line)
     return _alg.mv_to_plane(mv, like=_like(point, line))
+
+
+def line_line_gap(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Signed perpendicular gap between two lines; zero exactly when they meet.
+
+    The wedge of two normalized lines is a pseudoscalar whose single coefficient
+    *is* the signed distance between them -- not merely an algebraic quantity
+    that vanishes on incidence. That makes it directly usable as an epipolar
+    residual with metric units, unlike ``x2^T E x1``, whose scale depends on how
+    the correspondence happens to be normalized.
+    """
+    a, b = normalize_line(a), normalize_line(b)
+    mv = _alg.line_mv(a) ^ _alg.line_mv(b)
+    return _coeff(mv, "e0123", _like(a, b))
