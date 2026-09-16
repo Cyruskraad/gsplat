@@ -307,3 +307,44 @@ def pose_errors(estimate, reference):
     ).abs().clamp(max=1.0)
     direction = float(_torch.arccos(cosine) * 180.0 / _torch.pi)
     return rotation, direction
+
+
+def view_graph(views: int = 10, seed: int = 0, spread: float = 0.4, connected: bool = True):
+    """A view graph with known global motors and exact relative motors on edges.
+
+    ``connected=True`` gives a chain plus chords, which is what averaging needs.
+    ``connected=False`` gives a same-parity edge rule, which silently splits the
+    graph into two components -- useful for testing that the split is detected
+    rather than papered over.
+
+    Returns ``(truth_motors, observed_relative, edge_i, edge_j)`` with camera 0
+    at the identity so the gauge is already pinned.
+    """
+    import torch as _torch
+
+    from gsplat.contrib.ga import motor as _motor
+    from gsplat.contrib.ga.sfm import averaging as _averaging
+
+    gen = _torch.Generator().manual_seed(seed)
+    truth = _motor.motor_exp(
+        _torch.randn(views, 6, generator=gen, dtype=_torch.float64) * spread
+    )
+    truth = _motor.motor_compose(
+        _motor.motor_inverse(truth[0]).expand(views, 8), truth
+    )
+
+    if connected:
+        pairs = (
+            [(i, i + 1) for i in range(views - 1)]
+            + [(i, i + 3) for i in range(views - 3)]
+            + [(0, views - 1)]
+        )
+    else:
+        pairs = [
+            (i, j) for i in range(views) for j in range(views) if i != j and (i + j) % 2 == 0
+        ]
+
+    edge_i = _torch.tensor([p[0] for p in pairs])
+    edge_j = _torch.tensor([p[1] for p in pairs])
+    observed = _averaging.relative_motor(truth[edge_i], truth[edge_j])
+    return truth, observed, edge_i, edge_j

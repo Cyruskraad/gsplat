@@ -21,10 +21,11 @@ same sandwich product transforms all of them.
 - :mod:`gsplat.contrib.ga.motor`      -- motor exp/log, composition, and the sandwich
 - :mod:`gsplat.contrib.ga.primitives` -- incidence: join, meet, and metric residuals
 - :mod:`gsplat.contrib.ga.camera`     -- pinhole cameras with motor extrinsics
+- :mod:`gsplat.contrib.ga.camera_opt` -- motor-parameterized pose refinement (claim C2)
 - :mod:`gsplat.contrib.ga.sfm`        -- structure-from-motion stages
 - :mod:`gsplat.contrib.ga.baseline`   -- the quaternion/se(3) control arm
 """
 
-from gsplat.contrib.ga import algebra, camera, motor, primitives
+from gsplat.contrib.ga import algebra, camera, camera_opt, motor, primitives
 
-__all__ = ["algebra", "camera", "motor", "primitives"]
+__all__ = ["algebra", "camera", "camera_opt", "motor", "primitives"]

@@ -124,8 +124,13 @@ reprojection RMSE):
   6e-16 after similarity alignment; **rotations agree to 2e-15 with no alignment
   at all**, which is the sharpest form of the check since a similarity gauge
   leaves rotations untouched.
-- **Gate 2 (runtime):** GA is **2.05x** the control, inside the 3x budget set
-  before the work started.
+- **Gate 2 (runtime):** GA is **~1.9-2.1x** the control across repeated runs,
+  inside the 3x budget set before the work started. Measured *warm*: kingdon
+  compiles its operators symbolically on first use, and that cost is once per
+  process rather than per iteration. Charging it to whichever arm runs first
+  turns the ratio into ~60x, which is a measurement artifact, not a cost anyone
+  pays per iteration. `examples/gasfm/benchmark.py` warms both arms before
+  timing and reports the compile separately.
 
 This is the expected result, and it is the point. The two are the same estimator
 in different coordinates, so agreement is the passing condition — if they ever
@@ -190,6 +195,73 @@ removed. Aligning on the *cameras* and then applying that same transform to the
 independently, since a wrong reconstruction would not survive a transform
 derived from something else.
 
+## Claim C2: motors as a camera-pose parameterization
+
+`gsplat/contrib/ga/camera_opt.py` provides `MotorCameraOptModule`, a drop-in
+alternative to `examples/utils.py::CameraOptModule` — same constructor, same
+`zero_init` / `random_init`, same `forward(camtoworlds, embed_ids)` signature and
+the same right-multiplication semantics, so it swaps into
+`examples/simple_trainer.py` under `--pose_opt`.
+
+| | parameters | per forward pass |
+| --- | --- | --- |
+| 6D + delta (existing) | **9** for 6 dof | Gram-Schmidt orthogonalization; identity is the constant `[1,0,0,0,1,0]`, so it needs a registered buffer |
+| motor (this) | **6** for 6 dof | one `exp` from the tangent algebra; identity *is* the zero vector, so there is nothing to remember |
+
+The motor parameterization is *minimal*: six numbers for six degrees of freedom,
+no constraint to maintain, no redundant directions in the gradient, and
+`zero_init` is exactly the identity by construction rather than by arrangement.
+
+**What C2 does not claim.** It does not claim this trains better. Both
+parameterizations cover SE(3) and both are differentiable; whether minimality
+helps a given optimizer on a given scene is empirical.
+`tests/ga/test_camera_opt.py::TestPoseRefinement` runs the CPU-sized version —
+both modules reduce reprojection error from a perturbed start under identical
+Adam settings — and deliberately asserts convergence for *both* rather than a
+win for either. One synthetic task would not support a stronger claim.
+
+**The real comparison, not yet run** (needs a GPU; this container has none):
+
+```bash
+# baseline arm
+python examples/simple_trainer.py default --data_dir <scene> \
+    --pose_opt --pose_noise 0.01 --result_dir results/pose_6d
+# motor arm: swap CameraOptModule for MotorCameraOptModule in the trainer
+python examples/simple_trainer.py default --data_dir <scene> \
+    --pose_opt --pose_noise 0.01 --result_dir results/pose_motor
+# compare final PSNR/SSIM/LPIPS and recovered pose error, same seeds
+```
+
+## View-graph averaging
+
+`sfm/averaging.py` turns pairwise relative motors into global poses by
+Gauss-Newton in **bivector coordinates**: each edge's residual is
+`log(R_obs⁻¹ · (M_i · M_j⁻¹))`, and a motor logarithm is a plain 6-vector with
+no constraint attached. Rotation and translation are therefore averaged
+*jointly, in one linear system*, where a vector-algebra pipeline runs rotation
+averaging and translation averaging as two separate stages with separate
+machinery. As with line features, the Jacobians come from autograd straight
+through `motor_log`, so no linearization was derived by hand.
+
+Two entry points, because two-view geometry gives you different things:
+
+- `average_motors` when relative motors carry true scale — recovers global poses
+  to **8.9e-16** on a connected graph with exact edges.
+- `average_rotations` when they do not, which is the usual case. Scrambling
+  every translation with σ=3 noise leaves the recovered rotations exact to
+  **5.6e-16**, which is the whole point of having it.
+
+### A silent failure worth knowing about
+
+Averaging determines poses only within the pinned camera's connected component.
+A disconnected graph fails *quietly*: every edge residual goes to machine zero —
+the fit is perfect — while the component not containing the pinned camera sits
+at an arbitrary global offset. During development an edge rule of
+`(i + j) % 2 == 0` split the graph by parity exactly this way and looked like a
+solver bug for a while.
+`tests/ga/test_averaging.py::test_a_disconnected_graph_leaves_its_far_component_free`
+pins it.
+
 ## Two-view relative pose
 
 `sfm/twoview.py` estimates the motor relating two calibrated views: normalized
@@ -206,22 +278,33 @@ otherwise would be false advertising.
 
 ### Measured envelope (300 correspondences, `threshold_px=1.5`, 200 iterations)
 
-| pixel noise | outliers | inliers found | rotation err | translation-dir err |
-| --- | --- | --- | --- | --- |
-| 0 | 0% | 300 | 0.0000° | 0.0000° |
-| 0.5 px | 0% | 300 | 0.037° | 0.248° |
-| 0.5 px | 10% | 267 | 0.322° | 1.915° |
-| 0.5 px | 20% | 240 | 0.740° | 2.120° |
-| 1.0 px | 20% | 80 | 6.93° | 83.4° |
-| 0.5 px | 40% | 58 | 6.91° | 85.5° |
+Reported over **six seeds**, because single-seed numbers here are actively
+misleading — an earlier version of this document quoted 0.32°/1.92° at 10%
+outliers and 0.74°/2.12° at 20%, which were the lucky draws. Figures below come
+from `tests/ga/_helpers.py::two_view_scene`;
+`examples/gasfm/benchmark.py` builds its own scene and lands within a few
+thousandths of a degree, with the same tail.
 
-**Open limitation, stated plainly.** Past 20% outliers at 0.5px noise the
-estimate collapses to a consistent ~7°/85° failure. Raising the RANSAC budget
-from 200 to 800 iterations changes those numbers *bit for bit*, so it is not a
-sampling shortage — there is a single strong wrong attractor that the robust
-refinement falls into. A five-point minimal solver and a proper MSAC score are
-the obvious next steps; neither is geometric-algebra work, which is why this is
-recorded as a limit rather than polished away.
+| pixel noise | outliers | rot median | rot max | t-dir median | t-dir max |
+| --- | --- | --- | --- | --- | --- |
+| 0 | 0% | 0.000° | 0.000° | 0.000° | 0.000° |
+| 0.5 px | 0% | 0.085° | 0.176° | 0.339° | 0.812° |
+| 0.5 px | 10% | 0.305° | **1.467°** | 2.327° | **10.509°** |
+| 0.5 px | 20% | 0.639° | **7.232°** | 2.652° | **83.944°** |
+
+So: **reliable on clean correspondences, usable but not dependable at 10%
+outliers, and not trustworthy at 20%.** Two seeds in six fail at 10%; one in six
+collapses entirely at 20%.
+
+**Open limitation, stated plainly.** Raising the RANSAC budget from 200 to 800
+iterations changes those numbers *bit for bit*, so it is not a sampling
+shortage — there is a single strong wrong attractor that the robust refinement
+falls into. A five-point minimal solver and a proper MSAC score are the fix, and
+this stage is not fit for real matcher output until they exist. Neither is
+geometric-algebra work, which is why it is recorded as a boundary rather than
+polished away. `tests/ga/test_twoview.py::TestRansac` asserts the *tail* as well
+as the median, so improving the estimator will trip those tests and force this
+section to be updated with it.
 
 ### Three corrections worth keeping
 
