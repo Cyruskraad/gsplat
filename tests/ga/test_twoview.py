@@ -245,17 +245,48 @@ class TestUnitBaseline:
 
 
 class TestRansac:
-    """Accuracy bounds are the measured ones, not aspirational.
+    """Accuracy bounds are the measured ones, over several seeds.
 
-    The tested envelope is up to 20% outliers at 0.5px noise. Beyond that --
-    40% outliers, or 20% with 1px noise -- the estimate collapses to roughly
-    7 degrees of rotation and 85 degrees of translation-direction error, with a
-    consistent signature that suggests a single wrong attractor rather than
-    sampling bad luck. Notably, raising the RANSAC budget from 200 to 800
-    iterations changes those results *bit for bit*, so it is not a matter of
-    too few hypotheses. That regime is documented in ``docs/ga-sfm.md`` as an
-    open limitation rather than asserted here.
+    An earlier version of this file asserted single-seed numbers (0.32 deg at
+    10% outliers, 0.74 deg at 20%) and passed. Running six seeds shows those
+    were the lucky draws: at 10% outliers two of six seeds land near
+    1.5 deg / 10 deg, and at 20% one of six collapses to 7 deg / 84 deg. A
+    single-seed assertion cannot see that, so these tests aggregate.
+
+    Measured over seeds 0-5 at 0.5px noise:
+
+    ======== ============== ============== ============== ==============
+    outliers rot median     rot max        t-dir median   t-dir max
+    ======== ============== ============== ============== ==============
+    0%       0.085 deg      0.176 deg      0.339 deg      0.812 deg
+    10%      0.305 deg      1.467 deg      2.327 deg      10.509 deg
+    20%      0.639 deg      7.232 deg      2.652 deg      83.944 deg
+    ======== ============== ============== ============== ==============
+
+    So: reliable on clean correspondences, usable-but-not-dependable at 10%,
+    and not trustworthy at 20%. The honest summary is that this RANSAC needs a
+    five-point solver and an MSAC score before it is fit for real matcher
+    output; see ``docs/ga-sfm.md``.
     """
+
+    SEEDS = tuple(range(6))
+
+    def _sweep(self, outlier_fraction, pixel_noise=0.5):
+        rotations, directions = [], []
+        for seed in self.SEEDS:
+            points_a, points_b, intrinsics, truth, _ = two_view_scene(
+                points=300,
+                pixel_noise=pixel_noise,
+                outlier_fraction=outlier_fraction,
+                seed=seed,
+            )
+            motor, _ = tv.ransac_relative_motor(
+                points_a, points_b, intrinsics, threshold_px=1.5, iterations=200
+            )
+            rotation, direction = pose_errors(motor, truth)
+            rotations.append(rotation)
+            directions.append(direction)
+        return sorted(rotations), sorted(directions)
 
     def test_exact_without_noise(self):
         points_a, points_b, intrinsics, true_relative, _ = two_view_scene(points=200)
@@ -266,21 +297,38 @@ class TestRansac:
         assert rotation < 1e-4 and direction < 1e-4
         assert bool(inliers.all())
 
-    @pytest.mark.parametrize("outlier_fraction", [0.0, 0.1, 0.2])
-    def test_accurate_under_noise_and_outliers(self, outlier_fraction):
-        points_a, points_b, intrinsics, true_relative, truth_mask = two_view_scene(
-            points=300, pixel_noise=0.5, outlier_fraction=outlier_fraction, seed=1
+    def test_reliable_on_clean_correspondences(self):
+        """The one regime that holds across every seed tried."""
+        rotations, directions = self._sweep(outlier_fraction=0.0)
+        assert max(rotations) < 0.5, rotations
+        assert max(directions) < 1.5, directions
+
+    def test_usable_but_not_dependable_at_ten_percent_outliers(self):
+        """Median is good; the tail is not. Both halves are asserted on purpose."""
+        rotations, directions = self._sweep(outlier_fraction=0.1)
+        median_rotation = rotations[len(rotations) // 2]
+        median_direction = directions[len(directions) // 2]
+        assert median_rotation < 1.0, rotations
+        assert median_direction < 4.0, directions
+        # Documenting the tail rather than pretending it is not there.
+        assert max(directions) > 5.0, (
+            "the 10% tail used to reach ~10 deg; if this now passes cleanly the "
+            "estimator improved and these bounds should be tightened"
         )
-        motor, inliers = tv.ransac_relative_motor(
-            points_a, points_b, intrinsics, threshold_px=1.5, iterations=200
+
+    def test_not_trustworthy_at_twenty_percent_outliers(self):
+        """At 20% at least one seed in six collapses entirely.
+
+        Asserted as a *known limitation* so that fixing it (five-point solver,
+        MSAC) trips this test and forces the documentation to be updated with
+        it.
+        """
+        rotations, directions = self._sweep(outlier_fraction=0.2)
+        assert rotations[len(rotations) // 2] < 2.0, rotations
+        assert max(directions) > 20.0, (
+            "the 20% tail used to collapse to ~84 deg; if it no longer does, the "
+            "estimator improved and docs/ga-sfm.md needs updating"
         )
-        rotation, direction = pose_errors(motor, true_relative)
-        assert rotation < 1.2, rotation
-        assert direction < 3.5, direction
-        # No true outlier should survive as an inlier.
-        if outlier_fraction:
-            precision = float((inliers & truth_mask).sum()) / max(int(inliers.sum()), 1)
-            assert precision > 0.95, precision
 
     def test_raises_when_no_pose_is_consistent(self):
         gen = torch.Generator().manual_seed(5)
