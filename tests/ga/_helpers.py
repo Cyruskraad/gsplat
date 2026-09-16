@@ -78,3 +78,43 @@ def random_bivectors(n: int, generator: torch.Generator, trans_scale: float = 2.
     w = w / norms * capped
     v = torch.randn(n, 3, generator=generator, dtype=torch.float64) * trans_scale
     return torch.cat([w, v], dim=-1)
+
+
+def synthetic_scene(
+    views: int = 6,
+    points: int = 200,
+    seed: int = 0,
+    jitter: float = 0.25,
+    distance: float = 8.0,
+):
+    """A small calibrated multi-view scene with known ground truth.
+
+    Cameras are jittered around a common stand-off from the origin so every
+    point projects in front of every camera; that keeps visibility out of the
+    tests that are not about visibility.
+
+    Returns ``(motors, intrinsics, points, pixels)`` with motors camera-from-world.
+    """
+    import torch as _torch
+
+    from gsplat.contrib.ga import camera as _camera
+    from gsplat.contrib.ga import motor as _motor
+
+    gen = _torch.Generator().manual_seed(seed)
+    intrinsics = _torch.tensor(
+        [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]], dtype=_torch.float64
+    ).expand(views, 3, 3).contiguous()
+
+    stand_off = _torch.zeros(views, 6, dtype=_torch.float64)
+    stand_off[:, 5] = -distance / 2.0  # bivector v = -t/2
+    motors = _motor.motor_compose(
+        _motor.motor_exp(stand_off),
+        _motor.motor_exp(_torch.randn(views, 6, generator=gen, dtype=_torch.float64) * jitter),
+    )
+    world = _torch.randn(points, 3, generator=gen, dtype=_torch.float64) * 0.8
+    pixels, _ = _camera.project(
+        motors[:, None, :].expand(views, points, 8),
+        intrinsics[:, None, :, :].expand(views, points, 3, 3),
+        world.expand(views, points, 3),
+    )
+    return motors, intrinsics, world, pixels

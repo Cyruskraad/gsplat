@@ -17,10 +17,13 @@ Rigid motion is represented by *motors* in 3D projective geometric algebra
 Cl(3,0,1), where points, lines and planes are grades of one algebra and the
 same sandwich product transforms all of them.
 
-- :mod:`gsplat.contrib.ga.algebra` -- backend adapter and encoding conventions
-- :mod:`gsplat.contrib.ga.motor`   -- motor exp/log, composition, and the sandwich
+- :mod:`gsplat.contrib.ga.algebra`    -- backend adapter and encoding conventions
+- :mod:`gsplat.contrib.ga.motor`      -- motor exp/log, composition, and the sandwich
+- :mod:`gsplat.contrib.ga.primitives` -- incidence: join, meet, and metric residuals
+- :mod:`gsplat.contrib.ga.camera`     -- pinhole cameras with motor extrinsics
+- :mod:`gsplat.contrib.ga.sfm`        -- structure-from-motion stages
 """
 
-from gsplat.contrib.ga import algebra, motor
+from gsplat.contrib.ga import algebra, camera, motor, primitives
 
-__all__ = ["algebra", "motor"]
+__all__ = ["algebra", "camera", "motor", "primitives"]
