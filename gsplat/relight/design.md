@@ -9,11 +9,14 @@ contract for the code.
 
 **In:** the representation of light transport, the projection of illumination
 onto a basis, the two render paths and their equivalence, the near-field flash
-model, offline atom prefiltering, optimal basis compression, and the inverse
-lighting solve.
+model, offline atom prefiltering, optimal basis compression, the inverse
+lighting solve, and the capture-side mathematics a loader will call — chrome-
+sphere light rays, the bracket-offset fit, ambient subtraction and the held-out
+splits.
 
 **Out:** rasterisation (that is `gsplat.rasterization`), training loops (those
-live in `examples/`), dataset loading, and anything that needs a GPU.
+live in `examples/`), file I/O and dataset classes, and anything that needs a
+GPU.
 
 ## Invariants
 
@@ -34,7 +37,10 @@ breaks the method, not just an implementation.
    in one texel projects identically through both.
 6. **Prefiltering commutes with the atom expansion.**
    `prefilter(sum_k ell_k A_k) == sum_k ell_k prefilter(A_k)`.
-7. **Compression is optimal.** The basis rotation from `compress_transport` is
+7. **A light calibration reports whether to believe it.** `solve_flash_offset`
+   returns a condition number because a degenerate capture produces a wrong
+   answer with a zero residual.
+8. **Compression is optimal.** The basis rotation from `compress_transport` is
    the Eckart--Young truncation; no other basis of the same size does better.
 
 ## Layout
@@ -47,6 +53,8 @@ breaks the method, not just an implementation.
 | `functional/prefilter.py` | Offline per-atom roughness prefiltering |
 | `functional/compress.py` | Transport spectrum and optimal rank reduction |
 | `functional/inverse.py` | Non-negative least-squares light recovery |
+| `functional/calibration.py` | Chrome-sphere light rays, bracket-offset fit, ambient subtraction |
+| `functional/splits.py` | Deterministic farthest-point held-out views and lights |
 
 ## Conventions
 
@@ -80,7 +88,7 @@ from gsplat.relight import functional as F
 python -m pytest tests/relight/ -q
 ```
 
-99 tests, about 10 seconds, CPU only. They need `torch` and `pytest` and
+144 tests, about 18 seconds, CPU only. They need `torch` and `pytest` and
 nothing else; `import gsplat` prints "No CUDA toolkit found" on a CPU box and
 otherwise behaves.
 

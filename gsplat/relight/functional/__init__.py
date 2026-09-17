@@ -31,6 +31,15 @@ from .atoms import (
     project_environment,
     project_point_light,
 )
+from .calibration import (
+    FlashOffset,
+    closest_point_to_rays,
+    light_ray_from_highlight,
+    ray_sphere_intersection,
+    reflect,
+    solve_flash_offset,
+    subtract_ambient,
+)
 from .compress import (
     CompressedTransport,
     TransportSpectrum,
@@ -53,6 +62,7 @@ from .prefilter import (
     prefilter_equirect,
     roughness_to_sharpness,
 )
+from .splits import Split, farthest_point_indices, split_lights, split_views
 from .transport import (
     composite,
     compositing_weights,
@@ -73,6 +83,19 @@ __all__ = [
     "make_sg_atoms",
     "project_environment",
     "project_point_light",
+    # calibration
+    "FlashOffset",
+    "closest_point_to_rays",
+    "light_ray_from_highlight",
+    "ray_sphere_intersection",
+    "reflect",
+    "solve_flash_offset",
+    "subtract_ambient",
+    # splits
+    "Split",
+    "farthest_point_indices",
+    "split_lights",
+    "split_views",
     # transport
     "composite",
     "compositing_weights",

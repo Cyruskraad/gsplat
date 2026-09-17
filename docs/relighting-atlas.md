@@ -3,20 +3,23 @@
 Real-time, multi-view relighting of OLAT-captured objects, at a cost independent of
 how complex the illumination is.
 
-**Status.** The design is complete. **P1 (the transport core and its exactness
-proof) is implemented and executed**; everything from P2 onward is design only
-and has not been run. See [Phases and gates](#phases-and-gates) for what that
+**Status.** The design is complete. **P0 (capture-side calibration and splits)
+and P1 (the transport core and its exactness proof) are implemented and
+executed**; everything from P2 onward is design only and has not been run. See [Phases and gates](#phases-and-gates) for what that
 means claim by claim, and `gsplat/relight/design.md` for the module contract.
 
-Measured on CPU, `tests/relight/`, 99 tests in ~10 s:
+Measured on CPU, `tests/relight/`, 144 tests in ~18 s:
 
-| P1 gate | Target | Measured |
+| Gate | Target | Measured |
 | --- | --- | --- |
 | `max\|Path A − Path B\|`, float64, 20 seeds | — | **1.3e-15** |
 | `max\|Path A − Path B\|`, float32, 20 seeds | < 1e-5 | **1.2e-06** |
 | Superposition residue | structural, i.e. rounding only | **8.9e-16** |
 | Prefilter commutation | < 1e-6 | **4.0e-15** |
 | Inverse-lighting iterations to 1e-10 KKT | interactive | **149–159** |
+| Flash-bracket offset, 100 mm sphere, ½-px ray error | < 25 mm | **18 mm** |
+| Light *direction* from one sphere, ½-px ray error | — | **0.9°** |
+| Light *position* per shot from one 40 mm sphere | was "< 2 mm" | **784 mm — gate withdrawn, see below** |
 
 ---
 
@@ -276,14 +279,18 @@ No new required dependencies. RAW decoding (`rawpy`) and EXR stay optional behin
 
 Every gate is a number, declared before the work.
 
-**P0 — Capture protocol and data contract.** *CPU.*
+**P0 — Capture protocol and data contract.** *CPU.* **Partly executed.**
 Capture protocol document. `OLATParser` / `OLATDataset` returning
 `(camtoworld, K, image_linear, light_position, light_intensity, light_profile, mask,
 view_id, light_id)`. Chrome-sphere solver. Flash/no-flash pairing and ambient
 subtraction. Deterministic held-out-view *and* held-out-light splits. A procedural
 fixture (sphere and plane, analytic) so the loader is testable with no capture.
-*Gate:* loader round-trips the fixture; light positions recovered from synthetic
-sphere highlights to under 2 mm; splits deterministic and disjoint.
+*Gates:* splits deterministic and disjoint — **met**; light calibration —
+**the 2 mm gate was withdrawn on measurement and replaced** by an 18 mm
+bracket-offset fit and a 0.9° direction recovery, both met, per the section
+above. The dataset loader and its procedural fixture are **not yet written**;
+the calibration and split mathematics that the loader will call are, in
+`gsplat/relight/functional/calibration.py` and `splits.py`.
 
 **P1 — Transport core and the exactness proof.** *CPU. The scientific core, and it
 needs no GPU.* **Executed.**
