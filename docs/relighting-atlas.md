@@ -3,7 +3,20 @@
 Real-time, multi-view relighting of OLAT-captured objects, at a cost independent of
 how complex the illumination is.
 
-**Status: design. Nothing in this document has been executed.**
+**Status.** The design is complete. **P1 (the transport core and its exactness
+proof) is implemented and executed**; everything from P2 onward is design only
+and has not been run. See [Phases and gates](#phases-and-gates) for what that
+means claim by claim, and `gsplat/relight/design.md` for the module contract.
+
+Measured on CPU, `tests/relight/`, 99 tests in ~10 s:
+
+| P1 gate | Target | Measured |
+| --- | --- | --- |
+| `max\|Path A − Path B\|`, float64, 20 seeds | — | **1.3e-15** |
+| `max\|Path A − Path B\|`, float32, 20 seeds | < 1e-5 | **1.2e-06** |
+| Superposition residue | structural, i.e. rounding only | **8.9e-16** |
+| Prefilter commutation | < 1e-6 | **4.0e-15** |
+| Inverse-lighting iterations to 1e-10 KKT | interactive | **149–159** |
 
 ---
 
@@ -273,13 +286,33 @@ fixture (sphere and plane, analytic) so the loader is testable with no capture.
 sphere highlights to under 2 mm; splits deterministic and disjoint.
 
 **P1 — Transport core and the exactness proof.** *CPU. The scientific core, and it
-needs no GPU.*
+needs no GPU.* **Executed.**
 Atom basis and projection, near-field model, both contractions, the torch reference
-renderer, atom prefilter pyramids.
+renderer, atom prefilter pyramids, optimal basis compression, and the
+non-negative least-squares light solve. Lives in `gsplat/relight/functional/`;
+99 tests in `tests/relight/`.
 *Gates:* `max |Path A - Path B| < 1e-5`; superposition
 `render(E1+E2) - render(E1) - render(E2) == 0` exactly, structurally rather than
 penalised; `prefilter(sum ell_k A_k) == sum ell_k prefilter(A_k)` to `1e-6`; every
-guard mutation-checked.
+guard mutation-checked. **All met** -- see the table at the top of this document.
+
+Two defects were found by running the code rather than by reading it, which is
+why the phase is ordered before anything that depends on it:
+
+- Building the exclusive cumulative product in the compositing weights by
+  *dividing* the inclusive product is wrong exactly where it matters. A fully
+  opaque primitive makes the divisor zero, and every weight in front of it --
+  including its own -- collapses to zero. Shifting instead of dividing fixes it.
+- The light solver stopped on relative step size, which never fires on an
+  ill-conditioned Gram matrix even after the objective has stopped moving: it
+  exhausted a 500-iteration budget at a residual of 6e-9. Stopping on the
+  projected gradient, the first-order optimality measure for the constrained
+  problem, and adding adaptive restart brings it to 149-159 iterations.
+
+Mutation checks were run rather than assumed. Reinstating the division in the
+compositing weights, packing the splat channels atom-major instead of
+channel-major, and reducing `contract_screen` along the channel axis each fail
+named tests.
 
 **P2 — Trainer v1.** *GPU, workstation.*
 Fork `examples/simple_trainer.py`. Fixed 128-lobe atom basis, Path A only, `D_i`
