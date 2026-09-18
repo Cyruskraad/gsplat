@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas-relight"
+version = "0.1.0"
+description = "All-frequency Transport via Learned Atom Splatting: relighting at a cost independent of the illumination's complexity."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+
+# atlas.functional needs nothing but torch. gsplat is required only by
+# atlas.model / atlas.train / atlas.render, but it is a hard dependency here
+# because those are the point of the package; install with --no-deps if you
+# only want the functional layer.
+dependencies = [
+    "torch>=2.7",
+    "numpy>=1.26",
+]
+
+[project.optional-dependencies]
+# The rasteriser. Pinned to the fork because the relight model relies on
+# extra_signals and arbitrary-channel-count rasterisation.
+gpu = ["gsplat @ git+https://github.com/Cyruskraad/gsplat@main"]
+# Capture ingestion: RAW decode and HDR/EXR I/O.
+capture = ["rawpy>=0.19", "imageio>=2.34", "pillow>=10.0"]
+viewer = ["viser>=0.2", "nerfview"]
+dev = ["pytest>=8", "black==22.3.0"]
+
+[project.scripts]
+atlas-inspect = "atlas.tools.inspect_capture:main"
+
+[tool.setuptools.packages.find]
+include = ["atlas*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
