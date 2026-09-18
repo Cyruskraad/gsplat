@@ -100,7 +100,7 @@ atlas/reference.py  a CPU rasteriser written to be obviously correct, and slow.
 atlas/model.py      RelightSplats + Path A render. gsplat imported lazily,
                     inside render() only, so the rest is CPU-testable.
 atlas/data/         synthetic.py: a capture with known ground truth.
-                    loader.py                           [not written yet]
+                    loader.py: the capture, and the four-way split.
 atlas/train.py      trainer.                            [not written yet]
 atlas/render.py     offline env-map relighting.         [not written yet]
 ```

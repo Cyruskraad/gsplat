@@ -16,6 +16,7 @@
 """Capture data: the synthetic generator now, the real loader when the report
 from the real capture arrives."""
 
+from .loader import SET_NAMES, Capture, Frame, FrameSplit, load_capture
 from .synthetic import (
     SyntheticConfig,
     fit_lobe_transport,
@@ -25,6 +26,11 @@ from .synthetic import (
 )
 
 __all__ = [
+    "Capture",
+    "Frame",
+    "FrameSplit",
+    "SET_NAMES",
+    "load_capture",
     "SyntheticConfig",
     "fit_lobe_transport",
     "generate_capture",
