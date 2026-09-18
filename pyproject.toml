@@ -17,6 +17,10 @@ license = { text = "Apache-2.0" }
 dependencies = [
     "torch>=2.7",
     "numpy>=1.26",
+    # Configs are hand-edited, so they are YAML rather than JSON. This is the
+    # only dependency outside the torch stack, and nothing in atlas.functional
+    # touches it.
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +30,11 @@ gpu = ["gsplat @ git+https://github.com/Cyruskraad/gsplat@main"]
 # Capture ingestion: RAW decode and HDR/EXR I/O.
 capture = ["rawpy>=0.19", "imageio>=2.34", "pillow>=10.0"]
 viewer = ["viser>=0.2", "nerfview"]
+# LPIPS needs a pretrained network, so it is optional. PSNR, SSIM, the report,
+# the gate and the comparison sheet all work without it -- the sheet writes its
+# own PNGs rather than depending on an image library, so it is available on a
+# machine where nothing optional has been installed yet.
+eval = ["lpips>=0.1.4"]
 dev = ["pytest>=8", "black==22.3.0"]
 
 [project.scripts]

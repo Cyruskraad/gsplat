@@ -50,10 +50,28 @@ jobs:
       - name: Imports
         # py_compile does not evaluate a dataclass's annotations, so a missing
         # import there compiles cleanly and breaks on first run. This catches it.
-        run: python -c "import atlas, atlas.functional, atlas.ply, atlas.model, atlas.tools.inspect_capture"
+        run: make imports
 
       - name: Tests
         run: python -m pytest tests/ -q --ignore=tests/gpu
+
+      - name: The comparison sheet must render with nothing optional installed
+        # atlas.eval writes its own PNGs rather than depending on an image
+        # library, so that the one artifact a person looks at when a number
+        # moves is available on a machine where nothing optional was installed.
+        # If that ever stops being true, this step is where it shows up.
+        run: |
+          python - <<'PY'
+          import sys, torch
+          from atlas.eval import SheetEntry, comparison_sheet
+          reference = torch.rand(16, 16, 3)
+          comparison_sheet(
+              "/tmp/ci-sheet.png",
+              [SheetEntry("CI", reference, reference * 0.9)],
+          )
+          for forbidden in ("PIL", "imageio", "matplotlib", "lpips"):
+              assert forbidden not in sys.modules, forbidden
+          PY
 
       - name: The functional layer must import without gsplat
         # Belt and braces: the boundary is also a test, but a CI step that fails

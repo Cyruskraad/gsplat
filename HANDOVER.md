@@ -19,12 +19,15 @@ inspector on real data, because the loader is written against what it finds.
 | `atlas/tools/inspect_capture.py` | **Executed.** 19 tests, CPU. Never run on real data |
 | `atlas/ply.py`, `atlas/model.py` | **Executed apart from the rasteriser call**, which is CUDA-only. 21 tests |
 | `atlas/config.py`, `atlas/run.py` | **Executed.** 69 tests. Config hashing, run directories, provenance, ledger |
+| `atlas/eval.py`, `atlas/imageio.py` | **Executed.** 66 tests. Tonemapped metrics, the two held-out splits, the gate, the comparison sheet |
 | `atlas/data/`, `atlas/train.py`, `atlas/render.py` | **Not written** |
 | CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 257 tests, about 12
-seconds, no GPU and no `gsplat` required.
+`make check` is the whole of what has been verified: 323 tests, about 14
+seconds, no GPU and no `gsplat` required. It also happens to pass with numpy
+absent, which is how this container came back after a restart -- nothing under
+`atlas/` imports it.
 
 The one thing CPU tests cannot reach is `gsplat.rasterization` itself. Every
 input to it is covered -- the transport contraction, the activations, the PLY
@@ -43,6 +46,23 @@ From `tests/`, on CPU:
 | Prefilter commutation | < 1e-6 | 4.0e-15 |
 | Inverse-lighting iterations to 1e-10 KKT | interactive | 149–159 |
 | Flash-bracket offset, 100 mm sphere, ½-px ray error | < 25 mm | 18 mm |
+| SSIM against a literal transcription of Wang et al., float64 | exact | < 1e-10 |
+| PNG: adaptive filtering vs unfiltered scanlines, on a gradient | pays for itself | 2.23x smaller |
+
+## A third finding, from the evaluation harness
+
+**SSIM cannot see the failure the project is gated on.** On a synthetic capture
+where the prediction gets the diffuse response right and the specular highlight
+35% wrong -- which is precisely what a model that memorised its training
+illuminations does on an unseen light -- the two held-out splits separate by
+**14.6 dB** of `psnr/mu` and by **0.001** of `ssim/mu`. A run reported on SSIM
+alone would look fine.
+
+That is why `RelightingReport` reports both splits in every domain and gates on
+PSNR in the mu-law domain, and why there is no unnamed PSNR anywhere in
+`atlas/eval.py`: on the same pair, linear-radiance PSNR ranks a model that has
+lost its entire diffuse response *above* one that is 10% off on a single
+highlight pixel. Both of those are pinned as tests.
 
 ## Two findings that changed the plan
 

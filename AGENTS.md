@@ -77,6 +77,8 @@ atlas/tools/        standard library, plus optional Pillow/rawpy that degrade.
 atlas/ply.py        standard library. Reads a gsplat PLY for geometry init.
 atlas/config.py     typed config tree, layered YAML, the hash that names a run.
 atlas/run.py        run directories, provenance, metrics, the results ledger.
+atlas/eval.py       tonemapped metrics, the two held-out splits, the gate.
+atlas/imageio.py    PNG in and out, and a bitmap font. Standard library only.
 atlas/model.py      RelightSplats + Path A render. gsplat imported lazily,
                     inside render() only, so the rest is CPU-testable.
 atlas/data/         loader.                             [not written yet]
