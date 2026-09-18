@@ -66,7 +66,9 @@ its predecessors.
 ```
 atlas/functional/   pure PyTorch. Imports torch and nothing else. CPU-testable.
 atlas/tools/        standard library, plus optional Pillow/rawpy that degrade.
-atlas/model.py      imports gsplat. Needs CUDA.        [not written yet]
+atlas/ply.py        standard library. Reads a gsplat PLY for geometry init.
+atlas/model.py      RelightSplats + Path A render. gsplat imported lazily,
+                    inside render() only, so the rest is CPU-testable.
 atlas/data/         loader.                             [not written yet]
 atlas/train.py      trainer.                            [not written yet]
 atlas/render.py     offline env-map relighting.         [not written yet]

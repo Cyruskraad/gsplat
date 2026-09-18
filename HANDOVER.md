@@ -17,11 +17,17 @@ inspector on real data, because the loader is written against what it finds.
 | --- | --- |
 | `atlas/functional/` — atoms, transport, near-field, prefilter, compress, inverse, calibration, splits | **Executed.** 144 tests, CPU |
 | `atlas/tools/inspect_capture.py` | **Executed.** 19 tests, CPU. Never run on real data |
-| `atlas/model.py`, `atlas/data/`, `atlas/train.py`, `atlas/render.py` | **Not written** |
+| `atlas/ply.py`, `atlas/model.py` | **Executed apart from the rasteriser call**, which is CUDA-only. 21 tests |
+| `atlas/data/`, `atlas/train.py`, `atlas/render.py` | **Not written** |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 163 tests, about 20
+`make check` is the whole of what has been verified: 188 tests, about 20
 seconds, no GPU and no `gsplat` required.
+
+The one thing CPU tests cannot reach is `gsplat.rasterization` itself. Every
+input to it is covered -- the transport contraction, the activations, the PLY
+geometry, the shape contracts -- but the call is closed only by the `--smoke`
+run on the workstation.
 
 ## Measured numbers
 
@@ -84,12 +90,13 @@ says so.
 
 ### 2. Then, in order
 
-- `atlas/model.py` — `RelightSplats` plus Path A rendering through
-  `gsplat.rasterization`. `from_ply` initialises geometry from an existing
-  fixed-light reconstruction of the same object, which is what makes the first
-  real run fast. Start at **B = 32 atoms**, not 128: near-field training needs a
-  per-Gaussian `[N, B]` intermediate, which is 77 MB at 600k Gaussians and B=32
-  but 307 MB at B=128, before autograd.
+- ~~`atlas/model.py`~~ — **done.** `RelightSplats` plus Path A rendering.
+  `from_ply` initialises geometry from an existing fixed-light reconstruction
+  and sets the transport so that **under a uniform white environment the model
+  reproduces the colour that reconstruction had** — so iteration zero looks like
+  the object, and the smoke test tells you something. Default **B = 32 atoms**,
+  not 128: near-field training needs a per-primitive `[N, B]` intermediate,
+  77 MB at 600k primitives and B=32 but 307 MB at B=128, before autograd.
 - `atlas/data/` — the loader, against the report.
 - `atlas/train.py` — trainer. Carry over what the fixed-light work in
   `Cyruskraad/gsplat@codex/gsplat-hq-fixed-light` proved: mask-aware loss on a
