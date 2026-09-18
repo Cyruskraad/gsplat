@@ -46,3 +46,7 @@ include = ["atlas*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# `slow` marks the tests that measure peak memory by running a configuration in
+# its own process. They are part of `make check` -- a memory claim nobody runs
+# is a memory claim nobody has -- and `-m "not slow"` skips them when iterating.
+markers = ["slow: spawns a subprocess to measure peak memory"]

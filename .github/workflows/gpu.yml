@@ -74,6 +74,22 @@ jobs:
       - name: GPU tests
         run: .venv/bin/python -m pytest tests/gpu -q
 
+      - name: Contraction throughput and memory
+        # The number that decides whether the design's "train over-complete at
+        # 128 atoms, then compress" is affordable, or whether B has to be
+        # chosen before training rather than after. It lands in the ledger with
+        # the commit attached, so the next run is comparable with this one, and
+        # in the artifact so it can be read without the workstation.
+        run: |
+          mkdir -p runs
+          .venv/bin/python -m atlas.bench \
+            --device cuda \
+            --primitives 600000 \
+            --atoms 32 64 128 \
+            --resolution 1080 1920 \
+            --report runs/bench-ledger.jsonl \
+            --json runs/bench-$GITHUB_SHA.json
+
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4

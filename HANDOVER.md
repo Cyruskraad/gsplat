@@ -20,11 +20,12 @@ inspector on real data, because the loader is written against what it finds.
 | `atlas/ply.py`, `atlas/model.py` | **Executed apart from the rasteriser call**, which is CUDA-only. 21 tests |
 | `atlas/config.py`, `atlas/run.py` | **Executed.** 69 tests. Config hashing, run directories, provenance, ledger |
 | `atlas/eval.py`, `atlas/imageio.py` | **Executed.** 66 tests. Tonemapped metrics, the two held-out splits, the gate, the comparison sheet |
+| `atlas/bench.py`, chunked contraction | **Executed on CPU.** 56 tests. The sizes that decide `B` need the runner |
 | `atlas/data/`, `atlas/train.py`, `atlas/render.py` | **Not written** |
 | CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 323 tests, about 14
+`make check` is the whole of what has been verified: 379 tests, about 25
 seconds, no GPU and no `gsplat` required. It also happens to pass with numpy
 absent, which is how this container came back after a restart -- nothing under
 `atlas/` imports it.
@@ -48,6 +49,27 @@ From `tests/`, on CPU:
 | Flash-bracket offset, 100 mm sphere, ½-px ray error | < 25 mm | 18 mm |
 | SSIM against a literal transcription of Wang et al., float64 | exact | < 1e-10 |
 | PNG: adaptive filtering vs unfiltered scanlines, on a gradient | pays for itself | 2.23x smaller |
+| Chunked contraction, peak RSS, per-primitive light, N=200k B=64 | lower | 150 MB → 11 MB |
+| Chunked contraction, peak RSS, screen space, 540x960 B=32 | lower | 198 MB → 21 MB |
+| Chunked vs unchunked disagreement, float32, worst of 20 seeds | < 1e-6 | 2.2e-7 of output scale |
+
+## A fourth finding: a memory claim that measurement refuted
+
+`atlas/functional/transport.py` asserted in a comment that the shared far-field
+contraction, `einsum("ncb,cb->nc", ...)`, builds a full `[N, 3, B]` temporary
+before reducing it, and that chunking would therefore halve its footprint.
+`ru_maxrss` says it allocates **nothing** beyond its output: it reduces through
+a strided matmul without ever forming the product.
+
+The two paths that *do* allocate a full temporary are the per-primitive light
+(near-field training) and the screen-space buffer, measured at 150 MB → 11 MB
+and 198 MB → 21 MB respectively. Those are the ones chunking is for. The
+comment now says all of this, `tests/test_chunking.py` measures it in a
+subprocess rather than arguing it from the shapes, and one test exists purely
+to record that the shared path has no saving to make.
+
+The rule this produced is in `AGENTS.md`: measure a memory claim, do not derive
+it from the shapes.
 
 ## A third finding, from the evaluation harness
 

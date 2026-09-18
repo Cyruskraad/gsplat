@@ -64,10 +64,16 @@ from .prefilter import (
 )
 from .splits import Split, farthest_point_indices, split_lights, split_views
 from .transport import (
+    DEFAULT_CHUNK_BYTES,
+    auto_chunk,
+    check_finite,
     composite,
     compositing_weights,
     contract,
+    contract_chunked,
     contract_screen,
+    contract_screen_chunked,
+    contraction_bytes,
     pack_transport,
     unpack_transport,
 )
@@ -100,7 +106,13 @@ __all__ = [
     "composite",
     "compositing_weights",
     "contract",
+    "contract_chunked",
     "contract_screen",
+    "contract_screen_chunked",
+    "auto_chunk",
+    "check_finite",
+    "contraction_bytes",
+    "DEFAULT_CHUNK_BYTES",
     "pack_transport",
     "unpack_transport",
     # near field

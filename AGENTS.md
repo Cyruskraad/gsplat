@@ -33,6 +33,9 @@ each is pinned by a named test in `tests/`.
 7. `solve_flash_offset` reports a condition number, because a degenerate capture
    yields a wrong answer with a *zero* residual.
 8. `compress_transport` is the Eckart–Young truncation.
+9. **Chunking never changes an answer.** `contract_chunked` equals
+   `contract` and `contract_screen_chunked` equals `contract_screen`, at
+   every chunk size, on all three light forms.
 
 ## Ground rules
 
@@ -60,6 +63,11 @@ its predecessors.
   already happened once: the 2 mm chrome-sphere position gate was geometrically
   unreachable, so it was removed and replaced, not relaxed. The reasoning is in
   `docs/relighting-atlas.md`.
+- **Measure a memory claim; do not derive it from the shapes.** This has
+  already caught one: the module asserted that `einsum("ncb,cb->nc", ...)`
+  allocates a full `[N, 3, B]` temporary, and `ru_maxrss` says it allocates
+  nothing at all. The comment now says so, and the tests measure rather than
+  argue.
 - **No new required dependencies.** `atlas.functional` is pure PyTorch and must
   stay that way — it is what lets the correctness argument be checked without a
   GPU. RAW, EXR, viewer and gsplat all live behind optional extras. The one
@@ -79,6 +87,7 @@ atlas/config.py     typed config tree, layered YAML, the hash that names a run.
 atlas/run.py        run directories, provenance, metrics, the results ledger.
 atlas/eval.py       tonemapped metrics, the two held-out splits, the gate.
 atlas/imageio.py    PNG in and out, and a bitmap font. Standard library only.
+atlas/bench.py      contraction throughput and memory, into the ledger.
 atlas/model.py      RelightSplats + Path A render. gsplat imported lazily,
                     inside render() only, so the rest is CPU-testable.
 atlas/data/         loader.                             [not written yet]

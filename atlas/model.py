@@ -59,7 +59,7 @@ import torch
 from torch import Tensor
 
 from .functional.atoms import make_sg_atoms, project_environment
-from .functional.transport import contract
+from .functional.transport import contract_chunked
 from .ply import SH_C0, read_ply
 
 __all__ = ["RelightSplats", "DEFAULT_NUM_ATOMS"]
@@ -265,7 +265,10 @@ class RelightSplats:
         Ks: Tensor,
         width: int,
         height: int,
-        ell: Tensor,
+        ell,
+        *,
+        chunk_size: int = 0,
+        validate: bool = False,
         **rasterization_kwargs: Any,
     ):
         """Path A: contract the transport against the light, then splat.
@@ -274,9 +277,16 @@ class RelightSplats:
             viewmats: ``[C, 4, 4]`` world-to-camera.
             Ks: ``[C, 3, 3]`` pinhole intrinsics.
             width, height: Output size.
-            ell: ``[3, B]`` shared light coefficients, or ``[N, 3, B]`` when
-                every primitive sees its own light, which is what a near-field
-                point light produces.
+            ell: ``[3, B]`` shared light coefficients, ``[N, 3, B]`` when every
+                primitive sees its own light -- which is what a near-field point
+                light produces -- or a callable ``(start, stop)`` producing one
+                chunk at a time, which is how a near-field light avoids being
+                stored at all.
+            chunk_size: Primitives per contraction chunk. ``0`` picks one from a
+                memory budget. Only the per-primitive and callable light forms
+                have a temporary to save; see ``atlas.functional.transport``.
+            validate: Check each chunk for non-finite values, so a diverged
+                model names the primitive instead of rendering black.
             **rasterization_kwargs: Passed through to ``gsplat.rasterization``.
 
         Returns:
@@ -290,7 +300,9 @@ class RelightSplats:
                 'Install it with: pip install -e ".[gpu]"'
             ) from exc
 
-        colors = contract(self.transport, ell)  # [N, 3]
+        colors = contract_chunked(
+            self.transport, ell, chunk_size=chunk_size, validate=validate
+        )  # [N, 3]
         return rasterization(
             means=self.means,
             quats=self.quats,
