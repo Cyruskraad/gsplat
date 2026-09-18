@@ -88,6 +88,10 @@ atlas/run.py        run directories, provenance, metrics, the results ledger.
 atlas/eval.py       tonemapped metrics, the two held-out splits, the gate.
 atlas/imageio.py    PNG in and out, and a bitmap font. Standard library only.
 atlas/bench.py      contraction throughput and memory, into the ledger.
+atlas/reference.py  a CPU rasteriser written to be obviously correct, and slow.
+                    Generates the synthetic capture, runs smoke-cpu, and is the
+                    one oracle for gsplat.rasterization that is not derived
+                    from gsplat.rasterization.
 atlas/model.py      RelightSplats + Path A render. gsplat imported lazily,
                     inside render() only, so the rest is CPU-testable.
 atlas/data/         loader.                             [not written yet]
