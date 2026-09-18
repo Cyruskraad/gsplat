@@ -21,11 +21,13 @@ inspector on real data, because the loader is written against what it finds.
 | `atlas/config.py`, `atlas/run.py` | **Executed.** 69 tests. Config hashing, run directories, provenance, ledger |
 | `atlas/eval.py`, `atlas/imageio.py` | **Executed.** 66 tests. Tonemapped metrics, the two held-out splits, the gate, the comparison sheet |
 | `atlas/bench.py`, chunked contraction | **Executed on CPU.** 56 tests. The sizes that decide `B` need the runner |
-| `atlas/data/`, `atlas/train.py`, `atlas/render.py` | **Not written** |
+| `atlas/reference.py` | **Executed.** 31 tests. CPU rasteriser: oracle, generator, smoke test |
+| `atlas/data/synthetic.py` | **Executed.** 22 tests. A capture with known ground truth |
+| `atlas/data/loader.py`, `atlas/train.py`, `atlas/render.py` | **Not written** |
 | CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 379 tests, about 25
+`make check` is the whole of what has been verified: 451 tests, about 75
 seconds, no GPU and no `gsplat` required. It also happens to pass with numpy
 absent, which is how this container came back after a restart -- nothing under
 `atlas/` imports it.
@@ -52,6 +54,46 @@ From `tests/`, on CPU:
 | Chunked contraction, peak RSS, per-primitive light, N=200k B=64 | lower | 150 MB → 11 MB |
 | Chunked contraction, peak RSS, screen space, 540x960 B=32 | lower | 198 MB → 21 MB |
 | Chunked vs unchunked disagreement, float32, worst of 20 seeds | < 1e-6 | 2.2e-7 of output scale |
+
+## The finding that changes the capture protocol
+
+**A bracket-mounted flash cannot support the held-out-light gate.**
+
+`docs/relighting-atlas.md` specifies an **off-camera** flash whose position is
+recovered per shot from chrome spheres. When the chrome-sphere *position* gate
+proved geometrically unreachable it was replaced by a bracket-mounted flash at
+one fitted camera-frame offset. Those two are not interchangeable:
+
+> If the light is a fixed function of the camera, holding out a light holds out
+> its view as well. `split_lights` and `split_views` select the same shots, the
+> two reported numbers are the same number, and the gate passes regardless of
+> what the model learned.
+
+`tests/test_synthetic.py::test_a_bracket_flash_collapses_the_two_splits_onto_each_other`
+runs both splits on a bracket capture and shows they select identical shots.
+
+**What this means for the shoot.** The flash has to move independently of the
+camera for the project's central gate to mean anything — a second operator, or
+a flash on a stand repositioned between passes. A bracket capture is still
+worth having: it gives geometry, it exercises the loader and trainer, and it is
+what the offset calibration was built for. It just cannot answer the question
+the project exists to answer. `SyntheticConfig.flash_mode` is `"free"` or
+`"bracket"`, and the manifest records `splits_are_independent` so nothing
+downstream has to infer it.
+
+## What the inspector said about a capture at last
+
+`atlas/tools/inspect_capture.py` was written before any data existed and has
+only ever been run against fixtures it built itself. Run against the generated
+capture it returns **usable**, finds the `nerf-transforms` solve, all 36 masks,
+a highlight-centroid RMS of 0.352 of the frame and a relative luminance spread
+of 1.09.
+
+One false positive, recorded rather than patched: it reports "about 16 flash /
+no-flash pairs" on a capture that contains none. With no EXIF timestamps the
+detector falls back to brightness, and brightness here varies because the light
+moves — the same signal. It feeds no verdict, so it stays, but the count must
+not be read as a total on the real capture.
 
 ## A fourth finding: a memory claim that measurement refuted
 

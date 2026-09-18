@@ -33,7 +33,12 @@ each is pinned by a named test in `tests/`.
 7. `solve_flash_offset` reports a condition number, because a degenerate capture
    yields a wrong answer with a *zero* residual.
 8. `compress_transport` is the Eckart–Young truncation.
-9. **Chunking never changes an answer.** `contract_chunked` equals
+9. **A held-out-light split only means something when the light is not a
+   function of the camera.** A bracket-mounted flash makes `split_lights`
+   and `split_views` select the same shots, and the gate then passes
+   whatever the model learned. `SyntheticConfig.flash_mode` names the two
+   cases and the manifest records `splits_are_independent`.
+10. **Chunking never changes an answer.** `contract_chunked` equals
    `contract` and `contract_screen_chunked` equals `contract_screen`, at
    every chunk size, on all three light forms.
 
@@ -94,7 +99,8 @@ atlas/reference.py  a CPU rasteriser written to be obviously correct, and slow.
                     from gsplat.rasterization.
 atlas/model.py      RelightSplats + Path A render. gsplat imported lazily,
                     inside render() only, so the rest is CPU-testable.
-atlas/data/         loader.                             [not written yet]
+atlas/data/         synthetic.py: a capture with known ground truth.
+                    loader.py                           [not written yet]
 atlas/train.py      trainer.                            [not written yet]
 atlas/render.py     offline env-map relighting.         [not written yet]
 ```
