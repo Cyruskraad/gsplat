@@ -39,7 +39,10 @@ each is pinned by a named test in `tests/`.
 Each of these exists because ignoring it caused a real defect in this project or
 its predecessors.
 
-- **There is no CI.** Validate by hand: `make check`.
+- **CI runs on every push.** `.github/workflows/cpu.yml` does lint, imports and
+  the CPU suite on a hosted runner; `.github/workflows/gpu.yml` does the
+  rasteriser parity tests on the workstation. Run `make check` locally anyway —
+  finding it yourself is faster than finding it in a log.
 - **Run it, don't just read it.** Both defects found so far — the compositing
   weights collapsing at `alpha = 1`, and the light solver never meeting its
   stopping rule — were invisible to inspection and obvious on the first run.
@@ -93,8 +96,18 @@ needs a GPU. There is a test that would notice.
 ## Validating
 
 ```bash
-make check     # lint + imports + tests. Seconds. No GPU, no gsplat needed.
+make check                 # lint + imports + tests. Seconds. No GPU, no gsplat.
+pytest tests/gpu -q        # needs CUDA and gsplat; skips cleanly without them.
 ```
 
-GPU work is listed in `HANDOVER.md` with the exact commands and the gate each
-one has to meet.
+`tests/gpu/` holds the one thing CPU cannot reach. The CPU suite proves the two
+render paths agree against `atlas.functional.composite`, a compositor written to
+be obviously correct — but the renderer uses `gsplat.rasterization`, a tiled CUDA
+kernel with its own sort and its own accumulation. If *it* is not linear in the
+per-primitive feature, the CPU proof is a proof about the wrong program. The
+parity test settles that without needing to know the kernel's weights: it renders
+the same scene both ways, and whatever weights the kernel chose it chose the same
+ones twice.
+
+`docs/runner-setup.md` registers the workstation so this happens on every push
+rather than by hand.

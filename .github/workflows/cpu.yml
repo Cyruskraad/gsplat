@@ -1,0 +1,66 @@
+# Everything that does not need a GPU, on every push.
+#
+# This is the gap the gsplat fork has: Actions is disabled there at the repo
+# level, which is why its handoff docs say "validate by hand". Here the bar is
+# enforced instead of remembered.
+name: cpu
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: cpu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install CPU torch
+        # The default PyPI torch wheel carries the CUDA runtime -- about 2.5 GB
+        # that a CPU runner will never execute. The cpu index is the same torch
+        # without it, and it is the difference between a two-minute job and a
+        # ten-minute one.
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install the project
+        # torch is already satisfied above, so this resolves the rest only.
+        run: pip install -e ".[dev,capture]"
+
+      - name: Lint
+        run: python -m black --check --required-version 22.3.0 atlas/ tests/
+
+      - name: Imports
+        # py_compile does not evaluate a dataclass's annotations, so a missing
+        # import there compiles cleanly and breaks on first run. This catches it.
+        run: python -c "import atlas, atlas.functional, atlas.ply, atlas.model, atlas.tools.inspect_capture"
+
+      - name: Tests
+        run: python -m pytest tests/ -q --ignore=tests/gpu
+
+      - name: The functional layer must import without gsplat
+        # Belt and braces: the boundary is also a test, but a CI step that fails
+        # loudly is what stops someone "fixing" the test instead of the import.
+        run: |
+          python - <<'PY'
+          import subprocess, sys
+          code = "import sys, atlas.functional; sys.exit(1 if 'gsplat' in sys.modules else 0)"
+          sys.exit(subprocess.run([sys.executable, "-c", code]).returncode)
+          PY

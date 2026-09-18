@@ -19,6 +19,7 @@ inspector on real data, because the loader is written against what it finds.
 | `atlas/tools/inspect_capture.py` | **Executed.** 19 tests, CPU. Never run on real data |
 | `atlas/ply.py`, `atlas/model.py` | **Executed apart from the rasteriser call**, which is CUDA-only. 21 tests |
 | `atlas/data/`, `atlas/train.py`, `atlas/render.py` | **Not written** |
+| CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
 `make check` is the whole of what has been verified: 188 tests, about 20
@@ -65,7 +66,22 @@ moves the 40 mm number. **Use a 100 mm chrome sphere or larger.**
 
 ## The next task, and its gate
 
-### 1. Run the inspector on the real capture
+### 1. Register the GPU runner — the highest-leverage step
+
+`docs/runner-setup.md` has the exact commands. Twenty minutes, no inbound
+network needed.
+
+This is not housekeeping. Nobody working on this project from a session can
+reach the workstation — there is no `ssh` client and outbound port 22 is
+blocked. Without a runner, every GPU question costs a round trip: write code
+blind, someone runs it, someone pastes the output. With one, a push runs on the
+GPU and the result comes back through the GitHub API, readable by anyone,
+including an agent with no shell on the machine.
+
+The first run's **Report the hardware** step printing `nvidia-smi` into a GitHub
+log *is* the proof that the loop is closed.
+
+### 2. Run the inspector on the real capture
 
 ```bash
 pip install -e ".[dev,capture]"
@@ -88,7 +104,7 @@ separate a moving light from a moving camera. The EXIF flash tag settles it when
 present; otherwise the definitive test needs the camera solve, and the report
 says so.
 
-### 2. Then, in order
+### 3. Then, in order
 
 - ~~`atlas/model.py`~~ — **done.** `RelightSplats` plus Path A rendering.
   `from_ply` initialises geometry from an existing fixed-light reconstruction

@@ -9,10 +9,16 @@ help:
 	@echo "format     - apply black"
 	@echo "imports    - import every module that has tyro annotations"
 	@echo "smoke-cpu  - whole trainer on a toy scene via the reference renderer"
-	@echo "check      - lint + imports + test, what CI would run if there were CI"
+	@echo "gpu        - rasteriser parity tests; needs CUDA + gsplat"
+	@echo "check      - lint + imports + test, the same set CI runs"
 
 test:
 	$(PYTHON) -m pytest tests/ -q
+
+# Needs CUDA and gsplat. Skips cleanly without them, which is why `test` above
+# can safely include the same directory.
+gpu:
+	$(PYTHON) -m pytest tests/gpu -q
 
 lint:
 	$(PYTHON) -m black --check --required-version 22.3.0 atlas/ tests/

@@ -1,0 +1,86 @@
+# The part CPU cannot reach: the rasteriser itself.
+#
+# Runs on a self-hosted runner on the workstation. This workflow is the project's
+# feedback loop -- it is how a change gets validated against real CUDA without
+# anyone watching a terminal, and how the results come back through the GitHub
+# API rather than over a shell.
+#
+# See docs/runner-setup.md to register the runner.
+name: gpu
+
+on:
+  push:
+    # Documentation commits should not occupy the GPU.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - ".github/workflows/cpu.yml"
+  workflow_dispatch:
+
+# Deliberately not `pull_request`: a self-hosted runner executes the code in the
+# branch it checks out, so running it on pull requests from outside would hand
+# the workstation to whoever opened one.
+
+concurrency:
+  # One GPU. Queue rather than fight over it, and do not cancel a run mid-way --
+  # a half-finished CUDA job can leave memory held.
+  group: gpu
+  cancel-in-progress: false
+
+jobs:
+  gpu:
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report the hardware
+        # The first thing to read when something fails, and on the very first
+        # run it is the whole point: it proves the loop is closed.
+        run: |
+          nvidia-smi
+          python3 --version
+
+      - name: Environment
+        # A venv inside the workspace, never the system interpreter: a CI job
+        # must not be able to modify the workstation's own environment.
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install -e ".[dev,capture]"
+
+      - name: Report the stack
+        run: |
+          .venv/bin/python - <<'PY'
+          import torch
+          print("torch      ", torch.__version__)
+          print("cuda avail ", torch.cuda.is_available())
+          if torch.cuda.is_available():
+              print("device     ", torch.cuda.get_device_name(0))
+              print("capability ", torch.cuda.get_device_capability(0))
+          try:
+              import gsplat
+              print("gsplat     ", gsplat.__version__)
+          except Exception as exc:
+              print("gsplat      NOT AVAILABLE:", exc)
+          PY
+
+      - name: CUDA is actually present
+        # Without this the GPU tests would skip and the job would pass green
+        # while proving nothing, which is worse than failing.
+        run: .venv/bin/python -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)"
+
+      - name: GPU tests
+        run: .venv/bin/python -m pytest tests/gpu -q
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-artifacts
+          path: |
+            runs/
+            *.json
+          if-no-files-found: ignore
+          retention-days: 14
