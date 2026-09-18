@@ -18,11 +18,12 @@ inspector on real data, because the loader is written against what it finds.
 | `atlas/functional/` — atoms, transport, near-field, prefilter, compress, inverse, calibration, splits | **Executed.** 144 tests, CPU |
 | `atlas/tools/inspect_capture.py` | **Executed.** 19 tests, CPU. Never run on real data |
 | `atlas/ply.py`, `atlas/model.py` | **Executed apart from the rasteriser call**, which is CUDA-only. 21 tests |
+| `atlas/config.py`, `atlas/run.py` | **Executed.** 69 tests. Config hashing, run directories, provenance, ledger |
 | `atlas/data/`, `atlas/train.py`, `atlas/render.py` | **Not written** |
 | CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 188 tests, about 20
+`make check` is the whole of what has been verified: 257 tests, about 12
 seconds, no GPU and no `gsplat` required.
 
 The one thing CPU tests cannot reach is `gsplat.rasterization` itself. Every

@@ -62,7 +62,12 @@ its predecessors.
   `docs/relighting-atlas.md`.
 - **No new required dependencies.** `atlas.functional` is pure PyTorch and must
   stay that way — it is what lets the correctness argument be checked without a
-  GPU. RAW, EXR, viewer and gsplat all live behind optional extras.
+  GPU. RAW, EXR, viewer and gsplat all live behind optional extras. The one
+  addition outside that layer is PyYAML, for configs people hand-edit.
+- **Every run is reproducible from a config hash, a commit and a data hash.**
+  Adding a knob means adding a field to a config dataclass — never reading an
+  environment variable or a global, both of which are invisible to the hash and
+  therefore to the ledger.
 
 ## Layout, and what may import what
 
@@ -70,6 +75,8 @@ its predecessors.
 atlas/functional/   pure PyTorch. Imports torch and nothing else. CPU-testable.
 atlas/tools/        standard library, plus optional Pillow/rawpy that degrade.
 atlas/ply.py        standard library. Reads a gsplat PLY for geometry init.
+atlas/config.py     typed config tree, layered YAML, the hash that names a run.
+atlas/run.py        run directories, provenance, metrics, the results ledger.
 atlas/model.py      RelightSplats + Path A render. gsplat imported lazily,
                     inside render() only, so the rest is CPU-testable.
 atlas/data/         loader.                             [not written yet]
