@@ -114,6 +114,8 @@ class RelightSplats:
         transport: Tensor,
         atom_axes: Tensor,
         atom_sharpness: Tensor,
+        specular_albedo: Optional[Tensor] = None,
+        roughness: Optional[Tensor] = None,
     ):
         num = means.shape[0]
         if means.shape != (num, 3):
@@ -144,8 +146,25 @@ class RelightSplats:
         self.scales = scales
         self.opacities = opacities
         self.transport = transport
+        if (specular_albedo is None) != (roughness is None):
+            raise ValueError(
+                "specular_albedo and roughness come as a pair: a lobe needs "
+                "both a colour and a width"
+            )
+        if specular_albedo is not None:
+            if specular_albedo.shape != (num, 3):
+                raise ValueError(
+                    f"specular_albedo must be [{num}, 3], got "
+                    f"{tuple(specular_albedo.shape)}"
+                )
+            if roughness.shape != (num,):
+                raise ValueError(
+                    f"roughness must be [{num}], got {tuple(roughness.shape)}"
+                )
         self.atom_axes = atom_axes
         self.atom_sharpness = atom_sharpness
+        self.specular_albedo = specular_albedo
+        self.roughness = roughness
 
     # --- shape and bookkeeping ---------------------------------------------
 
@@ -174,6 +193,9 @@ class RelightSplats:
                 "atom_sharpness",
             )
         }
+        for name in ("specular_albedo", "roughness"):
+            value = getattr(self, name)
+            moved[name] = None if value is None else value.to(*args, **kwargs)
         return RelightSplats(**moved)
 
     def requires_grad_(
@@ -214,6 +236,65 @@ class RelightSplats:
         self.atom_axes.div_(self.atom_axes.norm(dim=-1, keepdim=True).clamp_min(1e-12))
         self.atom_sharpness.clamp_(min=min_sharpness)
         return self
+
+    def specular_radiance(self, viewmat: Tensor, ell, ladder) -> Tensor:
+        """``[N, 3]`` from the view-dependent lobe. Zero without one.
+
+        The reflection direction is per primitive, so this is where the view
+        enters the transport -- and it enters *multiplicatively against the
+        atoms*, never against the light, which is why radiance stays linear in
+        the illumination.
+        """
+        from .functional.specular import reflect, specular_weights
+        from .functional.transport import contract_weights
+
+        if not self.has_specular:
+            return torch.zeros(
+                self.num_primitives,
+                3,
+                dtype=self.means.dtype,
+                device=self.means.device,
+            )
+        rotation = viewmat[:3, :3].to(self.means)
+        camera = -rotation.T @ viewmat[:3, 3].to(self.means)
+        normals = self.normals(camera_position=camera)
+        weights = specular_weights(
+            ladder.to(self.means.dtype),
+            reflect(camera - self.means, normals),
+            self.roughness.clamp_min(1e-3),
+        )
+        return self.specular_albedo * contract_weights(weights, ell)
+
+    @property
+    def has_specular(self) -> bool:
+        """Whether this model carries a view-dependent lobe."""
+        return self.specular_albedo is not None
+
+    def normals(self, camera_position: Optional[Tensor] = None) -> Tensor:
+        """``[N, 3]`` surface normals, from each Gaussian's shortest axis.
+
+        The convention 2DGS and GaussianShader use: a splat approximating a
+        surface is flattened against it, so its least-extended axis is the
+        surface normal. It is a good normal exactly where a Gaussian is a good
+        surface patch, and meaningless for a blob -- which is honest, since a
+        blob has no normal.
+
+        ``camera_position`` disambiguates the sign. An axis is a line, not a
+        direction, so without it half the normals point into the surface and
+        every reflection computed from them is mirrored.
+        """
+        from .reference import quaternion_to_rotation
+
+        rotation = quaternion_to_rotation(self.quats)  # [N, 3, 3], columns are axes
+        shortest = torch.argmin(self.scales, dim=-1)  # [N]
+        index = torch.arange(self.num_primitives, device=self.means.device)
+        normals = rotation[index, :, shortest]
+
+        if camera_position is not None:
+            towards = camera_position.to(self.means) - self.means
+            flip = torch.sign((normals * towards).sum(-1, keepdim=True))
+            normals = normals * torch.where(flip == 0, torch.ones_like(flip), flip)
+        return normals
 
     # --- the densification view ---------------------------------------------
 
@@ -371,6 +452,7 @@ class RelightSplats:
         *,
         chunk_size: int = 0,
         validate: bool = False,
+        ladder=None,
         **rasterization_kwargs: Any,
     ):
         """Path A: contract the transport against the light, then splat.
@@ -389,6 +471,11 @@ class RelightSplats:
                 have a temporary to save; see ``atlas.functional.transport``.
             validate: Check each chunk for non-finite values, so a diverged
                 model names the primitive instead of rendering black.
+            ladder: A :class:`~atlas.functional.specular.RoughnessLadder`.
+                Given one, and a model carrying specular parameters, the
+                view-dependent lobe is added. It stays linear in ``ell``, so
+                nothing about the exactness theorem or the light-count
+                independence changes.
             **rasterization_kwargs: Passed through to ``gsplat.rasterization``.
 
         Returns:
@@ -404,7 +491,9 @@ class RelightSplats:
 
         colors = contract_chunked(
             self.transport, ell, chunk_size=chunk_size, validate=validate
-        )  # [N, 3]
+        )
+        if ladder is not None:
+            colors = colors + self.specular_radiance(viewmat, ell, ladder)
         return rasterization(
             means=self.means,
             quats=self.quats,
@@ -430,6 +519,7 @@ class RelightSplats:
         backend: str = "auto",
         chunk_size: int = 0,
         validate: bool = False,
+        ladder=None,
         **kwargs: Any,
     ) -> Tuple[Tensor, Tensor]:
         """One view, through whichever renderer this machine can run.
@@ -458,6 +548,8 @@ class RelightSplats:
         colors = contract_chunked(
             self.transport, ell, chunk_size=chunk_size, validate=validate
         )
+        if ladder is not None:
+            colors = colors + self.specular_radiance(viewmat, ell, ladder)
 
         if backend == "reference":
             from .reference import render_reference

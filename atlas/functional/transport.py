@@ -64,6 +64,7 @@ from torch import Tensor
 
 __all__ = [
     "contract",
+    "contract_weights",
     "contract_chunked",
     "contract_screen",
     "contract_screen_chunked",
@@ -449,3 +450,41 @@ def contract_screen_chunked(
         stop = min(start + chunk_size, rows)
         out[start:stop] = contract_screen(transport[start:stop], ell)
     return out
+
+
+def contract_weights(weights: Tensor, ell: Tensor) -> Tensor:
+    """Contract shared per-primitive atom weights against the light. ``[N, 3]``.
+
+    The specular companion to :func:`contract`. Where the diffuse transport
+    carries a coefficient per colour *and* per atom, a specular lobe carries
+    one weight per atom shared across colours, with the colour supplied
+    separately by the specular albedo. That makes this an ``nk,ck->nc``
+    reduction with **no** ``[N, 3, B]`` intermediate at any point -- the
+    view-dependent term is cheaper than the view-independent one.
+
+    Args:
+        weights: ``[N, B]``, from
+            :func:`~atlas.functional.specular.specular_weights`.
+        ell: ``[3, B]`` shared light coefficients, or ``[N, 3, B]`` when each
+            primitive sees its own light.
+
+    Returns:
+        ``[N, 3]``.
+    """
+    if weights.ndim != 2:
+        raise ValueError(f"weights must be [N, B], got {tuple(weights.shape)}")
+    num, num_atoms = weights.shape
+    if ell.shape[-1] != num_atoms or ell.shape[-2] != 3:
+        raise ValueError(
+            f"ell must end in [3, {num_atoms}] to match the weights, got "
+            f"{tuple(ell.shape)}"
+        )
+    if ell.ndim == 2:
+        return torch.einsum("nk,ck->nc", weights, ell)
+    if ell.ndim == 3:
+        if ell.shape[0] != num:
+            raise ValueError(
+                f"per-primitive ell has {ell.shape[0]} rows but weights has {num}"
+            )
+        return torch.einsum("nk,nck->nc", weights, ell)
+    raise ValueError(f"ell must be [3, B] or [N, 3, B], got {tuple(ell.shape)}")

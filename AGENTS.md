@@ -19,7 +19,9 @@ fast *per light*, not per illumination. That is the gap.
 These are not style preferences. Breaking any of them breaks the method, and
 each is pinned by a named test in `tests/`.
 
-1. **Outgoing radiance is linear in the illumination.** Every term is
+1. **Outgoing radiance is linear in the illumination.** The transport may
+   depend on the *view* -- the exactness theorem only forbids it depending on
+   the *light* -- which is how `specular.py` adds gloss for free. Every term is
    `sum_k M[c,k] * ell[c,k]`. **Do not add a term that is not.** If you find
    yourself wanting a non-linear shading term, stop and read
    `docs/relighting-atlas.md` first — it is probably expressible as another
@@ -103,6 +105,8 @@ its predecessors.
 
 ```
 atlas/functional/   pure PyTorch. Imports torch and nothing else. CPU-testable.
+  specular.py       view-dependent gloss via prefiltered atoms, which keeps
+                    radiance linear in the illumination. See its docstring.
 atlas/tools/        standard library, plus optional Pillow/rawpy that degrade.
 atlas/ply.py        standard library. Reads a gsplat PLY for geometry init.
 atlas/config.py     typed config tree, layered YAML, the hash that names a run.

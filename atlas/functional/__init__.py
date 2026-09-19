@@ -62,6 +62,14 @@ from .prefilter import (
     prefilter_equirect,
     roughness_to_sharpness,
 )
+from .specular import (
+    DEFAULT_ROUGHNESS_LEVELS,
+    RoughnessLadder,
+    build_roughness_ladder,
+    min_resolvable_roughness,
+    sample_equirect,
+    specular_weights,
+)
 from .splits import Split, farthest_point_indices, split_lights, split_views
 from .transport import (
     DEFAULT_CHUNK_BYTES,
@@ -73,6 +81,7 @@ from .transport import (
     contract_chunked,
     contract_screen,
     contract_screen_chunked,
+    contract_weights,
     contraction_bytes,
     pack_transport,
     unpack_transport,
@@ -98,6 +107,12 @@ __all__ = [
     "solve_flash_offset",
     "subtract_ambient",
     # splits
+    "RoughnessLadder",
+    "build_roughness_ladder",
+    "min_resolvable_roughness",
+    "specular_weights",
+    "sample_equirect",
+    "DEFAULT_ROUGHNESS_LEVELS",
     "Split",
     "farthest_point_indices",
     "split_lights",
@@ -109,6 +124,7 @@ __all__ = [
     "contract_chunked",
     "contract_screen",
     "contract_screen_chunked",
+    "contract_weights",
     "auto_chunk",
     "check_finite",
     "contraction_bytes",

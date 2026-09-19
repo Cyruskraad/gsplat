@@ -29,11 +29,12 @@ inspector on real data, because the loader is written against what it finds.
 | `atlas/train.py`, `make smoke-cpu` | **Executed on CPU.** 23 tests. Trains; gate runs every evaluation |
 | The gate, both directions | **Executed on CPU.** 6 tests. Passes on a covered capture, fails on a sparse one |
 | Coupling detection, `split_arc`, extrapolation gate | **Executed on CPU.** 23 tests. Co-located captures are usable |
+| `atlas/functional/specular.py`, model gloss | **Executed on CPU.** 31 tests. View dependence at no cost to linearity |
 | `atlas/render.py` | **Not written** |
 | CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 585 tests, about 50
+`make check` is the whole of what has been verified: 617 tests, about 76
 seconds, no GPU and no `gsplat` required. It also happens to pass with numpy
 absent, which is how this container came back after a restart -- nothing under
 `atlas/` imports it.
@@ -62,6 +63,9 @@ From `tests/`, on CPU:
 | Chunked vs unchunked disagreement, float32, worst of 20 seeds | < 1e-6 | 2.2e-7 of output scale |
 | Gate on a covered capture (28 lights, 37 deg coverage) | pass | gap -0.04 dB |
 | Gate on a sparse capture (3 lights, 89 deg coverage) | fail | gap +8.3 dB |
+| Superposition through the full renderer, **with gloss** | structural | 1.3e-15 |
+| Homogeneity through the full renderer, **with gloss** | structural | 1.8e-15 |
+| Sharpest roughness a 64-row prefiltered map can hold | — | 0.263 |
 | Transport learning rate that converges | — | 0.02 (0.05 diverges) |
 
 ## Correction: a flash-on-camera capture is usable after all
