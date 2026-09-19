@@ -166,6 +166,26 @@ def build_model(
     start and an honest one.
     """
     num_atoms = config.atoms.count
+    if config.model.init_ground_truth:
+        blob = torch.load(
+            config.model.init_ground_truth, map_location="cpu", weights_only=False
+        )
+        axes, sharpnesses = make_sg_atoms(
+            num_atoms, sharpness=config.atoms.sharpness, device=device, dtype=dtype
+        )
+        count = blob["means"].shape[0]
+        return RelightSplats(
+            means=blob["means"].to(device=device, dtype=dtype).clone(),
+            quats=blob["quats"].to(device=device, dtype=dtype).clone(),
+            scales=blob["scales"].to(device=device, dtype=dtype).clone(),
+            opacities=blob["opacities"].to(device=device, dtype=dtype).clone(),
+            # The transport is *not* copied: recovering it is the whole task.
+            transport=torch.full(
+                (count, 3, num_atoms), 0.05 / num_atoms, device=device, dtype=dtype
+            ),
+            atom_axes=axes,
+            atom_sharpness=sharpnesses,
+        )
     if config.model.init_ply:
         model = RelightSplats.from_ply(
             config.model.init_ply,
@@ -248,6 +268,9 @@ class Trainer:
         )
         self.model = build_model(config, capture, device=self.device, dtype=dtype)
         self.model.requires_grad_(True, atoms=config.optim.learn_atoms)
+        if config.model.transport_only:
+            for name in ("means", "quats", "scales", "opacities"):
+                getattr(self.model, name).requires_grad_(False)
         self.params = self.model.as_parameter_dict()
         # Rebuild the model *around* the dict. `nn.Parameter(t)` shares storage
         # with `t` but is a new leaf in the graph, so without this the model
@@ -291,6 +314,7 @@ class Trainer:
                 eps=1e-15,
             )
             for name in PRIMITIVE_PARAMETERS
+            if self.params[name].requires_grad
         }
         if optim.learn_atoms:
             optimizers["atoms"] = torch.optim.Adam(
@@ -396,8 +420,9 @@ class Trainer:
                 f"after this point would be a measurement of nothing."
             )
         if optim.grad_clip > 0.0:
-            for name in PRIMITIVE_PARAMETERS:
-                torch.nn.utils.clip_grad_norm_([self.params[name]], optim.grad_clip)
+            for name in self.optimizers:
+                if name != "atoms":
+                    torch.nn.utils.clip_grad_norm_([self.params[name]], optim.grad_clip)
 
         for optimizer in self.optimizers.values():
             optimizer.step()
@@ -412,7 +437,9 @@ class Trainer:
 
     def _grad_norm(self) -> float:
         total = 0.0
-        for name in PRIMITIVE_PARAMETERS:
+        for name in self.optimizers:
+            if name == "atoms":
+                continue
             grad = self.params[name].grad
             if grad is not None:
                 total += float(grad.detach().pow(2).sum())

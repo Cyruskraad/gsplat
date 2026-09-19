@@ -27,11 +27,12 @@ inspector on real data, because the loader is written against what it finds.
 | `atlas/device.py` | **Executed on CPU, CUDA branch faked.** 39 tests. Detection, preflight, precision, seeding |
 | Learned atoms, `ParameterDict` densification view | **Executed on CPU.** 12 tests |
 | `atlas/train.py`, `make smoke-cpu` | **Executed on CPU.** 23 tests. Trains; gate runs every evaluation |
+| The gate, both directions | **Executed on CPU.** 3 tests. Passes on a covered capture, fails on a sparse one |
 | `atlas/render.py` | **Not written** |
 | CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 556 tests, about 33
+`make check` is the whole of what has been verified: 559 tests, about 46
 seconds, no GPU and no `gsplat` required. It also happens to pass with numpy
 absent, which is how this container came back after a restart -- nothing under
 `atlas/` imports it.
@@ -58,6 +59,40 @@ From `tests/`, on CPU:
 | Chunked contraction, peak RSS, per-primitive light, N=200k B=64 | lower | 150 MB → 11 MB |
 | Chunked contraction, peak RSS, screen space, 540x960 B=32 | lower | 198 MB → 21 MB |
 | Chunked vs unchunked disagreement, float32, worst of 20 seeds | < 1e-6 | 2.2e-7 of output scale |
+| Gate on a covered capture (28 lights, 37 deg coverage) | pass | gap -0.04 dB |
+| Gate on a sparse capture (3 lights, 89 deg coverage) | fail | gap +8.3 dB |
+| Transport learning rate that converges | — | 0.02 (0.05 diverges) |
+
+## The second finding that changes the capture protocol
+
+**The gate is a measurement of angular light coverage before it is a
+measurement of the model.**
+
+Training the transport from the *true* geometry -- so the only question is
+whether it learned transport or memorised illuminations -- gives this:
+
+| training lights | held-out light to nearest trained | held-out-view psnr/mu | gap |
+| --- | --- | --- | --- |
+| 3 | 89 deg | 15.6 | **+8.3 dB** |
+| 12 | 53 deg | 15.5 | −4.6 dB |
+| 28 | 37 deg | 15.4 | **−0.04 dB** |
+
+At three training lights the held-out light is on the far side of the sphere
+from anything the model saw, so it is extrapolating, and the gap is 8 dB. At 28
+it is interpolating and the two splits agree to 0.04 dB.
+
+**The atom count is not the driver.** With three training lights the gap is 8 dB
+or worse whether the model has four atoms or twenty-four. Adding atoms to a
+capture that does not cover the sphere does nothing; adding lights does
+everything.
+
+**What this means for the shoot.** Enough flash positions that every direction
+you want to relight from is within roughly 40 degrees of one you photographed,
+and the held-out light is chosen farthest-point, so it lands in the sparsest
+gap on purpose. Fewer than about a dozen well-spread positions cannot produce a
+meaningful gate result no matter how good the model is. It also sharpens the
+design's "train over-complete at B = 128": that is a statement about the *basis*,
+and it buys nothing unless the light coverage supports it.
 
 ## Two defects the trainer found on its first run
 

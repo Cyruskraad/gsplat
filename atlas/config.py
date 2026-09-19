@@ -125,6 +125,13 @@ class ModelConfig:
     # A fixed-light reconstruction of the same object. The single biggest
     # accelerator available for a first run.
     init_ply: Optional[str] = None
+    #: A synthetic capture's ``ground_truth.pt``. Starting from the true
+    #: geometry turns fitting the transport into the linear problem it actually
+    #: is, which is how the gate gets tested on what it claims to measure
+    #: rather than on whether the geometry converged.
+    init_ground_truth: Optional[str] = None
+    #: Freeze everything but the transport (and the basis, if it is learned).
+    transport_only: bool = False
     #: Primitives scattered when there is no PLY to start from. A poor start,
     #: and an honest one; a fixed-light reconstruction is far better.
     init_count: int = 4096

@@ -33,16 +33,20 @@ each is pinned by a named test in `tests/`.
 7. `solve_flash_offset` reports a condition number, because a degenerate capture
    yields a wrong answer with a *zero* residual.
 8. `compress_transport` is the Eckart–Young truncation.
-9. **The gate needs a floor as well as a gap.** A model that learned
+9. **A gate result is only as good as the light coverage.** Measured: with
+   the held-out light 89 degrees from anything trained the gap is +8 dB
+   whatever the atom count; at 37 degrees it is -0.04 dB. Report the coverage
+   next to the gap or the gap is uninterpretable.
+10. **The gate needs a floor as well as a gap.** A model that learned
    nothing scores equally badly on both held-out sets, so its *gap* is
    near zero and reads as a pass. `constant_baseline_psnr` is what it
    has to beat first.
-10. **A held-out-light split only means something when the light is not a
+11. **A held-out-light split only means something when the light is not a
    function of the camera.** A bracket-mounted flash makes `split_lights`
    and `split_views` select the same shots, and the gate then passes
    whatever the model learned. `SyntheticConfig.flash_mode` names the two
    cases and the manifest records `splits_are_independent`.
-11. **Chunking never changes an answer.** `contract_chunked` equals
+12. **Chunking never changes an answer.** `contract_chunked` equals
    `contract` and `contract_screen_chunked` equals `contract_screen`, at
    every chunk size, on all three light forms.
 
