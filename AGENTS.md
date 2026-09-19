@@ -73,6 +73,11 @@ its predecessors.
   allocates a full `[N, 3, B]` temporary, and `ru_maxrss` says it allocates
   nothing at all. The comment now says so, and the tests measure rather than
   argue.
+- **float32 for anything the exactness gate touches, and TF32 off.** The
+  claim is an *exact* linear operator, gated at 1e-5 in float32. TF32 keeps
+  ten mantissa bits; a contraction through it misses that gate by a margin
+  that reads as a broken method. `atlas/device.py` sets the policy and
+  enabling TF32 or AMP is a measurement, not a default.
 - **No new required dependencies.** `atlas.functional` is pure PyTorch and must
   stay that way — it is what lets the correctness argument be checked without a
   GPU. RAW, EXR, viewer and gsplat all live behind optional extras. The one
@@ -93,6 +98,8 @@ atlas/run.py        run directories, provenance, metrics, the results ledger.
 atlas/eval.py       tonemapped metrics, the two held-out splits, the gate.
 atlas/imageio.py    PNG in and out, and a bitmap font. Standard library only.
 atlas/bench.py      contraction throughput and memory, into the ledger.
+atlas/device.py     GPU detection, the memory preflight, precision policy,
+                    seeding. CUDA is never fallen back from silently.
 atlas/reference.py  a CPU rasteriser written to be obviously correct, and slow.
                     Generates the synthetic capture, runs smoke-cpu, and is the
                     one oracle for gsplat.rasterization that is not derived

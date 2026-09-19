@@ -24,11 +24,13 @@ inspector on real data, because the loader is written against what it finds.
 | `atlas/reference.py` | **Executed.** 31 tests. CPU rasteriser: oracle, generator, smoke test |
 | `atlas/data/synthetic.py` | **Executed.** 22 tests. A capture with known ground truth |
 | `atlas/data/loader.py` | **Executed.** 22 tests. Streaming reads, the sealed four-way split |
+| `atlas/device.py` | **Executed on CPU, CUDA branch faked.** 39 tests. Detection, preflight, precision, seeding |
+| Learned atoms, `ParameterDict` densification view | **Executed on CPU.** 12 tests |
 | `atlas/train.py`, `atlas/render.py` | **Not written** |
 | CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 473 tests, about 46
+`make check` is the whole of what has been verified: 524 tests, about 50
 seconds, no GPU and no `gsplat` required. It also happens to pass with numpy
 absent, which is how this container came back after a restart -- nothing under
 `atlas/` imports it.

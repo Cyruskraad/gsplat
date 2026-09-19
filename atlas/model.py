@@ -62,7 +62,26 @@ from .functional.atoms import make_sg_atoms, project_environment
 from .functional.transport import contract_chunked
 from .ply import SH_C0, read_ply
 
-__all__ = ["RelightSplats", "DEFAULT_NUM_ATOMS"]
+__all__ = [
+    "RelightSplats",
+    "DEFAULT_NUM_ATOMS",
+    "PRIMITIVE_PARAMETERS",
+    "ATOM_PARAMETERS",
+    "MIN_SHARPNESS",
+]
+
+#: The per-primitive tensors, in the order gsplat's densification expects to
+#: find them. Every one is ``[N, ...]``, so concatenating along dimension zero
+#: is always the right thing.
+PRIMITIVE_PARAMETERS = ("means", "quats", "scales", "opacities", "transport")
+
+#: The basis. ``[B, ...]``, so these must never go through densification.
+ATOM_PARAMETERS = ("atom_axes", "atom_sharpness")
+
+#: Floor on a learned sharpness. Below this an atom is so broad that it is
+#: nearly constant over the sphere and contributes only a bias, and the fit
+#: becomes ill-conditioned rather than wrong -- which is harder to notice.
+MIN_SHARPNESS = 1e-2
 
 # Near-field training needs a per-primitive [N, B] atom evaluation. At 600k
 # primitives that is 77 MB at B=32 and 307 MB at B=128, before autograd doubles
@@ -157,10 +176,93 @@ class RelightSplats:
         }
         return RelightSplats(**moved)
 
-    def requires_grad_(self, flag: bool = True) -> "RelightSplats":
-        for name in ("means", "quats", "scales", "opacities", "transport"):
+    def requires_grad_(
+        self, flag: bool = True, *, atoms: bool = False
+    ) -> "RelightSplats":
+        """Turn gradients on. ``atoms`` is the L in ATLAS and is opt-in.
+
+        The basis is held out by default so that a first run has a fixed-basis
+        baseline to attribute any later gain to. Learning it is a change to the
+        method, not a tuning knob, and it should be measured as one.
+        """
+        for name in PRIMITIVE_PARAMETERS:
             getattr(self, name).requires_grad_(flag)
+        for name in ATOM_PARAMETERS:
+            getattr(self, name).requires_grad_(flag and atoms)
         return self
+
+    @torch.no_grad()
+    def normalise_atoms_(
+        self, *, min_sharpness: float = MIN_SHARPNESS
+    ) -> "RelightSplats":
+        """Project the basis back onto its constraints, in place.
+
+        An atom is a spherical Gaussian ``exp(lambda (w . xi - 1))``: ``xi``
+        must be a unit vector or the lobe is both rotated and rescaled by the
+        same number, and ``lambda`` must stay positive or the lobe inverts into
+        a trough that grows without bound away from its axis.
+
+        This is projected gradient descent -- the step is unconstrained and the
+        projection follows it -- rather than an ``exp`` or softplus
+        reparameterisation. The reason is legibility: ``atom_sharpness`` in a
+        checkpoint is then the ``lambda`` the mathematics uses, and
+        ``atom_axes`` really are unit vectors, so both invariants can be checked
+        on the file rather than inferred through a transform.
+
+        Call it after every ``optimizer.step()`` that touched the atoms.
+        """
+        self.atom_axes.div_(self.atom_axes.norm(dim=-1, keepdim=True).clamp_min(1e-12))
+        self.atom_sharpness.clamp_(min=min_sharpness)
+        return self
+
+    # --- the densification view ---------------------------------------------
+
+    def as_parameter_dict(self) -> "torch.nn.ParameterDict":
+        """The per-primitive tensors, as gsplat's strategies want them.
+
+        ``gsplat.strategy.ops`` special-cases ``means``, ``scales`` and
+        ``opacities`` by name and treats every other entry generically --
+        ``p[sel].repeat([2] + [1] * (p.dim() - 1))`` -- so ``transport``
+        ``[N, 3, B]`` is carried through a split or a clone with no code at all.
+        That is exactly the reuse the design counts on.
+
+        The atoms are **not** in here. They are ``[B, ...]``, not ``[N, ...]``,
+        and densification concatenates along dimension zero: including them
+        would silently grow the basis every time a primitive split.
+        """
+        return torch.nn.ParameterDict(
+            {
+                name: torch.nn.Parameter(
+                    getattr(self, name), requires_grad=getattr(self, name).requires_grad
+                )
+                for name in PRIMITIVE_PARAMETERS
+            }
+        )
+
+    def atom_parameters(self) -> Dict[str, Tensor]:
+        """The basis, which lives in its own optimiser group."""
+        return {name: getattr(self, name) for name in ATOM_PARAMETERS}
+
+    @classmethod
+    def from_parameter_dict(
+        cls,
+        params: "torch.nn.ParameterDict",
+        atom_axes: Tensor,
+        atom_sharpness: Tensor,
+    ) -> "RelightSplats":
+        """Rebuild a model around a dict that densification may have replaced.
+
+        No copy: the parameters are taken as they are, so the model and the
+        optimiser keep referring to the same storage.
+        """
+        missing = [name for name in PRIMITIVE_PARAMETERS if name not in params]
+        if missing:
+            raise ValueError(f"the parameter dict is missing {missing}")
+        return cls(
+            **{name: params[name] for name in PRIMITIVE_PARAMETERS},
+            atom_axes=atom_axes,
+            atom_sharpness=atom_sharpness,
+        )
 
     def parameter_bytes(self) -> Dict[str, int]:
         """Bytes per parameter block, so a memory surprise arrives early."""

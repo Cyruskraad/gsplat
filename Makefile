@@ -35,7 +35,7 @@ format:
 # py_compile does not evaluate a tyro dataclass's annotations, so a missing
 # import there compiles cleanly and breaks on first run. This catches it.
 imports:
-	$(PYTHON) -c "import atlas, atlas.functional, atlas.ply, atlas.model, atlas.config, atlas.run, atlas.eval, atlas.imageio, atlas.bench, atlas.reference, atlas.data, atlas.tools.inspect_capture"
+	$(PYTHON) -c "import atlas, atlas.functional, atlas.ply, atlas.model, atlas.config, atlas.run, atlas.eval, atlas.imageio, atlas.bench, atlas.reference, atlas.device, atlas.data, atlas.tools.inspect_capture"
 
 smoke-cpu:
 	@echo "not yet implemented -- lands with atlas/train.py (T4)"; exit 1

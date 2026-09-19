@@ -238,3 +238,58 @@ def test_a_loaded_model_renders_something(tmp_path):
     reloaded = RelightSplats.load(path, device=DEVICE)
     again, _, _ = reloaded.render(viewmats, Ks, WIDTH, HEIGHT, _light(6))
     assert float((again - rendered).abs().max()) == 0.0
+
+
+# --- densification carries the transport ------------------------------------
+
+
+def test_gsplat_densification_carries_the_transport_through_a_split():
+    """The reuse the design counts on, checked against the real gsplat code.
+
+    ``tests/test_model.py`` checks our side of the contract -- that every entry
+    in the parameter dict is indexed by primitive -- by applying the same rule
+    by hand. This runs gsplat's actual ``ops.split`` and confirms it does what
+    we assumed: no code of ours is involved in carrying ``[N, 3, B]`` through,
+    and none should need to be.
+    """
+    import pytest
+    import torch
+
+    ops = pytest.importorskip("gsplat.strategy.ops")
+
+    from atlas.functional.atoms import make_sg_atoms
+    from atlas.model import PRIMITIVE_PARAMETERS, RelightSplats
+
+    num, atoms = 12, 9
+    axes, sharpnesses = make_sg_atoms(atoms)
+    model = RelightSplats(
+        means=torch.randn(num, 3),
+        quats=torch.nn.functional.normalize(torch.randn(num, 4), dim=-1),
+        scales=torch.full((num, 3), -2.0),
+        opacities=torch.zeros(num),
+        transport=torch.randn(num, 3, atoms),
+        atom_axes=axes,
+        atom_sharpness=sharpnesses,
+    ).requires_grad_(True)
+
+    params = model.as_parameter_dict()
+    optimizers = {
+        name: torch.optim.Adam([{"params": [params[name]], "lr": 1e-3, "name": name}])
+        for name in PRIMITIVE_PARAMETERS
+    }
+    mask = torch.zeros(num, dtype=torch.bool)
+    mask[torch.tensor([2, 5, 7])] = True
+    kept = torch.tensor([i for i in range(num) if not mask[i]])
+    before = params["transport"].detach().clone()
+
+    ops.split(params=params, optimizers=optimizers, state={}, mask=mask)
+
+    # Nine survivors plus two copies of each of the three split primitives.
+    assert params["transport"].shape == (num - 3 + 6, 3, atoms)
+    assert torch.allclose(params["transport"][: num - 3], before[kept])
+
+    rebuilt = RelightSplats.from_parameter_dict(
+        params, model.atom_axes, model.atom_sharpness
+    )
+    assert rebuilt.num_primitives == 15
+    assert rebuilt.num_atoms == atoms  # the basis did not grow with the scene

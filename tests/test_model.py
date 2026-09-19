@@ -308,3 +308,163 @@ def test_to_and_requires_grad_cover_every_parameter():
     moved = model.to(torch.float32)
     assert moved.transport.dtype == torch.float32
     assert moved.atom_axes.dtype == torch.float32
+
+
+# --- the densification view, and the learned basis --------------------------
+
+
+def _splats(num=8, atoms=6, seed=0):
+    from atlas.functional.atoms import make_sg_atoms
+
+    generator = torch.Generator().manual_seed(seed)
+    axes, sharpnesses = make_sg_atoms(atoms)
+    return RelightSplats(
+        means=torch.randn(num, 3, generator=generator),
+        quats=torch.randn(num, 4, generator=generator),
+        scales=torch.randn(num, 3, generator=generator),
+        opacities=torch.randn(num, generator=generator),
+        transport=torch.randn(num, 3, atoms, generator=generator),
+        atom_axes=axes,
+        atom_sharpness=sharpnesses,
+    )
+
+
+def test_every_entry_in_the_parameter_dict_is_indexed_by_primitive():
+    """The contract that makes gsplat's generic densification path correct.
+
+    ``gsplat.strategy.ops`` names only ``means``, ``scales`` and ``opacities``;
+    everything else it splits as ``p[sel].repeat([2] + [1] * (p.dim() - 1))``
+    and concatenates along dimension zero. That is right for any tensor whose
+    first dimension is the primitive, and wrong for any tensor whose is not.
+    """
+    from atlas.model import PRIMITIVE_PARAMETERS
+
+    model = _splats(num=11, atoms=5)
+    params = model.as_parameter_dict()
+    assert set(params.keys()) == set(PRIMITIVE_PARAMETERS)
+    for name, tensor in params.items():
+        assert tensor.shape[0] == 11, (name, tuple(tensor.shape))
+
+
+def test_the_atoms_are_kept_out_of_the_densification_view():
+    """They are ``[B, ...]``. Concatenating them along dimension zero would
+    grow the basis every time a primitive split, silently."""
+    from atlas.model import ATOM_PARAMETERS
+
+    params = _splats().as_parameter_dict()
+    for name in ATOM_PARAMETERS:
+        assert name not in params
+
+
+def test_the_parameter_dict_shares_storage_rather_than_copying():
+    model = _splats()
+    params = model.as_parameter_dict()
+    params["transport"].data.add_(1.0)
+    assert torch.allclose(model.transport, params["transport"].data)
+
+
+def test_a_model_rebuilds_around_a_dict_that_densification_replaced():
+    """What a training step does after a split: the dict is new tensors, the
+    basis is not, and the model is a view over both."""
+    model = _splats(num=6, atoms=4)
+    params = model.as_parameter_dict()
+    grown = torch.nn.ParameterDict(
+        {
+            name: torch.nn.Parameter(torch.cat([p, p], dim=0))
+            for name, p in params.items()
+        }
+    )
+    rebuilt = RelightSplats.from_parameter_dict(
+        grown, model.atom_axes, model.atom_sharpness
+    )
+    assert rebuilt.num_primitives == 12
+    assert rebuilt.num_atoms == 4
+    assert rebuilt.transport.shape == (12, 3, 4)
+
+
+def test_rebuilding_from_an_incomplete_dict_names_what_is_missing():
+    model = _splats()
+    params = model.as_parameter_dict()
+    del params["transport"]
+    with pytest.raises(ValueError, match=r"missing \['transport'\]"):
+        RelightSplats.from_parameter_dict(params, model.atom_axes, model.atom_sharpness)
+
+
+def test_the_transport_survives_the_generic_split_rule_with_its_channels_intact():
+    """Applied here exactly as ``gsplat.strategy.ops.split`` applies it, so the
+    reuse claim is checked without needing CUDA to check it."""
+    model = _splats(num=10, atoms=7)
+    transport = model.as_parameter_dict()["transport"]
+    selected = torch.tensor([1, 4, 9])
+    repeats = [2] + [1] * (transport.dim() - 1)
+    split = transport[selected].repeat(repeats)
+    assert split.shape == (6, 3, 7)
+    assert torch.equal(split[:3], transport[selected])
+    assert torch.equal(split[3:], transport[selected])
+
+
+# --- learned atoms ----------------------------------------------------------
+
+
+def test_the_basis_is_held_out_of_the_gradient_by_default():
+    """A first run needs a fixed-basis baseline to attribute a later gain to.
+    Learning the basis is a change to the method, not a tuning knob."""
+    model = _splats().requires_grad_(True)
+    assert model.transport.requires_grad is True
+    assert model.atom_axes.requires_grad is False
+    assert model.atom_sharpness.requires_grad is False
+
+
+def test_the_basis_becomes_trainable_when_asked_for():
+    model = _splats().requires_grad_(True, atoms=True)
+    assert model.atom_axes.requires_grad and model.atom_sharpness.requires_grad
+
+
+def test_a_learned_axis_is_projected_back_onto_the_unit_sphere():
+    """An atom is ``exp(lambda (w . xi - 1))``. A non-unit ``xi`` rotates and
+    rescales the lobe by the same number, so the two parameters stop meaning
+    separate things."""
+    model = _splats()
+    model.atom_axes.data.mul_(3.7)
+    assert float((model.atom_axes.norm(dim=-1) - 1).abs().max()) > 2.0  # premise
+    model.normalise_atoms_()
+    assert float((model.atom_axes.norm(dim=-1) - 1).abs().max()) < 1e-6
+
+
+def test_a_learned_sharpness_is_kept_positive():
+    """A negative lambda inverts the lobe into a trough that grows without
+    bound away from its axis."""
+    from atlas.model import MIN_SHARPNESS
+
+    model = _splats()
+    model.atom_sharpness.data.fill_(-42.0)
+    model.normalise_atoms_()
+    assert float(model.atom_sharpness.min()) == pytest.approx(MIN_SHARPNESS)
+
+
+def test_the_projection_leaves_an_already_valid_basis_alone():
+    model = _splats()
+    axes, sharpnesses = model.atom_axes.clone(), model.atom_sharpness.clone()
+    model.normalise_atoms_()
+    assert torch.allclose(model.atom_axes, axes, atol=1e-7)
+    assert torch.equal(model.atom_sharpness, sharpnesses)
+
+
+def test_a_gradient_reaches_the_basis_and_the_projection_keeps_it_legal():
+    """The L in ATLAS, end to end: a loss that depends on the atoms moves them,
+    and the projection puts them back on the constraint set."""
+    from atlas.functional.atoms import evaluate_atoms
+
+    model = _splats(num=4, atoms=5).requires_grad_(True, atoms=True)
+    directions = torch.nn.functional.normalize(torch.randn(16, 3), dim=-1)
+    evaluate_atoms(directions, model.atom_axes, model.atom_sharpness).sum().backward()
+
+    assert model.atom_axes.grad is not None
+    assert float(model.atom_axes.grad.abs().max()) > 0.0
+    before = model.atom_axes.detach().clone()
+    with torch.no_grad():
+        model.atom_axes.add_(0.3 * model.atom_axes.grad)
+    model.normalise_atoms_()
+    assert not torch.allclose(model.atom_axes, before)  # it moved
+    legality = (model.atom_axes.detach().norm(dim=-1) - 1).abs().max()
+    assert float(legality) < 1e-6  # and is legal
