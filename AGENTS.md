@@ -41,12 +41,16 @@ each is pinned by a named test in `tests/`.
    nothing scores equally badly on both held-out sets, so its *gap* is
    near zero and reads as a pass. `constant_baseline_psnr` is what it
    has to beat first.
-11. **A held-out-light split only means something when the light is not a
+11. **Measure the capture geometry; never trust a flag for it.** A flash on
+   the camera separates light from view by 3-11 degrees, so the view/light
+   split degenerates. `Capture.coupling_report()` classifies it from the
+   poses and the split scheme follows the measurement.
+12. **A held-out-light split only means something when the light is not a
    function of the camera.** A bracket-mounted flash makes `split_lights`
    and `split_views` select the same shots, and the gate then passes
    whatever the model learned. `SyntheticConfig.flash_mode` names the two
    cases and the manifest records `splits_are_independent`.
-12. **Chunking never changes an answer.** `contract_chunked` equals
+13. **Chunking never changes an answer.** `contract_chunked` equals
    `contract` and `contract_screen_chunked` equals `contract_screen`, at
    every chunk size, on all three light forms.
 

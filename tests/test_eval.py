@@ -514,7 +514,7 @@ def test_the_table_shows_both_splits_and_the_verdict():
     text = _report(31.0, 27.0).format_table()
     assert "held-out view" in text and "held-out light" in text
     assert "psnr/mu" in text and "FAIL" in text
-    assert "positive gap = the held-out-light split did worse" in text
+    assert "positive gap = the held-out light split did worse" in text
 
 
 def test_the_table_survives_an_infinite_metric():

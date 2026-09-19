@@ -160,3 +160,87 @@ def split_lights(light_directions: Tensor, num_val: int, num_test: int) -> Split
     if float((norms - 1.0).abs().max()) > 1e-3:
         raise ValueError("light_directions must be unit vectors")
     return _split(light_directions, num_val, num_test)
+
+
+def split_arc(directions: Tensor, fraction: float = 0.2, *, start: int = 0) -> Split:
+    """Hold out a **contiguous** angular sector, for extrapolation.
+
+    The farthest-point splits above hold out samples that are *surrounded* by
+    training samples, which measures interpolation. That is the right question
+    for a capture where views and lights vary independently, and the wrong one
+    for a co-located capture, where holding out a light holds out its view too
+    and the two numbers become one number.
+
+    What a co-located capture can still answer is the question relighting
+    actually asks: **can the transport predict directions it never saw?**
+    Removing a contiguous arc leaves the held-out directions *outside* the
+    trained region rather than between trained samples, so the score is an
+    extrapolation score. Reported next to a farthest-point interpolation score,
+    the difference is the same claim the view/light gap made, on splits this
+    data supports.
+
+    Selection is deterministic and takes no seed. Samples are ordered by
+    azimuth about the axis of least variance -- the natural traversal order of
+    an orbit, recovered from the samples rather than assumed from a filename --
+    and a contiguous run of that order becomes the test set.
+
+    Args:
+        directions: ``[N, D]`` sample coordinates: camera centres, light
+            directions, or anything else with an angular order.
+        fraction: Share of the samples to hold out, in ``(0, 1)``.
+        start: Which position in the azimuthal order the arc begins at, so a
+            second disjoint arc can be taken from the same capture.
+
+    Returns:
+        A :class:`Split` whose ``val`` is empty: an arc is one contiguous
+        region, and carving a validation set out of it would either break the
+        contiguity that makes it an extrapolation test or sit inside the test
+        arc and leak.
+    """
+    if directions.ndim != 2:
+        raise ValueError(f"directions must be [N, D], got {tuple(directions.shape)}")
+    num = directions.shape[0]
+    if not 0.0 < fraction < 1.0:
+        raise ValueError(f"fraction must be in (0, 1), got {fraction}")
+    count = max(1, int(round(num * fraction)))
+    if count >= num:
+        raise ValueError(
+            f"a fraction of {fraction} would hold out every one of {num} samples"
+        )
+
+    order = azimuthal_order(directions)
+    held = [int(order[(start + i) % num]) for i in range(count)]
+    held_set = set(held)
+
+    def to_tensor(ids) -> Tensor:
+        return torch.tensor(sorted(ids), dtype=torch.long, device=directions.device)
+
+    return Split(
+        train=to_tensor(i for i in range(num) if i not in held_set),
+        val=to_tensor([]),
+        test=to_tensor(held),
+    )
+
+
+def azimuthal_order(points: Tensor) -> Tensor:
+    """Indices ordering ``points`` by angle about their own axis of least spread.
+
+    An orbit is planar to within its elevation jitter, so the direction the
+    samples vary *least* along is the orbit's axis. Recovering it from the data
+    rather than assuming world ``+z`` means a capture shot around a horizontal
+    axis, or tilted, still orders correctly -- and a handheld pass is never
+    exactly level.
+    """
+    if points.ndim != 2 or points.shape[0] < 2:
+        raise ValueError(
+            f"need at least two points of shape [N, D], got {tuple(points.shape)}"
+        )
+    centred = (points - points.mean(dim=0)).to(torch.float64)
+    # Right singular vectors are ordered by decreasing spread, so the last is
+    # the axis the samples vary least along.
+    _, _, basis = torch.linalg.svd(centred, full_matrices=False)
+    axis = basis[-1]
+    first, second = basis[0], basis[1]
+    angles = torch.atan2(centred @ second, centred @ first)
+    del axis  # named for the reader; the plane is what the ordering needs
+    return torch.argsort(angles)

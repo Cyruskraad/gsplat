@@ -467,7 +467,7 @@ class Trainer:
         """
         splits: Dict[str, SplitMetrics] = {}
         entries: List[SheetEntry] = []
-        for name in SET_NAMES:
+        for name in self.split.names:
             indices = self.split[name]
             if not indices:
                 splits[name] = SplitMetrics(name=name, count=0, metrics={})
@@ -500,14 +500,26 @@ class Trainer:
             comparison_sheet(
                 self.run.renders / f"sheet-{self.state.step:06d}.png", entries
             )
+
+        # The pair whose difference is the gate, named by what the capture can
+        # support. A co-located capture has no independent light split at all,
+        # so asking for one would compare two empty sets and pass vacuously.
+        if self.split.scheme == "extrapolation":
+            first, second = "held_out_interpolated", "held_out_extrapolated"
+            pairing = "interpolation_extrapolation"
+        else:
+            first, second = "held_out_view", "held_out_light"
+            pairing = "view_light"
+
         return RelightingReport(
-            held_out_view=splits["held_out_view"],
-            held_out_light=splits["held_out_light"],
-            train=splits["train"],
-            baseline_psnr=self.baseline_psnr(),
+            held_out_view=splits[first],
+            held_out_light=splits[second],
+            train=splits.get("train"),
+            baseline_psnr=self.baseline_psnr(first),
+            pairing=pairing,
         )
 
-    def baseline_psnr(self) -> Optional[float]:
+    def baseline_psnr(self, set_name: str = "held_out_view") -> Optional[float]:
         """What a constant image already scores on the held-out views.
 
         Computed once and cached: it depends only on the data. Without it the
@@ -515,9 +527,9 @@ class Trainer:
         equally hopeless on both splits -- which is exactly what an untrained
         one is.
         """
-        if self._baseline is None and self.split.held_out_view:
+        if self._baseline is None and self.split[set_name]:
             references, masks = [], []
-            for index in self.split.held_out_view:
+            for index in self.split[set_name]:
                 reference, mask = self._reference(index)
                 references.append(reference.cpu())
                 masks.append(None if mask is None else mask.cpu())

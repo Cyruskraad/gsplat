@@ -27,12 +27,13 @@ inspector on real data, because the loader is written against what it finds.
 | `atlas/device.py` | **Executed on CPU, CUDA branch faked.** 39 tests. Detection, preflight, precision, seeding |
 | Learned atoms, `ParameterDict` densification view | **Executed on CPU.** 12 tests |
 | `atlas/train.py`, `make smoke-cpu` | **Executed on CPU.** 23 tests. Trains; gate runs every evaluation |
-| The gate, both directions | **Executed on CPU.** 3 tests. Passes on a covered capture, fails on a sparse one |
+| The gate, both directions | **Executed on CPU.** 6 tests. Passes on a covered capture, fails on a sparse one |
+| Coupling detection, `split_arc`, extrapolation gate | **Executed on CPU.** 23 tests. Co-located captures are usable |
 | `atlas/render.py` | **Not written** |
 | CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 559 tests, about 46
+`make check` is the whole of what has been verified: 585 tests, about 50
 seconds, no GPU and no `gsplat` required. It also happens to pass with numpy
 absent, which is how this container came back after a restart -- nothing under
 `atlas/` imports it.
@@ -62,6 +63,40 @@ From `tests/`, on CPU:
 | Gate on a covered capture (28 lights, 37 deg coverage) | pass | gap -0.04 dB |
 | Gate on a sparse capture (3 lights, 89 deg coverage) | fail | gap +8.3 dB |
 | Transport learning rate that converges | — | 0.02 (0.05 diverges) |
+
+## Correction: a flash-on-camera capture is usable after all
+
+The existing datasets have the flash mounted on the camera. I had said that
+makes the gate meaningless and the capture would have to be reshot. That was
+wrong, and the pipeline now handles it.
+
+**Measured:** a hotshoe flash 5-20 cm from the lens, object at a metre, gives
+**3-11 degrees** of view-to-light separation. There is nothing to decouple. But
+ATLAS's model has no view dependence at all -- radiance is `M . ell`, a function
+of the incident illumination only -- so one observation per incident direction
+is *exactly* what determines it. The light orbits with the camera, so the
+transport is constrained over the whole captured arc. **The data and the
+representation are well matched.**
+
+What is lost is the view/light split, and the replacement is
+**interpolation against extrapolation**: farthest-point hold-outs surrounded by
+training shots, against a contiguous arc the model never saw. Relighting *is*
+extrapolation in the incident direction, so the difference tests the same claim.
+Measured on synthetic co-located captures with the true geometry:
+
+| views | scheme | interpolated | extrapolated | gap | verdict |
+| --- | --- | --- | --- | --- | --- |
+| 40 | extrapolation | 28.99 | 30.43 | −1.44 dB | **PASS** |
+| 8 | extrapolation | 11.85 | 6.94 | +4.91 dB | **FAIL** |
+
+`Capture.coupling_report()` classifies a capture from its own poses -- on the
+synthetic bracket capture, 4.6° median and a 13 cm implied offset against a
+planted 12.9 cm -- and the split scheme follows the measurement rather than a
+manifest flag.
+
+**What remains true:** view-independence is unfalsifiable from co-located data
+and is wrong for glossy materials, since what gets fitted is the retroreflective
+slice. That is the next thing to measure and then to fix.
 
 ## The second finding that changes the capture protocol
 

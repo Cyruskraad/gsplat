@@ -170,3 +170,97 @@ def test_the_gap_follows_the_light_coverage_and_not_the_atom_count(tmp_path):
 
     _, trainer, covered = _fit(tmp_path, "covered-4", num_lights=30, atoms=4, steps=400)
     assert covered.gaps["psnr/mu"] < few_atoms.gaps["psnr/mu"] - 4.0
+
+
+# --- the gate on a co-located capture, which is the data that exists --------
+
+
+def _fit_colocated(tmp_path, tag, *, num_views, atoms=12, steps=500):
+    """Fit transport from true geometry on a flash-on-camera capture."""
+    generate_capture(
+        tmp_path / tag,
+        dataclasses.replace(
+            SCENE,
+            num_views=num_views,
+            num_lights=num_views,
+            flash_mode="bracket",
+            flash_offset=(0.12, -0.04, 0.02),
+        ),
+    )
+    config = from_dict(
+        Config,
+        {
+            "atoms": {"count": atoms},
+            "data": {
+                "capture_dir": str(tmp_path / tag),
+                "num_test_views": 2,
+                "num_test_lights": 2,
+            },
+            "model": {
+                "init_ground_truth": str(tmp_path / tag / "ground_truth.pt"),
+                "transport_only": True,
+            },
+            "optim": {
+                "max_steps": steps,
+                "eval_every": 0,
+                "save_every": 0,
+                "ssim_weight": 0.0,
+                "warmup_steps": 20,
+                "transport_lr": TRANSPORT_LR,
+                "batch_size": 2,
+            },
+            "runtime": {"backend": "reference"},
+            "run_root": str(tmp_path / "runs"),
+        },
+    )
+    capture = load_capture(config.data.capture_dir)
+    trainer = Trainer(config, capture, RunDirectory.create(config, name=tag))
+    order = list(trainer.split.train)
+    generator = torch.Generator().manual_seed(0)
+    for _ in range(steps):
+        picks = torch.randint(len(order), (2,), generator=generator)
+        trainer.step([order[int(i)] for i in picks])
+    return capture, trainer, trainer.evaluate()
+
+
+@pytest.mark.slow
+def test_a_co_located_capture_can_still_produce_a_meaningful_gate(tmp_path):
+    """The data that exists, and the result that decides whether it is usable.
+
+    The flash is on the camera, so holding out a light holds out its view and
+    the view/light pair collapses. What survives is interpolation against
+    extrapolation, and it discriminates: measured at 40 views the two agree to
+    1.4 dB and the gate passes; at 8 views the extrapolated arc trails by 4.9 dB
+    and it fails.
+    """
+    _, trainer, report = _fit_colocated(tmp_path, "dense", num_views=40)
+
+    assert trainer.split.scheme == "extrapolation"
+    assert report.pairing == "interpolation_extrapolation"
+    assert report.held_out_view["psnr/mu"] > report.baseline_psnr + 2.0
+    verdict = report.gate()
+    assert verdict.passed, (verdict.gap_db, verdict.reasons)
+
+
+@pytest.mark.slow
+def test_a_sparse_co_located_capture_fails_extrapolation(tmp_path):
+    """Eight positions around the orbit leave the removed arc far from anything
+    trained, and the transport cannot reach it."""
+    _, trainer, report = _fit_colocated(tmp_path, "sparse", num_views=8)
+
+    assert trainer.split.scheme == "extrapolation"
+    verdict = report.gate()
+    assert not verdict.passed
+    assert report.gaps["psnr/mu"] > 2.0, report.gaps["psnr/mu"]
+
+
+@pytest.mark.slow
+def test_the_verdict_says_extrapolation_rather_than_memorisation(tmp_path):
+    """The diagnosis has to match the experiment. On a co-located capture
+    'reproducing illuminations it was shown' is not a statement the data can
+    support, because every held-out shot has an unseen light by construction."""
+    _, _, report = _fit_colocated(tmp_path, "sparse2", num_views=8, steps=300)
+    reasons = " ".join(report.gate().reasons)
+    if "trails" in reasons:
+        assert "does not extrapolate" in reasons
+        assert "memoris" not in reasons

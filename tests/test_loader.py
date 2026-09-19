@@ -218,32 +218,43 @@ def test_asking_for_an_unknown_set_lists_the_four(capture):
 # --- the finding, at the loader --------------------------------------------
 
 
-def test_a_bracket_captures_held_out_light_frames_are_also_at_unseen_cameras(tmp_path):
-    """The consequence of the protocol finding, stated as what is actually true.
+def test_a_bracket_capture_is_routed_away_from_the_split_it_cannot_support(tmp_path):
+    """What the loader now does about the degeneracy, rather than exhibiting it.
 
-    My first version of this asserted the two sets come back empty. They do
-    not: the view split is farthest-point over camera *centres* and the light
-    split is farthest-point over light *directions*, so even with the flash
-    bolted to the camera the two selections need not pick the same indices, and
-    frames land in both buckets.
-
-    What is true is worse. In bracket mode frame *i* uses view *i* and light
-    *i*, so if view *i* is held out then frame *i* is not in training and light
-    *i* was therefore never seen either. Every held-out frame has an unseen
-    camera **and** an unseen light, whichever bucket it landed in. The two
-    numbers measure the same thing and their difference measures nothing about
-    transport.
+    The measurement says the flash is on the camera, so the four-way cut is
+    skipped entirely and the capture is split into interpolation against
+    extrapolation. The view/light sets are empty because nothing filled them,
+    not because the frames vanished.
     """
     config = dataclasses.replace(GRID, flash_mode="bracket", num_views=8)
     generate_capture(tmp_path / "cap", config, write_images=False)
     capture = load_capture(tmp_path / "cap")
-    assert capture.splits_are_independent is False
+    assert capture.coupling_report().verdict == "co_located"
 
     split = capture.split()
+    assert split.scheme == "extrapolation"
+    assert split.held_out_view == () and split.held_out_light == ()
+    assert len(split.held_out_extrapolated) > 0
+    assert sum(split.counts().values()) == len(capture)
+
+
+def test_forcing_the_four_way_split_on_a_bracket_capture_shows_why_it_is_refused(
+    tmp_path,
+):
+    """The degeneracy itself, kept because it is why the routing above exists.
+
+    In bracket mode frame *i* uses view *i* and light *i*, so if view *i* is
+    held out then frame *i* is not in training and light *i* was never seen
+    either. Every held-out frame has an unseen camera **and** an unseen light,
+    whichever bucket it landed in, so the two numbers measure the same thing.
+    """
+    config = dataclasses.replace(GRID, flash_mode="bracket", num_views=8)
+    generate_capture(tmp_path / "cap", config, write_images=False)
+    capture = load_capture(tmp_path / "cap")
+
+    split = capture.split(scheme="independent", path=tmp_path / "forced.json")
     trained_views = {capture.frames[i].view_index for i in split.train}
     trained_lights = {capture.frames[i].light_index for i in split.train}
-
-    # The premise: the buckets are not empty, so this is not vacuous.
     assert len(split.held_out_view) > 0 and len(split.held_out_light) > 0
 
     for name in ("held_out_view", "held_out_light", "held_out_both"):

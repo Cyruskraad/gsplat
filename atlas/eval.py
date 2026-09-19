@@ -716,23 +716,37 @@ def _is_lower_better(key: str) -> bool:
 
 @dataclass(frozen=True)
 class RelightingReport:
-    """Held-out views and held-out lights, reported together.
+    """Two held-out sets, reported together, and the gate between them.
 
-    Together because apart they are misleading. Novel-view quality on its own
-    says nothing about whether the model learned transport, and novel-light
-    quality on its own cannot distinguish a relighting failure from a
-    reconstruction that was never any good. The pair, and specifically their
-    difference, is the measurement.
+    Together because apart they are misleading. One number cannot distinguish a
+    model that learned transport from one that memorised illuminations.
+
+    **Which two depends on what the capture can support.** When lights and views
+    vary independently it is held-out view against held-out light. When the
+    flash is on the camera they are the same measurement, and the pair becomes
+    **interpolation against extrapolation**: hold-outs surrounded by training
+    samples against a contiguous arc the model never saw. Relighting is
+    extrapolation in the incident direction, so that difference tests the same
+    claim on splits a co-located capture actually has. Both are the same
+    dataclass and the same gate; only the names change.
     """
 
     held_out_view: SplitMetrics
     held_out_light: SplitMetrics
     train: Optional[SplitMetrics] = None
-    #: What a constant image already scores on the held-out-view set, from
+    #: What a constant image already scores on the first held-out set, from
     #: :func:`constant_baseline_psnr`. Supplying it turns the gate from "the two
-    #: splits agree" into "the two splits agree *and* the model reconstructs",
-    #: which are very different claims about a model that has not converged.
+    #: sets agree" into "they agree *and* the model reconstructs", which are
+    #: very different claims about a model that has not converged.
     baseline_psnr: Optional[float] = None
+    #: "view_light" or "interpolation_extrapolation" -- what the two sets are.
+    pairing: str = "view_light"
+
+    @property
+    def labels(self) -> Tuple[str, str]:
+        if self.pairing == "interpolation_extrapolation":
+            return ("interpolated", "extrapolated")
+        return ("held-out view", "held-out light")
 
     @property
     def gaps(self) -> Dict[str, float]:
@@ -800,10 +814,17 @@ class RelightingReport:
             if math.isnan(gap):
                 reasons.append(f"{key} is not available in both splits")
             elif gap > threshold:
+                first, second = self.labels
+                diagnosis = (
+                    "the model is reproducing illuminations it was shown, not "
+                    "transport"
+                    if self.pairing == "view_light"
+                    else "the transport does not extrapolate past the arc it "
+                    "was trained on, which is what relighting asks of it"
+                )
                 reasons.append(
-                    f"held-out-light psnr trails held-out-view by {gap:.3f} dB, "
-                    f"over the {threshold:.3f} dB budget: the model is "
-                    f"reproducing illuminations it was shown, not transport"
+                    f"{second} psnr trails {first} by {gap:.3f} dB, over the "
+                    f"{threshold:.3f} dB budget: {diagnosis}"
                 )
         return GateResult(
             passed=not reasons,
@@ -816,8 +837,15 @@ class RelightingReport:
     def as_row(self, **extra: Any) -> Dict[str, Any]:
         """Flatten to one ledger row: both splits, the gaps, and the gate."""
         row: Dict[str, Any] = {}
-        row.update(self.held_out_view.as_row("heldout_view"))
-        row.update(self.held_out_light.as_row("heldout_light"))
+        first, second = self.labels
+        prefixes = (
+            ("heldout_view", "heldout_light")
+            if self.pairing == "view_light"
+            else ("interpolated", "extrapolated")
+        )
+        row["pairing"] = self.pairing
+        row.update(self.held_out_view.as_row(prefixes[0]))
+        row.update(self.held_out_light.as_row(prefixes[1]))
         if self.train is not None:
             row.update(self.train.as_row("train"))
         row.update({f"gap/{k}": v for k, v in self.gaps.items()})
@@ -832,7 +860,8 @@ class RelightingReport:
 
     def format_table(self, *, precision: int = 4) -> str:
         """The side-by-side table, for a log or a terminal."""
-        columns = ["held-out view", "held-out light", "gap"]
+        first, second = self.labels
+        columns = [first, second, "gap"]
         if self.train is not None:
             columns.insert(0, "train")
         keys = [k for k in self.held_out_view.metrics if k not in INFORMATIONAL]
@@ -873,12 +902,13 @@ class RelightingReport:
             return "  ".join(body)
 
         counts = (
-            f"{self.held_out_view.count} views, " f"{self.held_out_light.count} lights"
+            f"{self.held_out_view.count} {first}, "
+            f"{self.held_out_light.count} {second}"
         )
         out = [line(header), "  ".join("-" * w for w in widths)]
         out += [line(r) for r in rows]
         out += ["  ".join("-" * w for w in widths), f"({counts})"]
-        out.append("positive gap = the held-out-light split did worse")
+        out.append(f"positive gap = the {second} split did worse")
         out.append(str(self.gate()))
         return "\n".join(out)
 

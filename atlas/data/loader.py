@@ -61,7 +61,13 @@ from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 import torch
 from torch import Tensor
 
-from ..functional.splits import Split, split_lights, split_views
+from ..functional.splits import (
+    Split,
+    farthest_point_indices,
+    split_arc,
+    split_lights,
+    split_views,
+)
 from ..imageio import read_png
 from .synthetic import nerf_to_viewmat
 
@@ -69,12 +75,36 @@ __all__ = [
     "Frame",
     "Capture",
     "FrameSplit",
+    "CouplingReport",
     "load_capture",
     "SET_NAMES",
+    "EXTRAPOLATION_SET_NAMES",
+    "CO_LOCATED_DEGREES",
+    "DECOUPLED_DEGREES",
 ]
 
-#: The four sets, in the order they are reported.
+#: The four sets of a capture whose lights and views vary independently.
 SET_NAMES = ("train", "held_out_view", "held_out_light", "held_out_both")
+
+#: The sets a co-located capture supports instead. Holding out a light there
+#: holds out its view too, so the view/light pair collapses to one number; what
+#: survives is interpolation against extrapolation, which is the question
+#: relighting actually asks.
+EXTRAPOLATION_SET_NAMES = (
+    "train",
+    "held_out_interpolated",
+    "held_out_extrapolated",
+)
+
+#: Below this view-to-light angle the flash is effectively on the lens.
+#: Measured: a hotshoe 5-20 cm from the lens on an object a metre away gives
+#: 3-11 degrees, so there is no decoupling to exploit at all.
+CO_LOCATED_DEGREES = 15.0
+
+#: Above this the two are separated enough that a view/light split measures two
+#: different things. Between the two the capture is partially decoupled and the
+#: report says so rather than rounding to one or the other.
+DECOUPLED_DEGREES = 45.0
 
 
 @dataclass(frozen=True)
@@ -95,35 +125,51 @@ class Frame:
 
 @dataclass(frozen=True)
 class FrameSplit:
-    """Frame indices in each of the four sets, plus the splits they came from."""
+    """Frame indices per set, and which scheme produced them.
+
+    A capture whose lights and views vary independently gets the four-way cut
+    (:data:`SET_NAMES`); a co-located one gets interpolation against
+    extrapolation (:data:`EXTRAPOLATION_SET_NAMES`). The sets the scheme does
+    not use are empty rather than absent, so a caller that iterates
+    ``split.names`` works on either.
+    """
 
     train: Tuple[int, ...]
-    held_out_view: Tuple[int, ...]
-    held_out_light: Tuple[int, ...]
-    held_out_both: Tuple[int, ...]
-    views: Split
-    lights: Split
     manifest_hash: str
+    scheme: str = "independent"
+    held_out_view: Tuple[int, ...] = ()
+    held_out_light: Tuple[int, ...] = ()
+    held_out_both: Tuple[int, ...] = ()
+    held_out_interpolated: Tuple[int, ...] = ()
+    held_out_extrapolated: Tuple[int, ...] = ()
+    views: Optional[Split] = None
+    lights: Optional[Split] = None
+
+    @property
+    def names(self) -> Tuple[str, ...]:
+        """The sets this scheme actually populates."""
+        return SET_NAMES if self.scheme == "independent" else EXTRAPOLATION_SET_NAMES
 
     def __getitem__(self, name: str) -> Tuple[int, ...]:
-        if name not in SET_NAMES:
-            raise KeyError(f"unknown set {name!r}; the four are {SET_NAMES}")
+        if name not in SET_NAMES + EXTRAPOLATION_SET_NAMES:
+            raise KeyError(f"unknown set {name!r}; this split has {self.names}")
         return getattr(self, name)
 
     def counts(self) -> Dict[str, int]:
-        return {name: len(self[name]) for name in SET_NAMES}
+        return {name: len(self[name]) for name in self.names}
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "manifest_hash": self.manifest_hash,
-            "frames": {name: list(self[name]) for name in SET_NAMES},
-            "views": {
-                k: v.tolist() for k, v in zip(("train", "val", "test"), self.views)
-            },
-            "lights": {
-                k: v.tolist() for k, v in zip(("train", "val", "test"), self.lights)
-            },
+            "scheme": self.scheme,
+            "frames": {name: list(self[name]) for name in self.names},
         }
+        for key, value in (("views", self.views), ("lights", self.lights)):
+            if value is not None:
+                payload[key] = {
+                    k: v.tolist() for k, v in zip(("train", "val", "test"), value)
+                }
+        return payload
 
 
 def _hash_manifest(text: str) -> str:
@@ -260,6 +306,51 @@ class Capture:
                 seen[frame.light_index] = position / position.norm().clamp_min(1e-12)
         return torch.stack([seen[l] for l in self.light_indices])
 
+    # -- what kind of capture is this --
+
+    def coupling_report(self) -> CouplingReport:
+        """Measure how far each shot's light sits from its own view direction.
+
+        Both directions are taken at the object's centre -- the centroid of the
+        camera positions is a poor proxy, so the origin of the capture's own
+        coordinate frame is used, which is where the generator and every SfM
+        convention put the subject.
+
+        The implied flash offset is the median distance from a camera to its
+        own light. On a rigidly mounted flash that is the bracket arm; on a
+        hand-held one it is meaningless, and the verdict already says which.
+        """
+        views, lights, offsets = [], [], []
+        target = torch.zeros(3, dtype=torch.float64)
+        for frame in self.frames:
+            rotation = frame.viewmat[:3, :3]
+            centre = -rotation.T @ frame.viewmat[:3, 3]
+            to_view = target - centre
+            to_light = target - frame.light_position
+            views.append(to_view / to_view.norm().clamp_min(1e-12))
+            lights.append(to_light / to_light.norm().clamp_min(1e-12))
+            offsets.append(float((frame.light_position - centre).norm()))
+
+        cosines = (torch.stack(views) * torch.stack(lights)).sum(-1).clamp(-1.0, 1.0)
+        degrees = torch.rad2deg(torch.acos(cosines))
+        median = float(degrees.median())
+        if median < CO_LOCATED_DEGREES:
+            verdict = "co_located"
+        elif median < DECOUPLED_DEGREES:
+            verdict = "partially_decoupled"
+        else:
+            verdict = "decoupled"
+
+        offsets_tensor = torch.tensor(offsets, dtype=torch.float64)
+        return CouplingReport(
+            verdict=verdict,
+            median_degrees=median,
+            min_degrees=float(degrees.min()),
+            max_degrees=float(degrees.max()),
+            implied_offset_metres=float(offsets_tensor.median()),
+            num_shots=len(self.frames),
+        )
+
     # -- the split --
 
     def split(
@@ -269,6 +360,8 @@ class Capture:
         num_test_views: int = 1,
         num_val_lights: int = 1,
         num_test_lights: int = 1,
+        scheme: str = "auto",
+        extrapolation_fraction: float = 0.2,
         path: Optional[Path | str] = None,
     ) -> FrameSplit:
         """Cut the capture four ways, reading ``split.json`` if one exists.
@@ -283,9 +376,28 @@ class Capture:
         if path.is_file():
             return self._load_split(path)
 
-        views = split_views(self.camera_positions(), num_val_views, num_test_views)
-        lights = split_lights(self.light_directions(), num_val_lights, num_test_lights)
-        split = self._assemble(views, lights)
+        if scheme == "auto":
+            scheme = (
+                "independent"
+                if self.coupling_report().splits_are_independent
+                else "extrapolation"
+            )
+        if scheme == "extrapolation":
+            split = self._assemble_extrapolation(
+                fraction=extrapolation_fraction,
+                num_interpolated=num_test_views + num_test_lights,
+            )
+        elif scheme == "independent":
+            views = split_views(self.camera_positions(), num_val_views, num_test_views)
+            lights = split_lights(
+                self.light_directions(), num_val_lights, num_test_lights
+            )
+            split = self._assemble(views, lights)
+        else:
+            raise ValueError(
+                f"scheme must be 'auto', 'independent' or 'extrapolation', "
+                f"got {scheme!r}"
+            )
         path.write_text(json.dumps(split.to_dict(), indent=1, sort_keys=True))
         return split
 
@@ -306,11 +418,44 @@ class Capture:
                 buckets["train"].append(frame.index)
         return FrameSplit(
             train=tuple(buckets["train"]),
+            scheme="independent",
             held_out_view=tuple(buckets["held_out_view"]),
             held_out_light=tuple(buckets["held_out_light"]),
             held_out_both=tuple(buckets["held_out_both"]),
             views=views,
             lights=lights,
+            manifest_hash=self.manifest_hash,
+        )
+
+    def _assemble_extrapolation(
+        self, *, fraction: float, num_interpolated: int
+    ) -> FrameSplit:
+        """Hold out one contiguous arc, and some samples inside what remains.
+
+        The arc is removed first and the interpolation set is chosen from the
+        frames that survive, so an "interpolated" frame really is surrounded by
+        training frames rather than sitting on the lip of the hole.
+        """
+        positions = torch.stack(
+            [-f.viewmat[:3, :3].T @ f.viewmat[:3, 3] for f in self.frames]
+        )
+        arc = split_arc(positions, fraction)
+        extrapolated = [int(i) for i in arc.test]
+        remaining = [int(i) for i in arc.train]
+
+        interpolated: List[int] = []
+        if num_interpolated > 0 and len(remaining) > num_interpolated + 1:
+            inner = farthest_point_indices(
+                positions[torch.tensor(remaining)], num_interpolated
+            )
+            interpolated = sorted(remaining[int(i)] for i in inner)
+
+        held = set(extrapolated) | set(interpolated)
+        return FrameSplit(
+            train=tuple(i for i in range(len(self.frames)) if i not in held),
+            scheme="extrapolation",
+            held_out_interpolated=tuple(interpolated),
+            held_out_extrapolated=tuple(extrapolated),
             manifest_hash=self.manifest_hash,
         )
 
@@ -326,7 +471,9 @@ class Capture:
             )
         frames = stored["frames"]
 
-        def to_split(block: Dict[str, Any]) -> Split:
+        def to_split(block):
+            if block is None:
+                return None
             return Split(
                 train=torch.tensor(block["train"], dtype=torch.long),
                 val=torch.tensor(block["val"], dtype=torch.long),
@@ -335,11 +482,14 @@ class Capture:
 
         return FrameSplit(
             train=tuple(frames["train"]),
-            held_out_view=tuple(frames["held_out_view"]),
-            held_out_light=tuple(frames["held_out_light"]),
-            held_out_both=tuple(frames["held_out_both"]),
-            views=to_split(stored["views"]),
-            lights=to_split(stored["lights"]),
+            scheme=stored.get("scheme", "independent"),
+            held_out_view=tuple(frames.get("held_out_view", ())),
+            held_out_light=tuple(frames.get("held_out_light", ())),
+            held_out_both=tuple(frames.get("held_out_both", ())),
+            held_out_interpolated=tuple(frames.get("held_out_interpolated", ())),
+            held_out_extrapolated=tuple(frames.get("held_out_extrapolated", ())),
+            views=to_split(stored.get("views")),
+            lights=to_split(stored.get("lights")),
             manifest_hash=stored["manifest_hash"],
         )
 
@@ -361,3 +511,64 @@ def load_capture(root: Path | str) -> Capture:
     if not manifest["frames"]:
         raise ValueError(f"{manifest_path} lists no frames")
     return Capture(root, manifest, text)
+
+
+@dataclass(frozen=True)
+class CouplingReport:
+    """How independent this capture's lights are from its cameras.
+
+    Measured from the poses rather than read from the manifest, because a real
+    capture arrives with no such flag and a synthetic one should be checked
+    against its own geometry rather than trusted.
+    """
+
+    verdict: str  #: "co_located", "partially_decoupled" or "decoupled"
+    median_degrees: float
+    min_degrees: float
+    max_degrees: float
+    implied_offset_metres: Optional[float]
+    num_shots: int
+
+    @property
+    def splits_are_independent(self) -> bool:
+        return self.verdict == "decoupled"
+
+    def to_dict(self) -> Dict[str, Any]:
+        payload = {
+            "verdict": self.verdict,
+            "median_degrees": self.median_degrees,
+            "min_degrees": self.min_degrees,
+            "max_degrees": self.max_degrees,
+            "implied_offset_metres": self.implied_offset_metres,
+            "num_shots": self.num_shots,
+            "splits_are_independent": self.splits_are_independent,
+        }
+        return payload
+
+    def __str__(self) -> str:
+        offset = (
+            "unknown"
+            if self.implied_offset_metres is None
+            else f"{self.implied_offset_metres * 100:.0f} cm"
+        )
+        advice = {
+            "co_located": (
+                "the flash is effectively on the lens. Holding out a light "
+                "holds out its view, so the gate runs on interpolation against "
+                "extrapolation instead."
+            ),
+            "partially_decoupled": (
+                "partially separated. The view/light split is weak here; the "
+                "extrapolation split is the more honest measurement."
+            ),
+            "decoupled": (
+                "lights and views vary independently, so held-out view and "
+                "held-out light measure different things."
+            ),
+        }[self.verdict]
+        return (
+            f"{self.verdict}: view-to-light angle "
+            f"{self.median_degrees:.1f} deg median "
+            f"({self.min_degrees:.1f}-{self.max_degrees:.1f}), implied flash "
+            f"offset {offset} over {self.num_shots} shots.\n  {advice}"
+        )
