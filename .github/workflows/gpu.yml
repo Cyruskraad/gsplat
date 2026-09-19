@@ -74,6 +74,31 @@ jobs:
       - name: GPU tests
         run: .venv/bin/python -m pytest tests/gpu -q
 
+      - name: The device layer must see the GPU
+        # The whole point of the runner. If select_device() does not return
+        # CUDA here, nothing below this line means anything.
+        run: |
+          .venv/bin/python - <<'PY'
+          from atlas.device import select_device, plan_memory, configure_precision
+          report = select_device("cuda")
+          print(report)
+          assert report.is_cuda and report.free_bytes > 0
+          print(plan_memory(600_000, 128, available_bytes=report.free_bytes))
+          print("precision:", configure_precision())
+          PY
+
+      - name: Smoke train on the GPU
+        # The whole pipeline through the CUDA rasteriser: capture, model,
+        # contraction, rasterisation, evaluation, gate, ledger. `make smoke-cpu`
+        # covers the same seams through the reference renderer; this is the
+        # first time any of it touches a GPU.
+        run: |
+          mkdir -p runs
+          .venv/bin/python -m atlas.tools.smoke_cpu --steps 24 --keep runs/smoke-gpu
+
+      - name: The gate, both directions
+        run: .venv/bin/python -m pytest tests/test_gate.py -q
+
       - name: Contraction throughput and memory
         # The number that decides whether the design's "train over-complete at
         # 128 atoms, then compress" is affordable, or whether B has to be
