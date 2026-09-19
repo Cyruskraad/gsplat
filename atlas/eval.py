@@ -78,6 +78,7 @@ __all__ = [
     "RelightingReport",
     "GateResult",
     "GATE_PSNR_GAP_DB",
+    "constant_baseline_psnr",
     "append_evaluation",
 ]
 
@@ -636,6 +637,49 @@ def evaluate_set(
     return SplitMetrics(name=name, count=count, metrics=averaged)
 
 
+def constant_baseline_psnr(
+    references,
+    *,
+    domain: str = "mu",
+    masks=None,
+) -> float:
+    """What a model that learned nothing already scores.
+
+    The best constant image: every pixel set to the reference's own mean, in
+    the metric's domain. Nothing can be learned from a single image that does
+    worse than this, so it is the floor a real reconstruction has to clear.
+
+    It exists because the gate is a *difference*, and a difference is happy
+    when both sides are equally hopeless. An untrained model scores about the
+    same on held-out views and held-out lights -- badly -- and its gap is
+    therefore near zero, which without this would read as a pass.
+
+    Args:
+        references: An iterable of ``[H, W, C]`` linear-radiance images.
+        domain: The tonemap the comparison is made in.
+        masks: Optional per-image ``[H, W]`` weights, in the same order.
+
+    Returns:
+        The mean per-image PSNR of the constant predictor, in decibels.
+    """
+    curve = TONEMAPS[domain] if domain in TONEMAPS else None
+    if curve is None:
+        raise KeyError(f"unknown tonemap {domain!r}; known: {sorted(TONEMAPS)}")
+
+    masks = list(masks) if masks is not None else None
+    scores: List[float] = []
+    for index, reference in enumerate(references):
+        mapped = curve(reference)
+        mask = None if masks is None else masks[index]
+        weight = _prepare_mask(mask, _as_hwc(mapped).shape)
+        mean = _masked_mean(_as_hwc(mapped), weight)
+        constant = torch.full_like(mapped, mean)
+        scores.append(psnr(constant, mapped, mask=mask, data_range=curve.data_range))
+    if not scores:
+        raise ValueError("no references: there is no baseline to compute")
+    return sum(scores) / len(scores)
+
+
 # --- the two splits, and the gate between them ------------------------------
 
 #: The decision the project rests on. If held-out-light PSNR trails
@@ -684,6 +728,11 @@ class RelightingReport:
     held_out_view: SplitMetrics
     held_out_light: SplitMetrics
     train: Optional[SplitMetrics] = None
+    #: What a constant image already scores on the held-out-view set, from
+    #: :func:`constant_baseline_psnr`. Supplying it turns the gate from "the two
+    #: splits agree" into "the two splits agree *and* the model reconstructs",
+    #: which are very different claims about a model that has not converged.
+    baseline_psnr: Optional[float] = None
 
     @property
     def gaps(self) -> Dict[str, float]:
@@ -736,6 +785,16 @@ class RelightingReport:
                     f"({diverged:.3%} of the tensor); the model diverged"
                 )
 
+        if self.baseline_psnr is not None:
+            achieved = self.held_out_view.get(key)
+            if achieved is not None and achieved <= self.baseline_psnr:
+                reasons.append(
+                    f"held-out-view {key} is {achieved:.3f} dB against a "
+                    f"constant-image baseline of {self.baseline_psnr:.3f} dB: "
+                    f"the model is not reconstructing, so the agreement between "
+                    f"the two splits is not evidence of anything"
+                )
+
         gap = self.gaps.get(key, float("nan"))
         if not reasons:
             if math.isnan(gap):
@@ -766,6 +825,8 @@ class RelightingReport:
         row["gate/passed"] = verdict.passed
         row["gate/psnr_gap_db"] = verdict.gap_db
         row["gate/threshold_db"] = verdict.threshold
+        if self.baseline_psnr is not None:
+            row["gate/baseline_psnr"] = self.baseline_psnr
         row.update(extra)
         return row
 

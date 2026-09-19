@@ -64,6 +64,7 @@ from typing import (
 
 __all__ = [
     "AtomConfig",
+    "RuntimeConfig",
     "DataConfig",
     "ModelConfig",
     "OptimConfig",
@@ -124,6 +125,9 @@ class ModelConfig:
     # A fixed-light reconstruction of the same object. The single biggest
     # accelerator available for a first run.
     init_ply: Optional[str] = None
+    #: Primitives scattered when there is no PLY to start from. A poor start,
+    #: and an honest one; a fixed-light reconstruction is far better.
+    init_count: int = 4096
     near_field: bool = True
     profile_exponent: float = 0.0
 
@@ -132,10 +136,62 @@ class ModelConfig:
 class OptimConfig:
     max_steps: int = 30_000
     batch_size: int = 1
+    #: Steps of gradient accumulation per optimiser step. Raises the effective
+    #: batch without raising peak memory, which matters when one frame already
+    #: carries [N, 3, B].
+    grad_accum: int = 1
+
     transport_lr: float = 2.5e-3
     means_lr: float = 1.6e-4
+    quats_lr: float = 1e-3
+    scales_lr: float = 5e-3
+    opacities_lr: float = 5e-2
+    #: The basis moves slowly or it drags the transport around with it: every
+    #: coefficient in the model is expressed in terms of it.
+    atoms_lr: float = 1e-4
+
+    #: "cosine" or "constant".
+    schedule: str = "cosine"
+    warmup_steps: int = 300
+    min_lr_scale: float = 0.01
+    grad_clip: float = 0.0
+
+    #: The L in ATLAS. Off for a first run so there is a fixed-basis baseline.
+    learn_atoms: bool = False
+
+    #: Loss = l1 + ssim_weight * (1 - SSIM), both in the log1p domain.
+    ssim_weight: float = 0.2
+    #: Evaluations with no improvement before stopping. 0 disables.
+    early_stop_patience: int = 0
+
     eval_every: int = 2_000
     save_every: int = 5_000
+
+
+@dataclass
+class RuntimeConfig:
+    """Where the run executes, and at what precision.
+
+    These belong in the config rather than in command-line flags because the
+    config hash names the run: a result produced with TF32 on is not the same
+    result, and nothing downstream could tell.
+    """
+
+    #: "auto", "cpu", "cuda" or "cuda:N". "auto" falls back and says so; an
+    #: explicit "cuda" that cannot be honoured raises.
+    device: str = "auto"
+    #: "auto", "gsplat" or "reference". The reference renderer is roughly a
+    #: thousand times slower and is for smoke tests and oracles.
+    backend: str = "auto"
+    #: Off, deliberately. TF32 keeps ten mantissa bits and the exactness gate
+    #: lives at 1e-5 in float32. See atlas/device.py.
+    allow_tf32: bool = False
+    deterministic: bool = True
+    #: Primitives per contraction chunk. 0 sizes it from free memory.
+    chunk_size: int = 0
+    #: Check every contraction chunk for non-finite values. Costs a device
+    #: synchronisation per chunk; worth it while a run is being brought up.
+    validate_chunks: bool = False
 
 
 @dataclass
@@ -146,6 +202,7 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
+    runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     seed: int = 0
     run_root: str = "runs"
     run_name: Optional[str] = None

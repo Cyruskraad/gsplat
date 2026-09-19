@@ -45,6 +45,7 @@ from atlas.eval import (  # noqa: E402
     SplitMetrics,
     TONEMAPS,
     align_exposure,
+    constant_baseline_psnr,
     append_evaluation,
     colourise,
     comparison_sheet,
@@ -715,3 +716,94 @@ def test_no_metric_is_reported_without_its_domain():
     domain is not comparable with anything."""
     keys = set(evaluate_image(_image(16, 16, 3), _image(16, 16, 3, seed=1)))
     assert "psnr" not in keys and "ssim" not in keys
+
+
+# --- the floor under the gate ----------------------------------------------
+
+
+def test_the_constant_baseline_is_what_a_model_that_learned_nothing_scores():
+    """The best constant image: every pixel the reference's own mean, in the
+    metric's domain. For a uniform-random reference the variance is known, so
+    the PSNR it implies can be written down."""
+    reference = torch.rand(64, 64, 3, generator=_rng(0))
+    baseline = constant_baseline_psnr([reference], domain="linear")
+    variance = float(((reference - reference.mean()) ** 2).mean())
+    assert baseline == pytest.approx(10 * math.log10(1.0 / variance), abs=1e-6)
+
+
+def test_a_constant_reference_leaves_nothing_for_a_model_to_beat():
+    """Nothing to predict, so a constant predicts it. Measured at 144 dB rather
+    than infinite: the mean goes through a Python float on its way back into a
+    float32 tensor and leaves a few ulps behind. Either way nothing clears it.
+    """
+    assert constant_baseline_psnr([torch.full((16, 16, 3), 0.4)]) > 100.0
+
+
+def test_the_baseline_averages_over_images():
+    a, b = _image(16, 16, 3, seed=1), _image(16, 16, 3, seed=2) * 4.0
+    together = constant_baseline_psnr([a, b])
+    apart = (constant_baseline_psnr([a]) + constant_baseline_psnr([b])) / 2
+    assert together == pytest.approx(apart)
+
+
+def test_the_baseline_honours_a_mask():
+    reference = _image(16, 16, 3, seed=3)
+    mask = torch.zeros(16, 16)
+    mask[:8] = 1.0
+    assert constant_baseline_psnr([reference], masks=[mask]) != constant_baseline_psnr(
+        [reference]
+    )
+
+
+def test_no_references_is_refused_rather_than_averaged():
+    with pytest.raises(ValueError, match="no baseline"):
+        constant_baseline_psnr([])
+
+
+def test_a_model_below_the_baseline_fails_the_gate_however_small_its_gap():
+    """The hole: the gate is a difference, and a difference is satisfied by a
+    model that is equally hopeless on both splits."""
+    report = RelightingReport(
+        held_out_view=SplitMetrics("v", 4, {"psnr/mu": 8.0, "non_finite": 0.0}),
+        held_out_light=SplitMetrics("l", 4, {"psnr/mu": 7.95, "non_finite": 0.0}),
+        baseline_psnr=11.0,
+    )
+    verdict = report.gate()
+    assert abs(verdict.gap_db) < 0.1  # the gap alone looks excellent
+    assert not verdict.passed
+    assert "not reconstructing" in " ".join(verdict.reasons)
+
+
+def test_a_model_above_the_baseline_is_judged_on_its_gap():
+    above = RelightingReport(
+        held_out_view=SplitMetrics("v", 4, {"psnr/mu": 31.0, "non_finite": 0.0}),
+        held_out_light=SplitMetrics("l", 4, {"psnr/mu": 30.6, "non_finite": 0.0}),
+        baseline_psnr=11.0,
+    )
+    assert above.gate().passed
+    memorising = RelightingReport(
+        held_out_view=SplitMetrics("v", 4, {"psnr/mu": 31.0, "non_finite": 0.0}),
+        held_out_light=SplitMetrics("l", 4, {"psnr/mu": 25.0, "non_finite": 0.0}),
+        baseline_psnr=11.0,
+    )
+    assert not memorising.gate().passed
+
+
+def test_a_report_without_a_baseline_keeps_the_old_behaviour():
+    """The floor is opt-in, so an existing caller that has no baseline to give
+    is not silently failed."""
+    report = RelightingReport(
+        held_out_view=SplitMetrics("v", 4, {"psnr/mu": 8.0, "non_finite": 0.0}),
+        held_out_light=SplitMetrics("l", 4, {"psnr/mu": 7.95, "non_finite": 0.0}),
+    )
+    assert report.gate().passed
+    assert "gate/baseline_psnr" not in report.as_row()
+
+
+def test_the_baseline_reaches_the_ledger_row():
+    report = RelightingReport(
+        held_out_view=SplitMetrics("v", 4, {"psnr/mu": 31.0, "non_finite": 0.0}),
+        held_out_light=SplitMetrics("l", 4, {"psnr/mu": 30.6, "non_finite": 0.0}),
+        baseline_psnr=11.25,
+    )
+    assert report.as_row()["gate/baseline_psnr"] == 11.25

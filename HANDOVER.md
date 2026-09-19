@@ -26,11 +26,12 @@ inspector on real data, because the loader is written against what it finds.
 | `atlas/data/loader.py` | **Executed.** 22 tests. Streaming reads, the sealed four-way split |
 | `atlas/device.py` | **Executed on CPU, CUDA branch faked.** 39 tests. Detection, preflight, precision, seeding |
 | Learned atoms, `ParameterDict` densification view | **Executed on CPU.** 12 tests |
-| `atlas/train.py`, `atlas/render.py` | **Not written** |
+| `atlas/train.py`, `make smoke-cpu` | **Executed on CPU.** 23 tests. Trains; gate runs every evaluation |
+| `atlas/render.py` | **Not written** |
 | CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 524 tests, about 50
+`make check` is the whole of what has been verified: 556 tests, about 33
 seconds, no GPU and no `gsplat` required. It also happens to pass with numpy
 absent, which is how this container came back after a restart -- nothing under
 `atlas/` imports it.
@@ -57,6 +58,25 @@ From `tests/`, on CPU:
 | Chunked contraction, peak RSS, per-primitive light, N=200k B=64 | lower | 150 MB → 11 MB |
 | Chunked contraction, peak RSS, screen space, 540x960 B=32 | lower | 198 MB → 21 MB |
 | Chunked vs unchunked disagreement, float32, worst of 20 seeds | < 1e-6 | 2.2e-7 of output scale |
+
+## Two defects the trainer found on its first run
+
+**The first trainer did not train.** `nn.Parameter(t)` shares storage with `t`
+but is a **new leaf**. The model rendered from its own tensors while the
+optimiser held the `ParameterDict` copies, so every gradient landed on the
+model's, `params[...].grad` stayed `None`, and `optimizer.step()` was a no-op.
+The loss curve was flat and nothing said why; the only symptom was
+`grad_norm = 0.0` in the metrics. Fixed by rebuilding the model *around* the
+dict with `from_parameter_dict`, which is what that method is for.
+
+**The gate could be passed by learning nothing.** The gate is a *difference*,
+and a difference is satisfied when both sides are equally hopeless. A 20-step
+run from a random scatter scored 9.8 dB on held-out views and 10.2 dB on
+held-out lights -- a gap of -0.4 dB -- and passed. `constant_baseline_psnr`
+computes what the best constant image already scores, and the gate now fails
+anything below it with "the model is not reconstructing, so the agreement
+between the two splits is not evidence of anything". The floor is opt-in, so a
+caller with no baseline keeps the old behaviour.
 
 ## The finding that changes the capture protocol
 

@@ -53,7 +53,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -418,6 +418,125 @@ class RelightSplats:
             sh_degree=None,
             **rasterization_kwargs,
         )
+
+    def render_image(
+        self,
+        viewmat: Tensor,
+        K: Tensor,
+        width: int,
+        height: int,
+        ell,
+        *,
+        backend: str = "auto",
+        chunk_size: int = 0,
+        validate: bool = False,
+        **kwargs: Any,
+    ) -> Tuple[Tensor, Tensor]:
+        """One view, through whichever renderer this machine can run.
+
+        This is the single call site that makes "works on the GPU when there is
+        one" true rather than aspirational. ``"auto"`` uses the CUDA rasteriser
+        when CUDA and gsplat are both present and the reference renderer
+        otherwise, and it never pretends the two are interchangeable in speed:
+        the reference path is roughly a thousand times slower and is for smoke
+        tests and oracles.
+
+        Args:
+            viewmat: ``[4, 4]`` world-to-camera.
+            K: ``[3, 3]`` intrinsics.
+            width, height: Frame size.
+            ell: Light coefficients, in any form
+                :func:`~atlas.functional.transport.contract_chunked` accepts.
+            backend: ``"auto"``, ``"gsplat"`` or ``"reference"``.
+            chunk_size: Primitives per contraction chunk; ``0`` auto-sizes.
+            validate: Check each chunk for non-finite values.
+
+        Returns:
+            ``(image [H, W, 3], alpha [H, W])``.
+        """
+        backend = self.resolve_backend(backend)
+        colors = contract_chunked(
+            self.transport, ell, chunk_size=chunk_size, validate=validate
+        )
+
+        if backend == "reference":
+            from .reference import render_reference
+
+            return render_reference(
+                self.means,
+                self.quats,
+                self.scales,
+                self.opacities,
+                colors,
+                viewmat,
+                K,
+                width,
+                height,
+                **kwargs,
+            )
+
+        try:
+            from gsplat import rasterization
+        except ImportError as exc:  # pragma: no cover - depends on the install
+            raise ImportError(
+                "the gsplat backend was asked for but gsplat is not installed. "
+                'Install it with: pip install -e ".[gpu]", or pass '
+                'backend="reference" to use the CPU renderer.'
+            ) from exc
+
+        rendered, alphas, _ = rasterization(
+            means=self.means,
+            quats=self.quats,
+            scales=torch.exp(self.scales),
+            opacities=torch.sigmoid(self.opacities),
+            colors=colors,
+            viewmats=viewmat.unsqueeze(0),
+            Ks=K.unsqueeze(0),
+            width=width,
+            height=height,
+            sh_degree=None,
+            **kwargs,
+        )
+        return rendered[0], alphas[0, ..., 0]
+
+    @staticmethod
+    def resolve_backend(backend: str = "auto") -> str:
+        """Which renderer ``backend`` names on this machine, and why not.
+
+        Raises rather than falling back when a backend is named explicitly, for
+        the same reason ``atlas.device.select_device`` does: a CPU run that
+        silently replaces a GPU run still produces numbers.
+        """
+        backend = (backend or "auto").strip().lower()
+        if backend not in ("auto", "gsplat", "reference"):
+            raise ValueError(
+                f"backend must be 'auto', 'gsplat' or 'reference', got {backend!r}"
+            )
+        if backend == "reference":
+            return "reference"
+
+        try:
+            import gsplat  # noqa: F401
+
+            has_gsplat = True
+        except ImportError:
+            has_gsplat = False
+        usable = has_gsplat and torch.cuda.is_available()
+
+        if backend == "gsplat":
+            if not usable:
+                missing = []
+                if not has_gsplat:
+                    missing.append("gsplat is not installed")
+                if not torch.cuda.is_available():
+                    missing.append("torch reports no CUDA device")
+                raise RuntimeError(
+                    f"the gsplat backend was requested but {' and '.join(missing)}. "
+                    f"Refusing to fall back to the reference renderer, which is "
+                    f"about a thousand times slower."
+                )
+            return "gsplat"
+        return "gsplat" if usable else "reference"
 
     def project_environment(self, envmap: Tensor) -> Tensor:
         """Project an equirectangular environment onto this model's atom basis.
