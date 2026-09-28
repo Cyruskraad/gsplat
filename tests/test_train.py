@@ -361,3 +361,13 @@ def test_the_model_scatters_primitives_when_there_is_no_ply(tmp_path):
     assert model.num_primitives == 128
     assert model.num_atoms == config.atoms.count
     assert torch.isfinite(model.means).all()
+
+
+def test_the_baseline_is_cached_per_set_not_once(tmp_path):
+    # A single-slot cache returned the first set's floor for every later set.
+    first = _trainer(tmp_path)
+    light_first = first.baseline_psnr("held_out_light")
+    view_after = first.baseline_psnr("held_out_view")
+    fresh = _trainer(tmp_path / "fresh").baseline_psnr("held_out_view")
+    assert view_after == fresh
+    assert light_first != view_after

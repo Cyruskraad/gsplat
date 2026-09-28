@@ -284,7 +284,7 @@ class Trainer:
         self.optimizers = self._build_optimizers()
         self.state = TrainState()
         self.chunk_size = config.runtime.chunk_size
-        self._baseline: Optional[float] = None
+        self._baseline_cache: Dict[str, float] = {}
 
         run.log(
             event="trainer_ready",
@@ -520,23 +520,28 @@ class Trainer:
         )
 
     def baseline_psnr(self, set_name: str = "held_out_view") -> Optional[float]:
-        """What a constant image already scores on the held-out views.
+        """What a constant image already scores on ``set_name``.
 
-        Computed once and cached: it depends only on the data. Without it the
-        gate is a difference, and a difference is satisfied by a model that is
-        equally hopeless on both splits -- which is exactly what an untrained
+        Computed once **per set** and cached: it depends only on the data. A
+        single unlabelled cache slot would return a stale answer under the
+        wrong name the moment this is called with a second ``set_name`` --
+        exactly the failure this had before it was keyed by name, since
+        ``evaluate()`` always calls it with the same set for a given split
+        scheme and so never noticed. Without a baseline at all the gate is a
+        bare difference, and a difference is satisfied by a model that is
+        equally hopeless on both sets -- which is exactly what an untrained
         one is.
         """
-        if self._baseline is None and self.split[set_name]:
+        if set_name not in self._baseline_cache and self.split[set_name]:
             references, masks = [], []
             for index in self.split[set_name]:
                 reference, mask = self._reference(index)
                 references.append(reference.cpu())
                 masks.append(None if mask is None else mask.cpu())
-            self._baseline = constant_baseline_psnr(
+            self._baseline_cache[set_name] = constant_baseline_psnr(
                 references, masks=masks if any(m is not None for m in masks) else None
             )
-        return self._baseline
+        return self._baseline_cache.get(set_name)
 
     # -- checkpoints --
 

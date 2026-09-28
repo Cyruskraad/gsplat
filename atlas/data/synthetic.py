@@ -91,6 +91,7 @@ from ..functional.atoms import (
     make_sg_atoms,
     project_point_light,
 )
+from ..functional.ggx import microfacet_response
 from ..functional.nearfield import incident_radiance
 from ..functional.transport import contract
 from ..imageio import write_png
@@ -103,6 +104,8 @@ __all__ = [
     "viewmat_to_nerf",
     "nerf_to_viewmat",
     "GeneratedCapture",
+    "GGXGeneratedCapture",
+    "generate_ggx_capture",
 ]
 
 #: Flip between OpenGL (y up, z backward) and OpenCV (y down, z forward). It is
@@ -550,6 +553,245 @@ def generate_capture(
         transport=transport,
         atom_axes=axes,
         atom_sharpness=sharpnesses,
+        viewmats=viewmats,
+        light_positions=lights,
+        intrinsics=intrinsics,
+        frames=frames,
+    )
+
+
+# --- ground truth that is genuinely view-dependent --------------------------
+
+
+@dataclass
+class GGXGeneratedCapture:
+    """What :func:`generate_ggx_capture` wrote, and the analytic BRDF behind it.
+
+    Unlike :class:`GeneratedCapture`, there is no atom transport here at all --
+    the point of this generator is a target that is *not* expressed in the
+    model's own basis, so that fitting it measures the representation rather
+    than the fit.
+    """
+
+    root: Path
+    config: SyntheticConfig
+    means: Tensor
+    normals: Tensor
+    diffuse_albedo: Tensor
+    specular_f0: Tensor
+    roughness: float
+    quats: Tensor
+    log_scales: Tensor
+    opacity_logits: Tensor
+    viewmats: Tensor
+    light_positions: Tensor
+    intrinsics: Tensor
+    frames: List[Dict[str, Any]] = field(default_factory=list)
+
+    @property
+    def splits_are_independent(self) -> bool:
+        return self.config.flash_mode == "free"
+
+
+def generate_ggx_capture(
+    root: Path | str,
+    config: Optional[SyntheticConfig] = None,
+    *,
+    roughness: float = 0.3,
+    specular_f0: float = 0.5,
+    write_images: bool = True,
+    write_masks: bool = True,
+) -> GGXGeneratedCapture:
+    """A capture whose ground truth is a real Cook-Torrance/GGX surface.
+
+    :func:`generate_capture` fits its ground truth *into* the atom basis, via
+    :func:`fit_lobe_transport` -- which is the right target for testing the
+    loader, the trainer and the gate, but the wrong target for asking how good
+    the atom representation itself is: a model can only ever be graded against
+    a projection of the truth it was also built from.
+
+    This generator instead evaluates :func:`atlas.functional.ggx.microfacet_response`
+    directly, per shot, per primitive -- a target with no relationship to
+    spherical Gaussians at all. That is what makes the roughness sweep (see
+    ``tests/test_roughness_sweep.py``) a measurement of the representation gap
+    rather than of a fitting procedure.
+
+    The surface is uniform: one roughness and one specular reflectance for
+    every primitive, because the sweep varies roughness as its one independent
+    variable and a spatially varying surface would confound the two.
+
+    Args:
+        root: Destination directory, written in the same layout
+            :func:`generate_capture` uses.
+        config: Defaults to :class:`SyntheticConfig`; ``specular`` and
+            ``shininess`` are unused here since there is no atom fit.
+        roughness: Perceptual roughness in ``(0, 1]``, Disney's
+            ``alpha = roughness^2`` convention -- the same one
+            :func:`atlas.functional.prefilter.roughness_to_sharpness` uses.
+        specular_f0: Reflectance at normal incidence, shared by all channels
+            (a dielectric, not a coloured metal), in ``[0, 1]``.
+        write_images, write_masks: As in :func:`generate_capture`.
+
+    Returns:
+        A :class:`GGXGeneratedCapture`.
+    """
+    if not 0.0 < roughness <= 1.0:
+        raise ValueError(f"roughness must be in (0, 1], got {roughness}")
+    if not 0.0 <= specular_f0 <= 1.0:
+        raise ValueError(f"specular_f0 must be in [0, 1], got {specular_f0}")
+
+    config = config or SyntheticConfig()
+    root = Path(root)
+    manifest_path = root / "transforms.json"
+    if manifest_path.exists():
+        raise FileExistsError(
+            f"{manifest_path} already exists; generating over a capture would "
+            f"leave a mixture of two and no way to tell which is which"
+        )
+    (root / "images").mkdir(parents=True, exist_ok=True)
+    if write_masks:
+        (root / "masks").mkdir(parents=True, exist_ok=True)
+
+    means, normals, albedo, quats, log_scales, opacities = _scene(config)
+    num = means.shape[0]
+    roughness_t = torch.full((num,), float(roughness), dtype=torch.float64)
+    f0_t = torch.full((num, 3), float(specular_f0), dtype=torch.float64)
+
+    viewmats = _cameras(config)
+    lights = _lights(config, viewmats)
+    intrinsics = pinhole_intrinsics(config.width, config.height, config.fov_degrees)
+    intensity = torch.full((3,), float(config.flash_intensity), dtype=torch.float64)
+
+    if config.flash_mode == "bracket":
+        pairs = [(v, v) for v in range(config.num_views)]
+    else:
+        pairs = [
+            (v, l) for v in range(config.num_views) for l in range(config.num_lights)
+        ]
+
+    frames: List[Dict[str, Any]] = []
+    for shot, (view_index, light_index) in enumerate(pairs):
+        viewmat = viewmats[view_index]
+        light_position = lights[light_index]
+
+        light_directions, radiance = incident_radiance(
+            means,
+            light_position,
+            intensity,
+            reference_distance=config.reference_distance,
+        )
+        rotation = viewmat[:3, :3]
+        camera_position = -rotation.T @ viewmat[:3, 3]
+        to_camera = camera_position - means
+        view_directions = to_camera / to_camera.norm(dim=-1, keepdim=True).clamp_min(
+            1e-12
+        )
+
+        diffuse, specular = microfacet_response(
+            normals,
+            view_directions,
+            light_directions,
+            radiance,
+            diffuse_albedo=albedo,
+            specular_f0=f0_t,
+            roughness=roughness_t,
+        )
+        colors = (diffuse + specular).clamp_min(0.0)
+
+        record: Dict[str, Any] = {
+            "file_path": f"images/{shot:04d}.png",
+            "transform_matrix": viewmat_to_nerf(viewmat).tolist(),
+            "atlas": {
+                "view_index": view_index,
+                "light_index": light_index,
+                "light_position": light_position.tolist(),
+                "light_intensity": intensity.tolist(),
+                "exposure": 1.0,
+                "reference_distance": config.reference_distance,
+            },
+        }
+
+        if write_images:
+            image, alpha = render_reference(
+                means,
+                quats,
+                log_scales,
+                opacities,
+                colors,
+                viewmat,
+                intrinsics,
+                config.width,
+                config.height,
+            )
+            write_png(
+                root / record["file_path"],
+                (image / config.scale).clamp(0.0, 1.0),
+            )
+            if write_masks:
+                record["atlas"]["mask_path"] = f"masks/{shot:04d}.png"
+                write_png(root / record["atlas"]["mask_path"], alpha.clamp(0.0, 1.0))
+
+        frames.append(record)
+
+    manifest = {
+        "camera_model": "PINHOLE",
+        "fl_x": float(intrinsics[0, 0]),
+        "fl_y": float(intrinsics[1, 1]),
+        "cx": float(intrinsics[0, 2]),
+        "cy": float(intrinsics[1, 2]),
+        "w": config.width,
+        "h": config.height,
+        "atlas": {
+            "format_version": 1,
+            "synthetic": True,
+            "ground_truth": "ggx",
+            "colour_space": "linear",
+            "scale": config.scale,
+            "ambient": 0.0,
+            "flash_mode": config.flash_mode,
+            "splits_are_independent": config.flash_mode == "free",
+            "num_views": config.num_views,
+            "num_lights": (
+                config.num_lights if config.flash_mode == "free" else config.num_views
+            ),
+            "ggx": {"roughness": roughness, "specular_f0": specular_f0},
+            "config": asdict(config),
+        },
+        "frames": frames,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=1, sort_keys=True))
+
+    torch.save(
+        {
+            "means": means,
+            "quats": quats,
+            "scales": log_scales,
+            "opacities": opacities,
+            "normals": normals,
+            "diffuse_albedo": albedo,
+            "specular_f0": f0_t,
+            "roughness": roughness_t,
+            "viewmats": viewmats,
+            "light_positions": lights,
+            "intrinsics": intrinsics,
+            "config": asdict(config),
+            "roughness_scalar": roughness,
+            "specular_f0_scalar": specular_f0,
+        },
+        root / "ground_truth.pt",
+    )
+
+    return GGXGeneratedCapture(
+        root=root,
+        config=config,
+        means=means,
+        normals=normals,
+        diffuse_albedo=albedo,
+        specular_f0=f0_t,
+        roughness=roughness,
+        quats=quats,
+        log_scales=log_scales,
+        opacity_logits=opacities,
         viewmats=viewmats,
         light_positions=lights,
         intrinsics=intrinsics,
