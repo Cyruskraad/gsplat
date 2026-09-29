@@ -28,7 +28,15 @@ dependencies = [
 # extra_signals and arbitrary-channel-count rasterisation.
 gpu = ["gsplat @ git+https://github.com/Cyruskraad/gsplat@main"]
 # Capture ingestion: RAW decode and HDR/EXR I/O.
-capture = ["rawpy>=0.19", "imageio>=2.34", "pillow>=10.0"]
+# Capture preparation (atlas.prep): RAW decode, COLMAP/GLOMAP poses, fast
+# 16-bit image I/O. Masks additionally need `rembg` (BiRefNet), kept out of
+# this extra because it pulls in onnxruntime.
+capture = [
+    "rawpy>=0.19",
+    "pillow>=10.0",
+    "pycolmap>=3.13",
+    "opencv-python-headless>=4.8",
+]
 viewer = ["viser>=0.2", "nerfview"]
 # LPIPS needs a pretrained network, so it is optional. PSNR, SSIM, the report,
 # the gate and the comparison sheet all work without it -- the sheet writes its
@@ -39,6 +47,7 @@ dev = ["pytest>=8", "black==22.3.0"]
 
 [project.scripts]
 atlas-inspect = "atlas.tools.inspect_capture:main"
+atlas-prepare = "atlas.prep.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["atlas*"]

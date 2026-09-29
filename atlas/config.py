@@ -176,6 +176,34 @@ class OptimConfig:
 
 
 @dataclass
+class DensifyConfig:
+    """Densification, delegated to gsplat's strategies.
+
+    ``"mcmc"`` is 3DGS-as-MCMC (Kheradmand et al., NeurIPS 2024): a hard cap on
+    the primitive count, dead Gaussians relocated onto live ones rather than
+    cloned and split by gradient heuristics, and position noise that keeps
+    exploring. The cap matters more here than in ordinary splatting because
+    every primitive carries ``3B`` transport channels, so memory is
+    ``cap_max * 3B`` and known before the run starts.
+
+    Needs the gsplat backend: the relocation kernel is CUDA-only.
+    """
+
+    #: "none" or "mcmc".
+    strategy: str = "none"
+    cap_max: int = 300_000
+    refine_start: int = 500
+    refine_stop: int = 25_000
+    refine_every: int = 100
+    min_opacity: float = 0.005
+    noise_lr: float = 5e5
+    #: MCMC's L1 regularisers on opacity and scale, which let unneeded
+    #: Gaussians die so they can be relocated.
+    opacity_reg: float = 0.01
+    scale_reg: float = 0.01
+
+
+@dataclass
 class RuntimeConfig:
     """Where the run executes, and at what precision.
 
@@ -209,6 +237,7 @@ class Config:
     data: DataConfig = field(default_factory=DataConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
+    densify: DensifyConfig = field(default_factory=DensifyConfig)
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     seed: int = 0
     run_root: str = "runs"

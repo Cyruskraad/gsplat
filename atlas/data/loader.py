@@ -68,7 +68,7 @@ from ..functional.splits import (
     split_lights,
     split_views,
 )
-from ..imageio import read_png
+from ..imageio import read_image
 from .synthetic import nerf_to_viewmat
 
 __all__ = [
@@ -257,7 +257,7 @@ class Capture:
         learn the photographer.
         """
         frame = self.frames[index]
-        pixels = read_png(frame.image_path).to(torch.float64) / 255.0
+        pixels = read_image(frame.image_path)
         if pixels.shape[-1] == 1:
             pixels = pixels.expand(-1, -1, 3)
         radiance = pixels[..., :3] * self.scale
@@ -270,7 +270,7 @@ class Capture:
         frame = self.frames[index]
         if frame.mask_path is None:
             return None
-        return read_png(frame.mask_path).to(torch.float64)[..., 0] / 255.0
+        return read_image(frame.mask_path)[..., 0]
 
     # -- geometry of the grid --
 

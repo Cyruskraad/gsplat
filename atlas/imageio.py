@@ -30,7 +30,8 @@ sequential.
 **Decoding is slow on purpose.** Reconstructing the Sub, Average and Paeth
 filters genuinely depends on the pixel to the left, so it is a Python loop.
 :func:`read_png` is for tests and for small reference images. Nothing in a
-training loop should call it.
+training loop should call it; the loader goes through :func:`read_image`, which
+uses OpenCV when it is installed.
 """
 
 from __future__ import annotations
@@ -46,6 +47,9 @@ from torch import Tensor
 __all__ = [
     "write_png",
     "read_png",
+    "read_image",
+    "write_image",
+    "opencv_available",
     "to_uint8",
     "draw_text",
     "text_size",
@@ -292,6 +296,119 @@ def read_png(path: Path | str) -> Tensor:
     raw = _unfilter(zlib.decompress(bytes(compressed)), height, stride, channels)
     flat = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
     return flat.view(height, width, channels).clone()
+
+
+# --- the fast path: OpenCV, when it is installed ------------------------------
+#
+# The codec above keeps the comparison sheet dependency-free. A real capture is
+# a different job: hundreds of full-resolution frames, stored at 16 bits because
+# linear radiance quantised to 8 bits loses the shadows entirely. OpenCV's
+# libpng/libtiff/OpenEXR decoders do that in milliseconds, so the loader goes
+# through these two functions and only falls back to the codec above for the
+# 8-bit PNGs it can read.
+
+
+def opencv_available() -> bool:
+    """Whether ``cv2`` imports. Checked per call so a test can monkeypatch it."""
+    try:
+        import cv2  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def read_image(path: Path | str) -> Tensor:
+    """Read an image as ``float64`` ``[H, W, C]``, normalised by its bit depth.
+
+    Integer formats come back in ``[0, 1]`` (8-bit over 255, 16-bit over
+    65535); floating-point formats (EXR, float TIFF) come back unscaled, since
+    they already are radiance. Channel order is RGB(A) regardless of backend.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    if opencv_available():
+        import os
+
+        os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+        import cv2
+        import numpy as np
+
+        array = cv2.imread(str(path), cv2.IMREAD_UNCHANGED | cv2.IMREAD_ANYDEPTH)
+        if array is None:
+            raise ValueError(f"OpenCV could not decode {path}")
+        if array.ndim == 2:
+            array = array[..., None]
+        elif array.shape[-1] == 3:
+            array = array[..., ::-1]
+        elif array.shape[-1] == 4:
+            array = array[..., [2, 1, 0, 3]]
+        if array.dtype == np.uint8:
+            scale = 255.0
+        elif array.dtype == np.uint16:
+            scale = 65535.0
+        elif np.issubdtype(array.dtype, np.floating):
+            scale = 1.0
+        else:
+            raise ValueError(f"unsupported pixel type {array.dtype} in {path}")
+        return torch.from_numpy(np.ascontiguousarray(array).astype(np.float64)) / scale
+    if path.suffix.lower() != ".png":
+        raise ValueError(
+            f"reading {path.suffix} needs OpenCV: pip install opencv-python-headless"
+        )
+    try:
+        return read_png(path).to(torch.float64) / 255.0
+    except ValueError as error:
+        raise ValueError(
+            f"{error}. 16-bit and other PNG variants need OpenCV: "
+            f"pip install opencv-python-headless"
+        ) from error
+
+
+def write_image(path: Path | str, image: Tensor, *, bit_depth: int = 8) -> Path:
+    """Write a float ``[0, 1]`` image as an 8- or 16-bit PNG.
+
+    16-bit uses OpenCV when present and otherwise an unfiltered PNG written
+    here -- larger on disk, byte-identical once decoded. 8-bit is
+    :func:`write_png`.
+    """
+    if bit_depth == 8:
+        return write_png(path, image)
+    if bit_depth != 16:
+        raise ValueError(f"bit_depth must be 8 or 16, got {bit_depth}")
+    image = _as_hwc(image).detach().cpu()
+    if image.is_floating_point():
+        image = (image.clamp(0.0, 1.0) * 65535.0).round().to(torch.int32)
+    height, width, channels = image.shape
+    colour_type = {1: 0, 2: 4, 3: 2, 4: 6}.get(channels)
+    if colour_type is None:
+        raise ValueError(f"expected 1, 2, 3 or 4 channels, got {channels}")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    import numpy as np
+
+    array = image.numpy().astype(np.uint16)
+    if opencv_available():
+        import cv2
+
+        if channels == 3:
+            array = array[..., ::-1]
+        elif channels == 4:
+            array = array[..., [2, 1, 0, 3]]
+        if not cv2.imwrite(str(path), np.ascontiguousarray(array)):
+            raise OSError(f"OpenCV could not write {path}")
+        return path
+    rows = array.astype(">u2").reshape(height, width * channels).view(np.uint8)
+    filtered = np.concatenate([np.zeros((height, 1), np.uint8), rows], axis=1)
+    header = struct.pack(">IIBBBBB", width, height, 16, colour_type, 0, 0, 0)
+    blob = (
+        _SIGNATURE
+        + _chunk(b"IHDR", header)
+        + _chunk(b"IDAT", zlib.compress(filtered.tobytes(), 6))
+        + _chunk(b"IEND", b"")
+    )
+    path.write_bytes(blob)
+    return path
 
 
 # --- a font, because an unlabelled comparison sheet is a puzzle -------------

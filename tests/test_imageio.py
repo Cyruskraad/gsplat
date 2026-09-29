@@ -331,3 +331,52 @@ def test_every_glyph_is_distinct_so_a_label_can_be_read_back():
             continue
         assert glyph not in rendered, f"{character!r} and {rendered[glyph]!r} match"
         rendered[glyph] = character
+
+
+# --- the fast path ------------------------------------------------------------
+
+
+def _gradient(height=9, width=11, channels=3):
+    ramp = torch.linspace(0.0, 1.0, height * width * channels, dtype=torch.float64)
+    return ramp.view(height, width, channels)
+
+
+def test_read_image_matches_the_builtin_codec_on_8_bit(tmp_path):
+    from atlas.imageio import read_image
+
+    image = _gradient()
+    write_png(tmp_path / "a.png", image)
+    expected = read_png(tmp_path / "a.png").to(torch.float64) / 255.0
+    assert torch.equal(read_image(tmp_path / "a.png"), expected)
+
+
+def test_16_bit_keeps_what_8_bit_rounds_away(tmp_path):
+    pytest.importorskip("cv2")
+    from atlas.imageio import read_image, write_image
+
+    image = _gradient() * 0.01  # deep shadow: a handful of 8-bit levels
+    write_image(tmp_path / "a.png", image, bit_depth=16)
+    back = read_image(tmp_path / "a.png")
+    assert float((back - image).abs().max()) <= 0.5 / 65535 + 1e-12
+    assert len(torch.unique((image * 255).round())) < len(torch.unique(back))
+
+
+def test_the_dependency_free_16_bit_writer_is_a_valid_png(tmp_path, monkeypatch):
+    pytest.importorskip("cv2")
+    import atlas.imageio as imageio
+
+    image = _gradient(channels=4)
+    monkeypatch.setattr(imageio, "opencv_available", lambda: False)
+    imageio.write_image(tmp_path / "a.png", image, bit_depth=16)
+    monkeypatch.undo()
+    back = imageio.read_image(tmp_path / "a.png")
+    assert float((back - image).abs().max()) <= 0.5 / 65535 + 1e-12
+
+
+def test_without_opencv_a_16_bit_read_says_what_to_install(tmp_path, monkeypatch):
+    import atlas.imageio as imageio
+
+    monkeypatch.setattr(imageio, "opencv_available", lambda: False)
+    imageio.write_image(tmp_path / "a.png", _gradient(), bit_depth=16)
+    with pytest.raises(ValueError, match="opencv"):
+        imageio.read_image(tmp_path / "a.png")

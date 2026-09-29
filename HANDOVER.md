@@ -1,6 +1,6 @@
 # HANDOVER — state of play
 
-**Updated:** 2026-09-18. Read `AGENTS.md` first for the ground rules.
+**Updated:** 2026-09-29. Read `AGENTS.md` first for the ground rules.
 
 ## One-paragraph summary
 
@@ -30,11 +30,15 @@ inspector on real data, because the loader is written against what it finds.
 | The gate, both directions | **Executed on CPU.** 6 tests. Passes on a covered capture, fails on a sparse one |
 | Coupling detection, `split_arc`, extrapolation gate | **Executed on CPU.** 23 tests. Co-located captures are usable |
 | `atlas/functional/specular.py`, model gloss | **Executed on CPU.** 31 tests. View dependence at no cost to linearity |
+| `atlas/prep/` — RAW decode, COLMAP/GLOMAP poses, undistortion, masks, `init.ply` | **Executed on CPU** with SIFT. 13 tests incl. photographs → loader end to end. ALIKED/LightGlue and BiRefNet paths **reviewed only** (this pycolmap wheel has no ONNX; rembg not installed) |
+| MCMC densification via `gsplat.strategy.MCMCStrategy` | **Executed on CPU** with the CUDA relocation kernel swapped for its closed form. 6 tests. Never run with the real kernel |
+| `read_image` / `write_image` (OpenCV, 16-bit) | **Executed.** 4 tests; the loader now reads through it |
+| GGX ground truth (`functional/ggx.py`, `generate_ggx_capture`) | **Executed.** 5 tests |
 | `atlas/render.py` | **Not written** |
 | CI: `cpu.yml`, `gpu.yml`, `tests/gpu/` | **Written, never executed** — needs the repo and the runner |
 | Anything on a GPU | **Never run** |
 
-`make check` is the whole of what has been verified: 617 tests, about 76
+`make check` is the whole of what has been verified: 655 tests, about 76
 seconds, no GPU and no `gsplat` required. It also happens to pass with numpy
 absent, which is how this container came back after a restart -- nothing under
 `atlas/` imports it.
@@ -67,6 +71,60 @@ From `tests/`, on CPU:
 | Homogeneity through the full renderer, **with gloss** | structural | 1.8e-15 |
 | Sharpest roughness a 64-row prefiltered map can hold | — | 0.263 |
 | Transport learning rate that converges | — | 0.02 (0.05 diverges) |
+
+## Capture preparation: off-the-shelf, end to end
+
+Real captures are unposed RAW/JPEG from one body with the flash on it. Every
+stage between those files and training is now an established tool, joined by
+`atlas/prep/` with the radiometric and metric bookkeeping made explicit:
+
+| Stage | Tool | Our part |
+| --- | --- | --- |
+| Decode | LibRaw (`rawpy`), linear 16-bit, camera WB, no auto-bright | EXIF `ISO/N^2` exposure (shutter excluded: flash pulse) |
+| Features | COLMAP ALIKED-N16ROT + LightGlue; SIFT fallback | subprocess probe: the no-ONNX wheel *aborts* rather than raising |
+| Mapping | GLOMAP global SfM; incremental fallback below 80% registered | keep the largest model, one shared camera |
+| Undistort | COLMAP camera models, `grid_sample` on linear floats | no 8-bit round trip |
+| Scale | — | focus = least-squares meet of optical axes; median camera at `--camera-distance` metres, so near-field falloff and flash offset are metric |
+| Lights | — | flash at `--flash-offset` in camera axes, per shot |
+| Masks | BiRefNet via `rembg` (optional) | soft masks, applied as loss weights |
+| Init | SfM points → 3DGS PLY (kNN scale, opacity 0.1) | radius and track-length filter |
+| Densify | gsplat `MCMCStrategy` + its opacity/scale L1 | `transport [N,3,B]` follows relocation; model rebound each call |
+
+On the workstation:
+
+```bash
+pip install -e ".[capture,gpu]"   # + rembg[gpu] for masks
+atlas-prepare /data/Arago_Metashape/Images/1st_set runs/arago1 \
+    --flash-offset 0 -0.12 0 --camera-distance 0.8 --masks rembg -v
+atlas-inspect runs/arago1
+python -m atlas.train --config <cfg> data.capture_dir=runs/arago1 \
+    model.init_ply=runs/arago1/init.ply densify.strategy=mcmc
+```
+
+Measured here, on pycolmap's synthetic photographs (12 shots, seeded): 12/12
+registered, 0.81 px reprojection error, focal 1282 px against 1280 true,
+camera layout within 0.4% of the truth up to similarity, coupling report
+`co_located` at 5.5 deg for a 10 cm offset at 1 m. 5 s end to end on CPU. A
+16-shot synthetic scene fails in COLMAP itself, on the original images too:
+synthetic overlap, not the pipeline.
+
+## The roughness sweep: the hand-rolled specular fit loses
+
+GGX ground truth, co-located capture, 32 views, held-out **extrapolated** arc,
+PSNR on mu-law tonemapped radiance (constant-image floor in brackets):
+
+| roughness | diffuse-only | prefiltered specular | specular − diffuse |
+| --- | --- | --- | --- |
+| 0.30 | 21.00 (8.80) | 15.10 | −5.89 dB |
+| 0.50 | 24.56 (9.01) | 15.58 | −8.98 dB |
+| 0.80 | 27.84 (9.12) | 16.19 | −11.65 dB |
+
+More steps make the specular fit worse, and batch 4 × 700 steps reaches only
+14.82; this is identifiability or optimisation, not budget. **Do not enable the
+specular ladder on real data** until a fit beats diffuse-only on this sweep.
+Linearity in the light (1e-15) is unaffected either way. The sweep also exposed
+a real bug: `Trainer.baseline_psnr` cached one floor for every held-out set.
+Fixed, with a regression test.
 
 ## Correction: a flash-on-camera capture is usable after all
 

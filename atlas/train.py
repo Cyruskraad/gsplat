@@ -282,6 +282,7 @@ class Trainer:
             self.params, self.model.atom_axes, self.model.atom_sharpness
         )
         self.optimizers = self._build_optimizers()
+        self.strategy, self.strategy_state = self._build_strategy()
         self.state = TrainState()
         self.chunk_size = config.runtime.chunk_size
         self._baseline_cache: Dict[str, float] = {}
@@ -330,6 +331,76 @@ class Trainer:
                 eps=1e-15,
             )
         return optimizers
+
+    def _primitive_optimizers(self) -> Dict[str, torch.optim.Optimizer]:
+        return {k: v for k, v in self.optimizers.items() if k != "atoms"}
+
+    def _build_strategy(self):
+        """gsplat's densification strategy, or ``(None, None)``."""
+        densify = self.config.densify
+        if densify.strategy == "none":
+            return None, None
+        if densify.strategy != "mcmc":
+            raise ValueError(
+                f"densify.strategy must be 'none' or 'mcmc', got {densify.strategy!r}"
+            )
+        if self.config.model.transport_only:
+            raise ValueError(
+                "densification moves geometry; it cannot run with "
+                "model.transport_only, which freezes it"
+            )
+        try:
+            from gsplat.strategy import MCMCStrategy
+        except ImportError as error:
+            raise ImportError(
+                "densify.strategy='mcmc' uses gsplat's MCMCStrategy; install the "
+                "GPU extra (pip install -e '.[gpu]') or set densify.strategy=none"
+            ) from error
+        strategy = MCMCStrategy(
+            cap_max=densify.cap_max,
+            noise_lr=densify.noise_lr,
+            refine_start_iter=densify.refine_start,
+            refine_stop_iter=densify.refine_stop,
+            refine_every=densify.refine_every,
+            min_opacity=densify.min_opacity,
+        )
+        strategy.check_sanity(self.params, self._primitive_optimizers())
+        return strategy, strategy.initialize_state()
+
+    def _densify(self) -> None:
+        """One call of the strategy, then rebind the model to the new tensors.
+
+        gsplat replaces entries of ``self.params`` with new ``Parameter``
+        objects when it relocates or adds Gaussians; a model still holding the
+        old ones would render stale geometry and train nothing.
+        """
+        if self.strategy is None:
+            return
+        means_lr = self.optimizers["means"].param_groups[0]["lr"]
+        self.strategy.step_post_backward(
+            params=self.params,
+            optimizers=self._primitive_optimizers(),
+            state=self.strategy_state,
+            step=self.state.step,
+            info={},
+            lr=means_lr,
+        )
+        self.model = RelightSplats.from_parameter_dict(
+            self.params, self.model.atom_axes, self.model.atom_sharpness
+        )
+
+    def _regularisers(self) -> Tuple[Optional[Tensor], Dict[str, float]]:
+        """MCMC's opacity and scale L1 terms, when densifying."""
+        densify = self.config.densify
+        if self.strategy is None:
+            return None, {}
+        opacity = torch.sigmoid(self.params["opacities"]).mean()
+        scale = torch.exp(self.params["scales"]).mean()
+        total = densify.opacity_reg * opacity + densify.scale_reg * scale
+        return total, {
+            "opacity_reg": float(opacity.detach()),
+            "scale_reg": float(scale.detach()),
+        }
 
     def _light_for(self, frame) -> Tensor:
         """Per-primitive light coefficients for one shot.
@@ -412,6 +483,11 @@ class Trainer:
             for key, value in parts.items():
                 totals[key] = totals.get(key, 0.0) + value / len(indices)
 
+        regulariser, reg_parts = self._regularisers()
+        if regulariser is not None:
+            regulariser.backward()
+            totals.update(reg_parts)
+
         grad_norm = self._grad_norm()
         if not math.isfinite(grad_norm):
             raise TrainingDiverged(
@@ -428,11 +504,15 @@ class Trainer:
             optimizer.step()
         if optim.learn_atoms:
             self.model.normalise_atoms_()
+        # gsplat's own order (examples/simple_trainer.py): the strategy runs
+        # after the optimiser step, on the updated parameters.
+        self._densify()
 
         self._assert_finite(indices)
         self.state.step += 1
         totals["grad_norm"] = grad_norm
         totals["lr_scale"] = scale
+        totals["primitives"] = float(self.model.num_primitives)
         return totals
 
     def _grad_norm(self) -> float:
