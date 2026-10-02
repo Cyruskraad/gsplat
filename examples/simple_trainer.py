@@ -71,6 +71,8 @@ except ModuleNotFoundError as e:
     ) from e
 from gsplat.cuda._wrapper import CameraModel
 from gsplat.strategy import DefaultStrategy, MCMCStrategy
+
+from examples.checkpointing import completed_update_checkpoint
 from gsplat_viewer import GsplatViewer, GsplatRenderTabState
 from nerfview import CameraState, RenderTabState, apply_float_colormap
 
@@ -858,9 +860,16 @@ class Runner:
 
         self._gaussians_frozen = True
 
-    def _checkpoint_payload(self, step: int, schedulers=()) -> Dict[str, object]:
+    def _checkpoint_payload(
+        self, step: int, schedulers=(), *, completed_updates: Optional[int] = None
+    ) -> Dict[str, object]:
+        if completed_updates is None:
+            completed_updates = step + 1
+        if completed_updates != step + 1:
+            raise ValueError("checkpoint completed-update count differs from loop step")
         data: Dict[str, object] = {
             "step": step,
+            "completed_updates": completed_updates,
             "scene_id": self.scene.id,
             "splats": self.splats.state_dict(),
             "optimizers": {
@@ -885,8 +894,15 @@ class Runner:
             data["post_processing"] = self.post_processing_module.state_dict()
         return _weights_only_safe(data)
 
-    def _save_checkpoint(self, step: int, path: str, schedulers=()) -> None:
-        torch.save(self._checkpoint_payload(step, schedulers), path)
+    def _save_checkpoint(
+        self, step: int, path: str, schedulers=(), *, completed_updates: Optional[int] = None
+    ) -> None:
+        torch.save(
+            self._checkpoint_payload(
+                step, schedulers, completed_updates=completed_updates
+            ),
+            path,
+        )
         print("[Distillation] Gaussian parameters frozen")
 
     def rasterize_splats(
@@ -1342,25 +1358,6 @@ class Runner:
                     self.writer.add_image("train/render", canvas, step)
                 self.writer.flush()
 
-            # save checkpoint before updating the model
-            if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
-                mem = torch.cuda.max_memory_allocated() / 1024**3
-                stats = {
-                    "mem": mem,
-                    "ellipse_time": time.time() - global_tic,
-                    "num_GS": len(self.splats["means"]),
-                }
-                print("Step: ", step, stats)
-                with open(
-                    f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
-                    "w",
-                ) as f:
-                    json.dump(stats, f)
-                self._save_checkpoint(
-                    step,
-                    f"{self.ckpt_dir}/ckpt_{step}_rank{self.world_rank}.pt",
-                    schedulers,
-                )
             if (
                 step in [i - 1 for i in cfg.ply_steps] or step == max_steps - 1
             ) and cfg.save_ply:
@@ -1465,6 +1462,31 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+            # save completed-update checkpoint
+            if step in [i - 1 for i in cfg.save_steps] or step == max_steps - 1:
+                checkpoint = completed_update_checkpoint(
+                    loop_step=step, world_rank=self.world_rank
+                )
+                mem = torch.cuda.max_memory_allocated() / 1024**3
+                stats = {
+                    "mem": mem,
+                    "ellipse_time": time.time() - global_tic,
+                    "num_GS": len(self.splats["means"]),
+                    "completed_updates": checkpoint.completed_updates,
+                }
+                print("Completed updates: ", checkpoint.completed_updates, stats)
+                with open(
+                    f"{self.stats_dir}/train_step{step:04d}_rank{self.world_rank}.json",
+                    "w",
+                ) as f:
+                    json.dump(stats, f)
+                self._save_checkpoint(
+                    step,
+                    f"{self.ckpt_dir}/{checkpoint.filename}",
+                    schedulers,
+                    completed_updates=checkpoint.completed_updates,
+                )
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
