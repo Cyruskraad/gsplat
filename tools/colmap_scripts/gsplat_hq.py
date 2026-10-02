@@ -13,7 +13,6 @@ import cv2
 
 from .utils import PipelineError
 
-
 SPLIT_METHOD = "camera-pose-farthest-point-v1"
 
 
@@ -138,7 +137,11 @@ def create_split_manifest(
             validation_indices.add(index)
         elif len(test_indices) < test_count and index not in validation_indices:
             test_indices.add(index)
-    train = [name for index, name in enumerate(names) if index not in validation_indices | test_indices]
+    train = [
+        name
+        for index, name in enumerate(names)
+        if index not in validation_indices | test_indices
+    ]
     validation = [names[index] for index in sorted(validation_indices)]
     test = [names[index] for index in sorted(test_indices)]
     splits = {
@@ -167,7 +170,9 @@ def write_split_manifest(
         test_count=test_count,
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     return output
 
 
@@ -190,11 +195,10 @@ def validate_image_mask_contract(
     if missing or extra:
         missing_names = [image_by_stem[key] for key in missing]
         extra_names = [mask_by_stem[key] for key in extra]
-        raise PipelineError(f"Mask contract mismatch: missing={missing_names} extra={extra_names}")
-    return {
-        image_by_stem[key]: mask_by_stem[key]
-        for key in sorted(image_by_stem)
-    }
+        raise PipelineError(
+            f"Mask contract mismatch: missing={missing_names} extra={extra_names}"
+        )
+    return {image_by_stem[key]: mask_by_stem[key] for key in sorted(image_by_stem)}
 
 
 def padded_foreground_bbox(
@@ -226,11 +230,16 @@ def inspect_object_mask(mask: np.ndarray) -> dict[str, object]:
     foreground_pixels = int(binary.sum())
     if foreground_pixels == 0:
         raise PipelineError("Object mask is empty")
-    component_count_with_background, labels, stats, _ = cv2.connectedComponentsWithStats(
-        binary.astype(np.uint8), connectivity=8
-    )
+    (
+        component_count_with_background,
+        labels,
+        stats,
+        _,
+    ) = cv2.connectedComponentsWithStats(binary.astype(np.uint8), connectivity=8)
     component_count = component_count_with_background - 1
-    areas = stats[1:, cv2.CC_STAT_AREA] if component_count else np.asarray([], dtype=int)
+    areas = (
+        stats[1:, cv2.CC_STAT_AREA] if component_count else np.asarray([], dtype=int)
+    )
     largest = int(areas.max()) if len(areas) else 0
     touches_border = bool(
         binary[0, :].any()
@@ -262,7 +271,9 @@ def stage_gsplat_dataset(
     }
     for label, source in sources.items():
         if not source.is_dir():
-            raise PipelineError(f"Gaussian-splatting {label} directory missing: {source}")
+            raise PipelineError(
+                f"Gaussian-splatting {label} directory missing: {source}"
+            )
     destination.mkdir(parents=True, exist_ok=True)
     for label, source in sources.items():
         target = destination / label
@@ -283,9 +294,13 @@ def select_best_checkpoint(
             f"No checkpoint reaches alpha IoU >= {minimum_alpha_iou:.3f}"
         )
     best_lpips = min(record.lpips for record in eligible)
-    perceptual_ties = [record for record in eligible if record.lpips <= best_lpips + 0.005]
+    perceptual_ties = [
+        record for record in eligible if record.lpips <= best_lpips + 0.005
+    ]
     best_psnr = max(record.psnr for record in perceptual_ties)
-    pixel_ties = [record for record in perceptual_ties if record.psnr >= best_psnr - 0.2]
+    pixel_ties = [
+        record for record in perceptual_ties if record.psnr >= best_psnr - 0.2
+    ]
     return min(pixel_ties, key=lambda record: (record.num_gaussians, record.step))
 
 
@@ -293,9 +308,7 @@ def compact_candidate_passes(compact: ValidationRecord, hq: ValidationRecord) ->
     quality_ok = compact.psnr >= hq.psnr - 0.3 and compact.lpips <= hq.lpips + 0.02
     gaussian_reduction = 1.0 - compact.num_gaussians / hq.num_gaussians
     fps_gain = (
-        compact.fps is not None
-        and hq.fps is not None
-        and compact.fps >= hq.fps * 1.25
+        compact.fps is not None and hq.fps is not None and compact.fps >= hq.fps * 1.25
     )
     return quality_ok and (gaussian_reduction >= 0.30 or fps_gain)
 

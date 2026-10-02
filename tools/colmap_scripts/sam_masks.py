@@ -18,14 +18,10 @@ class SamPrompts:
     box: np.ndarray
 
 
-def mask_evidence_is_valid(
-    *, seed_recall: float, mesh_recall: float | None
-) -> bool:
+def mask_evidence_is_valid(*, seed_recall: float, mesh_recall: float | None) -> bool:
     if seed_recall >= 0.85:
         return True
-    return bool(
-        mesh_recall is not None and seed_recall >= 0.70 and mesh_recall >= 0.80
-    )
+    return bool(mesh_recall is not None and seed_recall >= 0.70 and mesh_recall >= 0.80)
 
 
 def refine_sam_with_mesh_envelope(
@@ -37,7 +33,9 @@ def refine_sam_with_mesh_envelope(
     sam = np.asarray(sam_mask, dtype=bool)
     mesh = np.asarray(mesh_mask, dtype=bool)
     if sam.ndim != 2 or mesh.shape != sam.shape:
-        raise PipelineError("SAM and mesh masks must have the same two-dimensional shape")
+        raise PipelineError(
+            "SAM and mesh masks must have the same two-dimensional shape"
+        )
     if not 0 < envelope_fraction < 0.5:
         raise PipelineError("Mesh envelope fraction must be between zero and 0.5")
     radius = max(1, round(min(sam.shape) * envelope_fraction))
@@ -53,18 +51,15 @@ def blue_seed_mask(image_rgb: np.ndarray) -> np.ndarray:
         raise PipelineError("SAM prompt image must be RGB")
     hsv = cv2.cvtColor(image_rgb[..., :3], cv2.COLOR_RGB2HSV)
     hue, saturation, value = cv2.split(hsv)
-    return (
-        (hue >= 95)
-        & (hue <= 135)
-        & (saturation >= 75)
-        & (value >= 20)
-    )
+    return (hue >= 95) & (hue <= 135) & (saturation >= 75) & (value >= 20)
 
 
 def _sample_mask_points(mask: np.ndarray, count: int) -> np.ndarray:
     coordinates_yx = np.argwhere(mask)
     if len(coordinates_yx) < count:
-        raise PipelineError(f"Cannot sample {count} prompts from {len(coordinates_yx)} pixels")
+        raise PipelineError(
+            f"Cannot sample {count} prompts from {len(coordinates_yx)} pixels"
+        )
     if len(coordinates_yx) > 50_000:
         sample_indices = np.linspace(0, len(coordinates_yx) - 1, 50_000, dtype=int)
         coordinates_yx = coordinates_yx[sample_indices]
@@ -75,7 +70,9 @@ def _sample_mask_points(mask: np.ndarray, count: int) -> np.ndarray:
     while len(selected) < count:
         index = int(np.argmax(nearest))
         selected.append(index)
-        nearest = np.minimum(nearest, np.linalg.norm(coordinates - coordinates[index], axis=1))
+        nearest = np.minimum(
+            nearest, np.linalg.norm(coordinates - coordinates[index], axis=1)
+        )
     return np.rint(coordinates[selected]).astype(np.float32)
 
 
@@ -128,9 +125,7 @@ def build_sam_prompts(
     negative_parts: list[np.ndarray] = []
     selected_mask = np.zeros(seeds.shape, dtype=bool)
     if support_candidates.any():
-        support_count = min(
-            max(1, negative_count // 2), int(support_candidates.sum())
-        )
+        support_count = min(max(1, negative_count // 2), int(support_candidates.sum()))
         support_points = _sample_mask_points(support_candidates, support_count)
         negative_parts.append(support_points)
         selected_mask[
@@ -151,7 +146,10 @@ def build_sam_prompts(
     return SamPrompts(
         points=np.concatenate([positives, negatives], axis=0),
         labels=np.concatenate(
-            [np.ones(len(positives), dtype=np.int32), np.zeros(len(negatives), dtype=np.int32)]
+            [
+                np.ones(len(positives), dtype=np.int32),
+                np.zeros(len(negatives), dtype=np.int32),
+            ]
         ),
         box=np.asarray([x0, y0, x1, y1], dtype=np.float32),
     )
@@ -194,5 +192,7 @@ def select_sam_candidate(
                 "objective": objective,
             }
         )
-    selected_index = max(range(len(reports)), key=lambda index: reports[index]["objective"])
+    selected_index = max(
+        range(len(reports)), key=lambda index: reports[index]["objective"]
+    )
     return masks[selected_index], selected_index, reports[selected_index]

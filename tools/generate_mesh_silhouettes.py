@@ -50,12 +50,10 @@ def main() -> int:
     reconstruction = pycolmap.Reconstruction(args.model)
     ply = PlyData.read(args.mesh)
     vertices = ply["vertex"]
-    points = np.column_stack(
-        (vertices["x"], vertices["y"], vertices["z"])
-    ).astype(np.float64)
-    faces = np.asarray(
-        [face for face in ply["face"]["vertex_indices"]], dtype=np.int32
+    points = np.column_stack((vertices["x"], vertices["y"], vertices["z"])).astype(
+        np.float64
     )
+    faces = np.asarray([face for face in ply["face"]["vertex_indices"]], dtype=np.int32)
     if len(points) == 0 or len(faces) == 0 or faces.shape[1] != 3:
         raise SystemExit("mesh must contain triangular faces")
 
@@ -112,9 +110,7 @@ def main() -> int:
             dtype=np.float64,
         )
         rvec, _ = cv2.Rodrigues(rotation)
-        distortion = (
-            params[4:8] if str(camera.model_name) == "OPENCV" else np.zeros(4)
-        )
+        distortion = params[4:8] if str(camera.model_name) == "OPENCV" else np.zeros(4)
         projected, _ = cv2.projectPoints(
             points, rvec, translation, intrinsics, distortion
         )

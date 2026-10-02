@@ -56,9 +56,7 @@ def _telemetry_loop(
         if sample:
             with telemetry_path.open("a", encoding="utf-8") as handle:
                 for line in sample.splitlines():
-                    handle.write(
-                        f"{datetime.now(timezone.utc).isoformat()},{line}\n"
-                    )
+                    handle.write(f"{datetime.now(timezone.utc).isoformat()},{line}\n")
         if _directory_size(run_dir) > maximum_bytes and process.poll() is None:
             (run_dir / "resource_abort.txt").write_text(
                 "artifact cap exceeded\n", encoding="utf-8"

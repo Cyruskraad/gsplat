@@ -8,7 +8,6 @@ from pathlib import Path
 import re
 from typing import Any, Iterable
 
-
 _SUMMARY_PATTERN = re.compile(r"val_step(?P<step>\d+)\.json$")
 _PER_VIEW_PATTERN = re.compile(r"val_step(?P<step>\d+)_per_view\.json$")
 
@@ -17,12 +16,16 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _fieldnames(rows: Iterable[dict[str, object]], preferred: tuple[str, ...]) -> list[str]:
+def _fieldnames(
+    rows: Iterable[dict[str, object]], preferred: tuple[str, ...]
+) -> list[str]:
     keys = {key for row in rows for key in row}
     return [key for key in preferred if key in keys] + sorted(keys - set(preferred))
 
 
-def _write_csv(path: Path, rows: list[dict[str, object]], preferred: tuple[str, ...]) -> None:
+def _write_csv(
+    path: Path, rows: list[dict[str, object]], preferred: tuple[str, ...]
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=_fieldnames(rows, preferred))
@@ -44,7 +47,9 @@ def export_metrics_csv(stats_dir: Path, output_dir: Path) -> dict[str, Path]:
                 raise ValueError(f"Per-view metrics must be a JSON list: {path}")
             for raw in payload:
                 if not isinstance(raw, dict):
-                    raise ValueError(f"Per-view metric rows must be JSON objects: {path}")
+                    raise ValueError(
+                        f"Per-view metric rows must be JSON objects: {path}"
+                    )
                 row = {"step": step, **raw}
                 per_view.append(row)
             continue
@@ -62,7 +67,9 @@ def export_metrics_csv(stats_dir: Path, output_dir: Path) -> dict[str, Path]:
         _write_csv(output, checkpoints, ("step",))
         outputs["checkpoints"] = output
     if per_view:
-        per_view.sort(key=lambda row: (int(row["step"]), str(row.get("image_name", ""))))
+        per_view.sort(
+            key=lambda row: (int(row["step"]), str(row.get("image_name", "")))
+        )
         output = output_dir / "validation_per_view.csv"
         _write_csv(output, per_view, ("step", "image_name"))
         outputs["per_view"] = output

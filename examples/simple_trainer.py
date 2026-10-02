@@ -189,7 +189,9 @@ def _scale_restored_learning_rates(optimizers, schedulers, scale: float) -> None
 
 
 def _validation_better(
-    candidate: Dict[str, float], current: Optional[Dict[str, float]], minimum_alpha_iou: float
+    candidate: Dict[str, float],
+    current: Optional[Dict[str, float]],
+    minimum_alpha_iou: float,
 ) -> bool:
     if candidate.get("alpha_iou", 0.0) < minimum_alpha_iou:
         return False
@@ -873,7 +875,8 @@ class Runner:
             "scene_id": self.scene.id,
             "splats": self.splats.state_dict(),
             "optimizers": {
-                key: optimizer.state_dict() for key, optimizer in self.optimizers.items()
+                key: optimizer.state_dict()
+                for key, optimizer in self.optimizers.items()
             },
             "schedulers": [scheduler.state_dict() for scheduler in schedulers],
             "strategy_state": self.strategy_state,
@@ -895,7 +898,12 @@ class Runner:
         return _weights_only_safe(data)
 
     def _save_checkpoint(
-        self, step: int, path: str, schedulers=(), *, completed_updates: Optional[int] = None
+        self,
+        step: int,
+        path: str,
+        schedulers=(),
+        *,
+        completed_updates: Optional[int] = None,
     ) -> None:
         torch.save(
             self._checkpoint_payload(
@@ -1498,7 +1506,9 @@ class Runner:
                     ):
                         self.best_validation = dict(stats)
                         self._save_checkpoint(
-                            step, f"{self.ckpt_dir}/best_rank{self.world_rank}.pt", schedulers
+                            step,
+                            f"{self.ckpt_dir}/best_rank{self.world_rank}.pt",
+                            schedulers,
                         )
                         with open(
                             f"{self.stats_dir}/best_validation.json", "w"
@@ -1630,12 +1640,8 @@ class Runner:
                 full_rendered, full_target = _resize_metric_pair(
                     full_rendered, full_target, cfg.metric_max_size
                 )
-                metrics["full_frame_psnr"].append(
-                    self.psnr(full_rendered, full_target)
-                )
-                metrics["full_frame_ssim"].append(
-                    self.ssim(full_rendered, full_target)
-                )
+                metrics["full_frame_psnr"].append(self.psnr(full_rendered, full_target))
+                metrics["full_frame_ssim"].append(self.ssim(full_rendered, full_target))
                 metrics["full_frame_lpips"].append(
                     self.lpips(full_rendered, full_target)
                 )

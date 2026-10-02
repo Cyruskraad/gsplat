@@ -32,7 +32,9 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _overlay(image: np.ndarray, mask: np.ndarray, maximum_size: int = 1600) -> Image.Image:
+def _overlay(
+    image: np.ndarray, mask: np.ndarray, maximum_size: int = 1600
+) -> Image.Image:
     scale = min(1.0, maximum_size / max(image.shape[:2]))
     size = (round(image.shape[1] * scale), round(image.shape[0] * scale))
     preview = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
@@ -51,9 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--images", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument(
-        "--model-config", default="configs/sam2.1/sam2.1_hiera_l.yaml"
-    )
+    parser.add_argument("--model-config", default="configs/sam2.1/sam2.1_hiera_l.yaml")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--names", nargs="*", default=[])
@@ -86,7 +86,8 @@ def _mesh_mask_for_image(directory: Path, image_path: Path) -> Path:
         path
         for path in directory.iterdir()
         if path.is_file()
-        and path.stem.casefold() in {
+        and path.stem.casefold()
+        in {
             image_path.stem.casefold(),
             f"{image_path.stem}-mask".casefold(),
         }
@@ -188,8 +189,7 @@ def main() -> int:
                 ).astype(bool)
                 recovered["mesh_fill_fraction"] = float(mesh_mask.mean())
                 recovered["mesh_recall"] = float(
-                    np.logical_and(mask, mesh_mask).sum()
-                    / max(int(mesh_mask.sum()), 1)
+                    np.logical_and(mask, mesh_mask).sum() / max(int(mesh_mask.sum()), 1)
                 )
             recovered["valid"] = bool(
                 0.02 <= report["fill_fraction"] <= 0.65
@@ -208,7 +208,9 @@ def main() -> int:
                 failures.append(image_path.name)
             continue
         if mask_path.exists() or overlay_path.exists():
-            raise SystemExit(f"refusing to overwrite existing output for {image_path.name}")
+            raise SystemExit(
+                f"refusing to overwrite existing output for {image_path.name}"
+            )
 
         image_pil = Image.open(image_path).convert("RGB")
         image = np.asarray(image_pil).copy()
@@ -359,7 +361,9 @@ def main() -> int:
         "grounding_model": args.grounding_model,
         "grounding_prompts": grounding_prompts if args.grounding_model else [],
         "mesh_mask_dir": (
-            str(args.mesh_mask_dir.resolve()) if args.mesh_mask_dir is not None else None
+            str(args.mesh_mask_dir.resolve())
+            if args.mesh_mask_dir is not None
+            else None
         ),
         "mesh_envelope_fraction": args.mesh_envelope_fraction,
         "image_count": len(records),

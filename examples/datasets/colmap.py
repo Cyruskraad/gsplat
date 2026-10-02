@@ -85,10 +85,14 @@ def _object_mask_paths(mask_dir: str, image_names: List[str]) -> List[str]:
     extra = [path for path in mask_files if _relative_stem(path) not in image_stems]
     if missing or extra:
         raise ValueError(f"Object mask mismatch: missing={missing} extra={extra}")
-    return [os.path.join(mask_dir, by_stem[_relative_stem(name)]) for name in image_names]
+    return [
+        os.path.join(mask_dir, by_stem[_relative_stem(name)]) for name in image_names
+    ]
 
 
-def _split_indices(split_manifest: str, image_names: List[str]) -> Dict[str, np.ndarray]:
+def _split_indices(
+    split_manifest: str, image_names: List[str]
+) -> Dict[str, np.ndarray]:
     with open(split_manifest, encoding="utf-8") as handle:
         payload = json.load(handle)
     splits = payload.get("splits", {})
@@ -613,11 +617,14 @@ class Dataset:
             object_mask = imageio.imread(object_mask_path)
             if object_mask.ndim == 3:
                 object_mask = object_mask[..., 0]
-            object_mask = cv2.resize(
-                object_mask,
-                (image.shape[1], image.shape[0]),
-                interpolation=cv2.INTER_NEAREST,
-            ) > 127
+            object_mask = (
+                cv2.resize(
+                    object_mask,
+                    (image.shape[1], image.shape[0]),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+                > 127
+            )
 
         if len(params) > 0:
             # Images are distorted. Undistort them.
@@ -645,7 +652,9 @@ class Dataset:
             y = np.random.randint(0, max(h - self.patch_size, 1))
             image = image[y : y + self.patch_size, x : x + self.patch_size]
             if object_mask is not None:
-                object_mask = object_mask[y : y + self.patch_size, x : x + self.patch_size]
+                object_mask = object_mask[
+                    y : y + self.patch_size, x : x + self.patch_size
+                ]
             K[0, 2] -= x
             K[1, 2] -= y
 

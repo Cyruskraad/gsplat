@@ -18,9 +18,7 @@ def initialize_status(run_dir: Path) -> None:
     )
 
 
-def finalize_status(
-    run_dir: Path, *, succeeded: bool, exit_code: int = 0
-) -> Path:
+def finalize_status(run_dir: Path, *, succeeded: bool, exit_code: int = 0) -> Path:
     running = run_dir / "RUNNING"
     if not running.is_file():
         raise PipelineError(f"Run has no RUNNING status: {run_dir}")

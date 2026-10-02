@@ -59,7 +59,9 @@ def run_cmd(
     printable = " ".join(shlex.quote(a) for a in args)
     print(f"[RUN] {printable}")
     if dry_run:
-        return subprocess.CompletedProcess(args=tuple(args), returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(
+            args=tuple(args), returncode=0, stdout="", stderr=""
+        )
     try:
         cp = subprocess.run(
             args,
@@ -71,7 +73,9 @@ def run_cmd(
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired as exc:
-        raise PipelineError(f"Command timed out after {timeout_seconds}s: {printable}") from exc
+        raise PipelineError(
+            f"Command timed out after {timeout_seconds}s: {printable}"
+        ) from exc
     if cp.returncode != 0:
         raise PipelineError(
             f"Command failed with status {cp.returncode}: {printable}\n{cp.stderr}"

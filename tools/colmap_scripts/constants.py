@@ -3,7 +3,9 @@
 from pathlib import Path
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
-ARAGO_RUNS_ROOT = Path("/home/dhlab/Documents/arago-3d-reconstruction/runs/colmap-scripts")
+ARAGO_RUNS_ROOT = Path(
+    "/home/dhlab/Documents/arago-3d-reconstruction/runs/colmap-scripts"
+)
 RELIGHT_RUNS_ROOT = Path("/home/dhlab/Documents/arago-3d-reconstruction/runs/uv-mgs")
 
 REQUIRED_IMAGE_COUNT = 32

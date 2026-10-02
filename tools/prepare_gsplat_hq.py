@@ -65,7 +65,11 @@ def main() -> int:
             f"free disk {free_gib:.1f} GiB is below {args.minimum_free_disk_gib:.1f} GiB"
         )
     gpu = subprocess.run(
-        ["nvidia-smi", "--query-gpu=name,memory.free,utilization.gpu", "--format=csv,noheader"],
+        [
+            "nvidia-smi",
+            "--query-gpu=name,memory.free,utilization.gpu",
+            "--format=csv,noheader",
+        ],
         check=False,
         text=True,
         capture_output=True,
@@ -78,7 +82,8 @@ def main() -> int:
     image_paths = {
         str(path.relative_to(args.images)): path
         for path in args.images.rglob("*")
-        if path.is_file() and path.suffix.casefold() in {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+        if path.is_file()
+        and path.suffix.casefold() in {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
     }
     mask_paths = {
         str(path.relative_to(args.masks)): path
@@ -98,7 +103,9 @@ def main() -> int:
         mask_path = mask_paths[image_to_mask[image_name]]
         with Image.open(image_path) as image, Image.open(mask_path) as source_mask:
             if image.size != source_mask.size:
-                failures.append(f"{image_name}: resolution {image.size} != {source_mask.size}")
+                failures.append(
+                    f"{image_name}: resolution {image.size} != {source_mask.size}"
+                )
             mask = np.asarray(source_mask.convert("L")) > 127
         report = inspect_object_mask(mask)
         valid = bool(
@@ -134,7 +141,11 @@ def main() -> int:
     (args.destination / "preflight.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
-    print(json.dumps({key: value for key, value in payload.items() if key != "mask_reports"}))
+    print(
+        json.dumps(
+            {key: value for key, value in payload.items() if key != "mask_reports"}
+        )
+    )
     return 0
 
 

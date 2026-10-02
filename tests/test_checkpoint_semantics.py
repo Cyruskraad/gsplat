@@ -8,11 +8,13 @@ def _trainer_source() -> tuple[str, ast.FunctionDef]:
     source = Path("examples/simple_trainer.py").read_text()
     module = ast.parse(source)
     runner = next(
-        node for node in module.body
+        node
+        for node in module.body
         if isinstance(node, ast.ClassDef) and node.name == "Runner"
     )
     train = next(
-        node for node in runner.body
+        node
+        for node in runner.body
         if isinstance(node, ast.FunctionDef) and node.name == "train"
     )
     return source, train
