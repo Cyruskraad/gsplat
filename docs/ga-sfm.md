@@ -1,5 +1,35 @@
 # Geometric-algebra structure from motion
 
+> ## Superseded — do not develop this further
+>
+> This work continues in **[`Cyruskraad/gasfm`](https://github.com/Cyruskraad/gasfm)**,
+> as a standalone package. That repository is the single home for it.
+>
+> The two were diffed module by module on 5 October 2026, and **every one of the
+> 14 modules in `gsplat/contrib/ga` exists there**. `motor.py`, `algebra.py` and
+> `primitives.py` differ only in their import path; `camera.py`, `camera_opt.py`
+> and `baseline/ba.py` differ only in import paths and docstring wording. On the
+> four modules that carry the estimator, `gasfm` is substantially ahead:
+>
+> | module | lines ahead there | what it gained |
+> | --- | --- | --- |
+> | `sfm/_lm.py` | 365 | a third parameter block, which is what makes self-calibration possible |
+> | `sfm/averaging.py` | 288 | a per-edge Jacobian — 401× at 120 views |
+> | `sfm/twoview.py` | 283 | MSAC, LO-RANSAC and the five-point minimal solver |
+> | `sfm/ba.py` | 189 | the focal-length Jacobian |
+>
+> And fourteen modules there have no counterpart here at all: the incremental
+> pipeline, the five-point solver, absolute pose, homography, track building,
+> COLMAP input and output, undistortion, the dataset writer, a learned
+> front-end, a renderer, a device policy, and the evaluation module — plus a
+> CLI, capture diagnostics and CI.
+>
+> **This branch has no unique content**, which is why nothing was ported out of
+> it. It is kept for provenance. `docs/related-work.md` in `gasfm` records the
+> diff above.
+>
+> Everything below is the state of this branch as of `4d973aa`, left as written.
+
 Experimental. Lives in `gsplat/contrib/ga`, install with `pip install gsplat[ga]`.
 
 ## Why
