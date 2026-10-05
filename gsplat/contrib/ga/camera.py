@@ -157,7 +157,9 @@ def pixel_ray_planes(
     )
 
 
-def image_line_plane(intrinsics: torch.Tensor, image_lines: torch.Tensor) -> torch.Tensor:
+def image_line_plane(
+    intrinsics: torch.Tensor, image_lines: torch.Tensor
+) -> torch.Tensor:
     """Camera-frame interpretation plane ``(..., 4)`` of an observed 2D image line.
 
     ``image_lines`` are homogeneous 2D lines ``(a, b, c)`` with ``a*u + b*v + c = 0``.
@@ -172,9 +174,7 @@ def image_line_plane(intrinsics: torch.Tensor, image_lines: torch.Tensor) -> tor
     camera rather than transforming the plane out to the world. That keeps the
     pose dependence in one place.
     """
-    normal = torch.einsum(
-        "...ji,...j->...i", intrinsics, image_lines
-    )
+    normal = torch.einsum("...ji,...j->...i", intrinsics, image_lines)
     plane = torch.cat([normal, torch.zeros_like(normal[..., :1])], dim=-1)
     return _prim.normalize_plane(plane)
 
@@ -192,7 +192,11 @@ def project_line(
         motor = motor.expand(*lines.shape[:-1], 8)
     cam_line = _mot.motor_apply_line(motor, lines)
     # The plane through the pinhole containing the line: join the origin to it.
-    origin = torch.zeros(*cam_line.shape[:-1], 3, dtype=lines.dtype, device=lines.device)
+    origin = torch.zeros(
+        *cam_line.shape[:-1], 3, dtype=lines.dtype, device=lines.device
+    )
     plane = _prim.mv_join_point_line(origin, cam_line)
     normal = plane[..., :3]
-    return torch.linalg.solve(intrinsics.transpose(-2, -1), normal.unsqueeze(-1)).squeeze(-1)
+    return torch.linalg.solve(
+        intrinsics.transpose(-2, -1), normal.unsqueeze(-1)
+    ).squeeze(-1)

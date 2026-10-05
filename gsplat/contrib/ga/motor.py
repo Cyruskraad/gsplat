@@ -113,9 +113,7 @@ def motor_exp(biv: torch.Tensor) -> torch.Tensor:
     """
     theta, v_perp, v_par = _screw_split(biv)
     simple = _alg.bivector_mv(torch.cat([biv[..., :3], v_perp], dim=-1))
-    null = _alg.bivector_mv(
-        torch.cat([torch.zeros_like(v_par), v_par], dim=-1)
-    )
+    null = _alg.bivector_mv(torch.cat([torch.zeros_like(v_par), v_par], dim=-1))
     sinc = torch.sin(theta) / theta
     # exp(B_s) = cos(theta) + sinc(theta) * B_s ;  exp(B_p) = 1 + B_p
     exp_s = torch.cos(theta).squeeze(-1) + sinc.squeeze(-1) * simple
@@ -144,7 +142,9 @@ def motor_log(motor: torch.Tensor) -> torch.Tensor:
 
     # theta / sin(theta), continued smoothly to 1 at theta = 0.
     small = sin_theta < 1e-8
-    ratio = torch.where(small, torch.ones_like(theta), theta / sin_theta.clamp_min(_EPS))
+    ratio = torch.where(
+        small, torch.ones_like(theta), theta / sin_theta.clamp_min(_EPS)
+    )
     w = rot * ratio
     axis = torch.where(small, torch.zeros_like(rot), rot / sin_theta.clamp_min(_EPS))
 
@@ -273,27 +273,35 @@ def motor_from_matrix(matrix: torch.Tensor) -> torch.Tensor:
     # Four algebraically equivalent forms; each is stable where its own
     # denominator is largest.
     s0 = torch.sqrt((trace + 1.0).clamp_min(_EPS)) * 2.0
-    q0 = branch(0.25 * s0 * s0, m[2][1] - m[1][2], m[0][2] - m[2][0], m[1][0] - m[0][1], s0)
+    q0 = branch(
+        0.25 * s0 * s0, m[2][1] - m[1][2], m[0][2] - m[2][0], m[1][0] - m[0][1], s0
+    )
     s1 = torch.sqrt((1.0 + m[0][0] - m[1][1] - m[2][2]).clamp_min(_EPS)) * 2.0
-    q1 = branch(m[2][1] - m[1][2], 0.25 * s1 * s1, m[0][1] + m[1][0], m[0][2] + m[2][0], s1)
+    q1 = branch(
+        m[2][1] - m[1][2], 0.25 * s1 * s1, m[0][1] + m[1][0], m[0][2] + m[2][0], s1
+    )
     s2 = torch.sqrt((1.0 - m[0][0] + m[1][1] - m[2][2]).clamp_min(_EPS)) * 2.0
-    q2 = branch(m[0][2] - m[2][0], m[0][1] + m[1][0], 0.25 * s2 * s2, m[1][2] + m[2][1], s2)
+    q2 = branch(
+        m[0][2] - m[2][0], m[0][1] + m[1][0], 0.25 * s2 * s2, m[1][2] + m[2][1], s2
+    )
     s3 = torch.sqrt((1.0 - m[0][0] - m[1][1] + m[2][2]).clamp_min(_EPS)) * 2.0
-    q3 = branch(m[1][0] - m[0][1], m[0][2] + m[2][0], m[1][2] + m[2][1], 0.25 * s3 * s3, s3)
+    q3 = branch(
+        m[1][0] - m[0][1], m[0][2] + m[2][0], m[1][2] + m[2][1], 0.25 * s3 * s3, s3
+    )
 
     pick_0 = (trace > 0).unsqueeze(-1)
     pick_1 = ((m[0][0] >= m[1][1]) & (m[0][0] >= m[2][2])).unsqueeze(-1)
     pick_2 = (m[1][1] >= m[2][2]).unsqueeze(-1)
-    quat = torch.where(
-        pick_0, q0, torch.where(pick_1, q1, torch.where(pick_2, q2, q3))
-    )
+    quat = torch.where(pick_0, q0, torch.where(pick_1, q1, torch.where(pick_2, q2, q3)))
     quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(_EPS)
 
     # Rotor: rotation of angle alpha about unit axis n has bivector -alpha/2 * n.
     vec = quat[..., 1:]
     sin_half = torch.linalg.vector_norm(vec, dim=-1, keepdim=True)
     half_angle = torch.atan2(sin_half, quat[..., 0:1])
-    axis = torch.where(sin_half > 1e-12, vec / sin_half.clamp_min(_EPS), torch.zeros_like(vec))
+    axis = torch.where(
+        sin_half > 1e-12, vec / sin_half.clamp_min(_EPS), torch.zeros_like(vec)
+    )
     zeros = torch.zeros_like(translation)
     rotor = motor_exp(torch.cat([-half_angle * axis, zeros], dim=-1))
     translator = motor_exp(torch.cat([zeros, -translation / 2.0], dim=-1))

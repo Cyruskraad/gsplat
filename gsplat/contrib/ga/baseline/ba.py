@@ -109,9 +109,7 @@ def quat_rotate(q: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
 def quat_to_matrix(q: torch.Tensor) -> torch.Tensor:
     """``wxyz`` quaternion -> ``(..., 3, 3)`` rotation matrix."""
     eye = torch.eye(3, dtype=q.dtype, device=q.device).expand(*q.shape[:-1], 3, 3)
-    return torch.stack(
-        [quat_rotate(q, eye[..., :, i]) for i in range(3)], dim=-1
-    )
+    return torch.stack([quat_rotate(q, eye[..., :, i]) for i in range(3)], dim=-1)
 
 
 def rotation_from_axis_angle(omega: torch.Tensor) -> torch.Tensor:
@@ -120,7 +118,9 @@ def rotation_from_axis_angle(omega: torch.Tensor) -> torch.Tensor:
     half = angle / 2.0
     # sin(half)/angle, continued to 1/2 at angle = 0.
     small = angle < 1e-8
-    scale = torch.where(small, torch.full_like(angle, 0.5), torch.sin(half) / angle.clamp_min(_EPS))
+    scale = torch.where(
+        small, torch.full_like(angle, 0.5), torch.sin(half) / angle.clamp_min(_EPS)
+    )
     return torch.cat([torch.cos(half), omega * scale], dim=-1)
 
 
@@ -229,7 +229,9 @@ def bundle_adjust(
         quat = quat_multiply(delta_q, state.poses[:, :4])
         # Unit norm is a *constraint* here, so it has to be re-imposed every
         # step -- the cost the bivector parameterization does not pay.
-        quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(_EPS)
+        quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(
+            _EPS
+        )
         translation = quat_rotate(delta_q, state.poses[:, 4:]) + u
         return replace(
             state,

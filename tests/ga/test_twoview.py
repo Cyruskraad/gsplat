@@ -81,10 +81,14 @@ class TestEssentialMatrix:
         move it from sub-degree to several degrees of rotation error, which is
         why the consensus set is never trusted as-is.
         """
-        points_a, points_b, intrinsics, true_relative, _ = two_view_scene(pixel_noise=0.5)
+        points_a, points_b, intrinsics, true_relative, _ = two_view_scene(
+            pixel_noise=0.5
+        )
         clean = tv.relative_motor_from_essential(
             tv.essential_matrix(points_a, points_b, intrinsics),
-            points_a, points_b, intrinsics,
+            points_a,
+            points_b,
+            intrinsics,
         )
         clean_rotation, _ = pose_errors(clean, true_relative)
 
@@ -92,7 +96,9 @@ class TestEssentialMatrix:
         corrupted[0] = torch.tensor([12.0, 470.0], dtype=DTYPE)
         dirty = tv.relative_motor_from_essential(
             tv.essential_matrix(points_a, corrupted, intrinsics),
-            points_a, corrupted, intrinsics,
+            points_a,
+            corrupted,
+            intrinsics,
         )
         dirty_rotation, _ = pose_errors(dirty, true_relative)
         assert clean_rotation < 1.0
@@ -114,7 +120,9 @@ class TestResiduals:
 
     def test_ray_gap_is_large_for_wrong_correspondences(self):
         points_a, points_b, intrinsics, true_relative, _ = two_view_scene(points=200)
-        shuffled = points_b[torch.randperm(200, generator=torch.Generator().manual_seed(3))]
+        shuffled = points_b[
+            torch.randperm(200, generator=torch.Generator().manual_seed(3))
+        ]
         gap = tv.epipolar_residual(
             true_relative, _rays(points_a, intrinsics), _rays(shuffled, intrinsics)
         )
@@ -179,7 +187,9 @@ class TestObjectiveChoice:
         assert direction_error > 20.0  # the drifted pose really is badly wrong
 
         def gap_cost(motor, mask):
-            return float(tv.epipolar_residual(motor, rays_a[mask], rays_b[mask]).pow(2).sum())
+            return float(
+                tv.epipolar_residual(motor, rays_a[mask], rays_b[mask]).pow(2).sum()
+            )
 
         def sampson_cost(motor, mask):
             return float(
@@ -211,8 +221,12 @@ class TestObjectiveChoice:
         )
         # A sane start: the linear fit on correspondences that actually agree.
         start = tv.relative_motor_from_essential(
-            tv.essential_matrix(points_a[inlier_mask], points_b[inlier_mask], intrinsics),
-            points_a, points_b, intrinsics,
+            tv.essential_matrix(
+                points_a[inlier_mask], points_b[inlier_mask], intrinsics
+            ),
+            points_a,
+            points_b,
+            intrinsics,
         )
         delta = 1.5 / float(intrinsics[0, 0])
         plain = tv.refine_relative_motor(

@@ -87,13 +87,17 @@ def meet_planes(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
     return _alg.mv_to_line(mv, like=_like(p, q))
 
 
-def plane_from_points(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+def plane_from_points(
+    a: torch.Tensor, b: torch.Tensor, c: torch.Tensor
+) -> torch.Tensor:
     """The plane through three Euclidean points -> plane ``(..., 4)``."""
     mv = _alg.point_mv(a) & _alg.point_mv(b) & _alg.point_mv(c)
     return _alg.mv_to_plane(mv, like=_like(a, b, c))
 
 
-def line_from_point_direction(point: torch.Tensor, direction: torch.Tensor) -> torch.Tensor:
+def line_from_point_direction(
+    point: torch.Tensor, direction: torch.Tensor
+) -> torch.Tensor:
     """The line through ``point`` along ``direction`` (need not be unit)."""
     return join_points(point, point + direction)
 

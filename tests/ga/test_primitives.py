@@ -75,16 +75,20 @@ class TestDistances:
         plane = torch.randn(64, 4, generator=gen, dtype=DTYPE)
         point = torch.randn(64, 3, generator=gen, dtype=DTYPE)
         normals = plane[:, :3].numpy()
-        want = ((point.numpy() * normals).sum(-1) + plane[:, 3].numpy()) / np.linalg.norm(
-            normals, axis=-1
-        )
+        want = (
+            (point.numpy() * normals).sum(-1) + plane[:, 3].numpy()
+        ) / np.linalg.norm(normals, axis=-1)
         got = prim.point_plane_distance(point, plane).numpy()
         np.testing.assert_allclose(got, want, atol=1e-12, rtol=0)
 
     def test_point_plane_distance_is_signed(self):
         plane = torch.tensor([0.0, 0.0, 1.0, -3.0], dtype=DTYPE)
-        above = prim.point_plane_distance(torch.tensor([0.0, 0.0, 9.0], dtype=DTYPE), plane)
-        below = prim.point_plane_distance(torch.tensor([0.0, 0.0, -1.0], dtype=DTYPE), plane)
+        above = prim.point_plane_distance(
+            torch.tensor([0.0, 0.0, 9.0], dtype=DTYPE), plane
+        )
+        below = prim.point_plane_distance(
+            torch.tensor([0.0, 0.0, -1.0], dtype=DTYPE), plane
+        )
         assert float(above) > 0 and float(below) < 0
 
 

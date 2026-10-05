@@ -59,7 +59,9 @@ class SixDCameraOptModule(torch.nn.Module):
         )
         torch.nn.init.zeros_(self.embeds.weight)
 
-    def forward(self, camtoworlds: torch.Tensor, embed_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, camtoworlds: torch.Tensor, embed_ids: torch.Tensor
+    ) -> torch.Tensor:
         batch = camtoworlds.shape[:-2]
         deltas = self.embeds(embed_ids)
         dx, drot = deltas[..., :3], deltas[..., 3:]
@@ -116,7 +118,12 @@ class TestOutputIsRigid:
         torch.testing.assert_close(
             torch.linalg.det(rotation), torch.ones(6, dtype=DTYPE), atol=1e-10, rtol=0
         )
-        torch.testing.assert_close(out[:, 3, :], torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=DTYPE).expand(6, 4), atol=1e-12, rtol=0)
+        torch.testing.assert_close(
+            out[:, 3, :],
+            torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=DTYPE).expand(6, 4),
+            atol=1e-12,
+            rtol=0,
+        )
 
     def test_random_init_is_reproducible_and_nonzero(self):
         torch.manual_seed(0)
@@ -193,9 +200,7 @@ class TestPoseRefinement:
                 intrinsics.expand(views, points, 3, 3),
                 world.expand(views, points, 3),
             )
-            return float(
-                ((projected - pixels)[valid]).pow(2).sum(-1).mean().sqrt()
-            )
+            return float(((projected - pixels)[valid]).pow(2).sum(-1).mean().sqrt())
 
     def test_both_parameterizations_reduce_reprojection_error(self):
         torch.manual_seed(0)

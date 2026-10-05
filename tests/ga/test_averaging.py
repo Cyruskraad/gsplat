@@ -50,7 +50,9 @@ class TestResidual:
         truth, observed, edge_i, edge_j = view_graph()
         gen = torch.Generator().manual_seed(1)
         wrong = mot.motor_compose(
-            mot.motor_exp(torch.randn(truth.shape[0], 6, generator=gen, dtype=DTYPE) * 0.2),
+            mot.motor_exp(
+                torch.randn(truth.shape[0], 6, generator=gen, dtype=DTYPE) * 0.2
+            ),
             truth,
         )
         residual = avg.edge_residuals(wrong, observed, edge_i, edge_j)
@@ -82,7 +84,8 @@ class TestMotorAveraging:
         for sigma in (0.0, 0.01, 0.05):
             noisy = mot.motor_compose(
                 mot.motor_exp(
-                    torch.randn(observed.shape[0], 6, generator=gen, dtype=DTYPE) * sigma
+                    torch.randn(observed.shape[0], 6, generator=gen, dtype=DTYPE)
+                    * sigma
                 ),
                 observed,
             )
@@ -103,7 +106,9 @@ class TestMotorAveraging:
             ),
             observed,
         )
-        _, stats = avg.average_motors(noisy, edge_i, edge_j, truth.shape[0], iterations=30)
+        _, stats = avg.average_motors(
+            noisy, edge_i, edge_j, truth.shape[0], iterations=30
+        )
         costs = stats["cost"]
         assert all(b <= a for a, b in zip(costs, costs[1:]))
 
@@ -139,7 +144,9 @@ class TestRotationAveraging:
         truth, observed, edge_i, edge_j = view_graph()
         gen = torch.Generator().manual_seed(4)
         scrambled = mot.motor_log(observed).clone()
-        scrambled[:, 3:] = torch.randn(observed.shape[0], 3, generator=gen, dtype=DTYPE) * 3.0
+        scrambled[:, 3:] = (
+            torch.randn(observed.shape[0], 3, generator=gen, dtype=DTYPE) * 3.0
+        )
 
         estimate, stats = avg.average_rotations(
             mot.motor_exp(scrambled), edge_i, edge_j, truth.shape[0], iterations=40
@@ -160,7 +167,9 @@ class TestRotationAveraging:
     def test_matches_motor_averaging_on_rotation(self):
         """With trustworthy translations both routes must agree on rotation."""
         truth, observed, edge_i, edge_j = view_graph()
-        joint, _ = avg.average_motors(observed, edge_i, edge_j, truth.shape[0], iterations=40)
+        joint, _ = avg.average_motors(
+            observed, edge_i, edge_j, truth.shape[0], iterations=40
+        )
         rotation_only, _ = avg.average_rotations(
             observed, edge_i, edge_j, truth.shape[0], iterations=40
         )

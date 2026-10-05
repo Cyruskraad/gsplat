@@ -101,7 +101,9 @@ class TestNoiseBehaviour:
         noisy = pixels + torch.randn(pixels.shape, generator=gen, dtype=DTYPE) * 2.0
 
         def pixel_rmse(points):
-            residual, valid = tri.reprojection_residuals(points, motors, intrinsics, noisy)
+            residual, valid = tri.reprojection_residuals(
+                points, motors, intrinsics, noisy
+            )
             return float(residual[valid].pow(2).sum(-1).mean().sqrt())
 
         best = pixel_rmse(tri.triangulate_reprojection(motors, intrinsics, noisy)[0])
@@ -113,8 +115,12 @@ class TestNoiseBehaviour:
         gen = torch.Generator().manual_seed(3)
         previous = 0.0
         for sigma in (0.5, 1.0, 2.0, 4.0):
-            noisy = pixels + torch.randn(pixels.shape, generator=gen, dtype=DTYPE) * sigma
-            current = _rmse(tri.triangulate_reprojection(motors, intrinsics, noisy)[0], world)
+            noisy = (
+                pixels + torch.randn(pixels.shape, generator=gen, dtype=DTYPE) * sigma
+            )
+            current = _rmse(
+                tri.triangulate_reprojection(motors, intrinsics, noisy)[0], world
+            )
             assert current > previous
             previous = current
 

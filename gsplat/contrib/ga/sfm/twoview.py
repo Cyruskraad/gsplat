@@ -181,7 +181,9 @@ def essential_matrix(
     # Undo the normalization, then project onto the essential manifold.
     essential = transform_b.T @ essential @ transform_a
     u, _, vh2 = torch.linalg.svd(essential)
-    singular = torch.tensor([1.0, 1.0, 0.0], dtype=essential.dtype, device=essential.device)
+    singular = torch.tensor(
+        [1.0, 1.0, 0.0], dtype=essential.dtype, device=essential.device
+    )
     return u @ torch.diag(singular) @ vh2
 
 
@@ -250,8 +252,16 @@ def relative_motor_from_essential(
         stacked_k = intrinsics.expand(2, 3, 3)
         pixels = torch.stack([points_a, points_b])
         world, valid = _tri.triangulate_linear(motors, stacked_k, pixels)
-        _, front_a = _cam.project(identity.expand(world.shape[0], 8), stacked_k[0].expand(world.shape[0], 3, 3), world)
-        _, front_b = _cam.project(pose_b.expand(world.shape[0], 8), stacked_k[1].expand(world.shape[0], 3, 3), world)
+        _, front_a = _cam.project(
+            identity.expand(world.shape[0], 8),
+            stacked_k[0].expand(world.shape[0], 3, 3),
+            world,
+        )
+        _, front_b = _cam.project(
+            pose_b.expand(world.shape[0], 8),
+            stacked_k[1].expand(world.shape[0], 3, 3),
+            world,
+        )
         score = int((valid & front_a & front_b).sum())
         if score > best_score:
             best, best_score = relative, score
@@ -325,7 +335,9 @@ def refine_relative_motor(
         delta = max(float(delta), 1e-12)
         magnitude = residual.abs()
         return torch.where(
-            magnitude <= delta, torch.ones_like(magnitude), delta / magnitude.clamp_min(_EPS)
+            magnitude <= delta,
+            torch.ones_like(magnitude),
+            delta / magnitude.clamp_min(_EPS),
         )
 
     weight = weights_for(residual_at(motor))
@@ -402,7 +414,9 @@ def ransac_relative_motor(
             continue
         if motor is None:
             continue
-        inliers = sampson_residual(motor, points_a, points_b, intrinsics).abs() < threshold
+        inliers = (
+            sampson_residual(motor, points_a, points_b, intrinsics).abs() < threshold
+        )
         if int(inliers.sum()) > best_count:
             best_motor, best_count = motor, int(inliers.sum())
 
@@ -413,7 +427,9 @@ def ransac_relative_motor(
     # *all* correspondences -- refining on the consensus set alone would inherit
     # whatever outliers survived thresholding, and those are what break an
     # unweighted fit.
-    inliers = sampson_residual(best_motor, points_a, points_b, intrinsics).abs() < threshold
+    inliers = (
+        sampson_residual(best_motor, points_a, points_b, intrinsics).abs() < threshold
+    )
     if int(inliers.sum()) >= min_samples:
         try:
             essential = essential_matrix(
@@ -427,7 +443,12 @@ def ransac_relative_motor(
                     refit, points_a, points_b, intrinsics, huber_delta=threshold
                 )
                 if int(
-                    (sampson_residual(candidate, points_a, points_b, intrinsics).abs() < threshold).sum()
+                    (
+                        sampson_residual(
+                            candidate, points_a, points_b, intrinsics
+                        ).abs()
+                        < threshold
+                    ).sum()
                 ) >= int(inliers.sum()):
                     best_motor = candidate
         except Exception:

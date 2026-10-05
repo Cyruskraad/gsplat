@@ -93,7 +93,9 @@ def perturb(motors, world, gen, pose_sigma=0.02, point_sigma=0.05):
 
 # --------------------------------------------------------------------------
 def run_bundle_gates(args) -> list[tuple[str, bool, str]]:
-    motors, intrinsics, world, pixels, gen = make_scene(args.views, args.points, args.seed)
+    motors, intrinsics, world, pixels, gen = make_scene(
+        args.views, args.points, args.seed
+    )
     start_motors, start_points = perturb(motors, world, gen)
 
     views, points = args.views, args.points
@@ -102,7 +104,12 @@ def run_bundle_gates(args) -> list[tuple[str, bool, str]]:
     observations = pixels.reshape(-1, 2)
 
     ga_problem = ga_ba.BundleProblem(
-        start_motors, intrinsics, start_points.clone(), observations, camera_idx, point_idx
+        start_motors,
+        intrinsics,
+        start_points.clone(),
+        observations,
+        camera_idx,
+        point_idx,
     )
     qt_problem = qt_ba.QuaternionBundleProblem(
         qt_ba.poses_from_matrices(ga_motor.motor_to_matrix(start_motors)),
@@ -122,14 +129,21 @@ def run_bundle_gates(args) -> list[tuple[str, bool, str]]:
     # process, not per iteration -- charging it to whichever arm happens to run
     # first turns a ~2x ratio into a ~60x one. The cold number is reported too,
     # since the compile is real, just amortized.
-    warm_motors, warm_intrinsics, warm_world, warm_pixels, warm_gen = make_scene(3, 20, 999)
+    warm_motors, warm_intrinsics, warm_world, warm_pixels, warm_gen = make_scene(
+        3, 20, 999
+    )
     warm_cam = torch.arange(3).repeat_interleave(20)
     warm_pt = torch.arange(20).repeat(3)
     warm_obs = warm_pixels.reshape(-1, 2)
     cold_began = time.perf_counter()
     ga_ba.bundle_adjust(
         ga_ba.BundleProblem(
-            warm_motors, warm_intrinsics, warm_world.clone(), warm_obs, warm_cam, warm_pt
+            warm_motors,
+            warm_intrinsics,
+            warm_world.clone(),
+            warm_obs,
+            warm_cam,
+            warm_pt,
         ),
         iterations=2,
     )
@@ -137,7 +151,11 @@ def run_bundle_gates(args) -> list[tuple[str, bool, str]]:
     qt_ba.bundle_adjust(
         qt_ba.QuaternionBundleProblem(
             qt_ba.poses_from_matrices(ga_motor.motor_to_matrix(warm_motors)),
-            warm_intrinsics, warm_world.clone(), warm_obs, warm_cam, warm_pt,
+            warm_intrinsics,
+            warm_world.clone(),
+            warm_obs,
+            warm_cam,
+            warm_pt,
         ),
         iterations=2,
     )
@@ -153,8 +171,12 @@ def run_bundle_gates(args) -> list[tuple[str, bool, str]]:
     print(f"\nPoint bundle adjustment  ({views} cameras, {points} points, float64)")
     print(f"  initial reprojection RMSE: {initial:.4f} px")
     print(f"  {'arm':<22}{'final RMSE':>14}{'iters':>8}{'seconds':>10}")
-    print(f"  {'GA motor':<22}{ga_stats['rmse']:>14.3e}{ga_stats['iterations']:>8}{ga_time:>10.3f}")
-    print(f"  {'quaternion control':<22}{qt_stats['rmse']:>14.3e}{qt_stats['iterations']:>8}{qt_time:>10.3f}")
+    print(
+        f"  {'GA motor':<22}{ga_stats['rmse']:>14.3e}{ga_stats['iterations']:>8}{ga_time:>10.3f}"
+    )
+    print(
+        f"  {'quaternion control':<22}{qt_stats['rmse']:>14.3e}{qt_stats['iterations']:>8}{qt_time:>10.3f}"
+    )
 
     # Gate 1, checked three ways. Rotations are the sharpest: a similarity gauge
     # leaves them untouched, so they compare directly with no alignment.
@@ -170,12 +192,20 @@ def run_bundle_gates(args) -> list[tuple[str, bool, str]]:
     _, structure_gap = ga_ba.align_similarity(ga_out.points, qt_out.points)
 
     print("\n  Gate 1 -- the arms reach the same optimum")
-    print(f"    |cost_GA - cost_control|            {cost_gap:.3e}   (want < {args.cost_tol:.0e})")
-    print(f"    rotation disagreement, unaligned    {rotation_gap:.3e}   (want < {args.pose_tol:.0e})")
-    print(f"    structure, after similarity align   {structure_gap:.3e}   (want < {args.pose_tol:.0e})")
+    print(
+        f"    |cost_GA - cost_control|            {cost_gap:.3e}   (want < {args.cost_tol:.0e})"
+    )
+    print(
+        f"    rotation disagreement, unaligned    {rotation_gap:.3e}   (want < {args.pose_tol:.0e})"
+    )
+    print(
+        f"    structure, after similarity align   {structure_gap:.3e}   (want < {args.pose_tol:.0e})"
+    )
 
     ratio = ga_time / max(qt_time, 1e-9)
-    print(f"\n  Gate 2 -- runtime ratio GA/control    {ratio:.2f}x   (want < {args.runtime_budget:.1f}x)")
+    print(
+        f"\n  Gate 2 -- runtime ratio GA/control    {ratio:.2f}x   (want < {args.runtime_budget:.1f}x)"
+    )
     print(f"    (kingdon's one-time operator compile, excluded above: {cold_ga:.2f}s)")
 
     # Accuracy against ground truth, for context rather than as a gate.
@@ -184,8 +214,16 @@ def run_bundle_gates(args) -> list[tuple[str, bool, str]]:
 
     return [
         ("Gate 1: cost agreement", cost_gap < args.cost_tol, f"{cost_gap:.3e}"),
-        ("Gate 1: rotation agreement", rotation_gap < args.pose_tol, f"{rotation_gap:.3e}"),
-        ("Gate 1: structure agreement", structure_gap < args.pose_tol, f"{structure_gap:.3e}"),
+        (
+            "Gate 1: rotation agreement",
+            rotation_gap < args.pose_tol,
+            f"{rotation_gap:.3e}",
+        ),
+        (
+            "Gate 1: structure agreement",
+            structure_gap < args.pose_tol,
+            f"{structure_gap:.3e}",
+        ),
         ("Gate 2: runtime ratio", ratio < args.runtime_budget, f"{ratio:.2f}x"),
     ]
 
@@ -204,7 +242,9 @@ def run_triangulation(args) -> list[tuple[str, bool, str]]:
     ):
         estimate, _ = solver(motors, intrinsics, noisy)
         spatial = float((estimate - world).norm(dim=-1).pow(2).mean().sqrt())
-        residual, valid = ga_tri.reprojection_residuals(estimate, motors, intrinsics, noisy)
+        residual, valid = ga_tri.reprojection_residuals(
+            estimate, motors, intrinsics, noisy
+        )
         pixel = float(residual[valid].pow(2).sum(-1).mean().sqrt())
         errors[name] = (spatial, pixel)
         print(f"  {name:<16}{spatial:>12.5f}{pixel:>14.5f}")
@@ -213,7 +253,13 @@ def run_triangulation(args) -> list[tuple[str, bool, str]]:
     # noise, so it must win on pixel residual. If it does not, something regressed.
     best = errors["reprojection"][1] < min(errors["linear"][1], errors["midpoint"][1])
     print(f"    reprojection solver minimizes pixel residual: {best}")
-    return [("Triangulation: reprojection solver is best", best, f"{errors['reprojection'][1]:.5f}")]
+    return [
+        (
+            "Triangulation: reprojection solver is best",
+            best,
+            f"{errors['reprojection'][1]:.5f}",
+        )
+    ]
 
 
 def run_lines(args) -> list[tuple[str, bool, str]]:
@@ -232,7 +278,9 @@ def run_lines(args) -> list[tuple[str, bool, str]]:
         ga_motor.motor_exp(stand_off),
         ga_motor.motor_exp(torch.randn(views, 6, generator=gen, dtype=DTYPE) * 0.2),
     )
-    line_motors = ga_motor.motor_exp(torch.randn(lines, 6, generator=gen, dtype=DTYPE) * 0.5)
+    line_motors = ga_motor.motor_exp(
+        torch.randn(lines, 6, generator=gen, dtype=DTYPE) * 0.5
+    )
     base = ga_ba.canonical_line()
     world_lines = ga_motor.motor_apply_line(line_motors, base.expand(lines, 6))
 
@@ -248,7 +296,9 @@ def run_lines(args) -> list[tuple[str, bool, str]]:
         ga_motor.motor_compose(ga_motor.motor_exp(delta_cam), motors),
         intrinsics,
         ga_motor.motor_compose(
-            ga_motor.motor_exp(torch.randn(lines, 6, generator=gen, dtype=DTYPE) * 0.03),
+            ga_motor.motor_exp(
+                torch.randn(lines, 6, generator=gen, dtype=DTYPE) * 0.03
+            ),
             line_motors,
         ),
         image_lines,
@@ -269,11 +319,17 @@ def run_lines(args) -> list[tuple[str, bool, str]]:
 
     print(f"\nLine bundle adjustment  ({views} cameras, {lines} lines)  -- claim C1")
     print(f"  initial residual RMSE: {initial:.5f}")
-    print(f"  final residual RMSE:   {stats['rmse']:.3e}  ({stats['iterations']} iters, {elapsed:.2f}s)")
+    print(
+        f"  final residual RMSE:   {stats['rmse']:.3e}  ({stats['iterations']} iters, {elapsed:.2f}s)"
+    )
     print(f"  line directions vs truth, unaligned: {direction_gap:.3e}")
     return [
         ("Claim C1: line BA converges", stats["rmse"] < 1e-9, f"{stats['rmse']:.3e}"),
-        ("Claim C1: line directions exact", direction_gap < 1e-9, f"{direction_gap:.3e}"),
+        (
+            "Claim C1: line directions exact",
+            direction_gap < 1e-9,
+            f"{direction_gap:.3e}",
+        ),
     ]
 
 
@@ -297,14 +353,20 @@ def make_two_view_scene(points, seed, pixel_noise=0.0, outlier_fraction=0.0):
         pose_b.expand(points, 8), intrinsics.expand(points, 3, 3), world
     )
     if pixel_noise:
-        points_a = points_a + torch.randn(points_a.shape, generator=gen, dtype=DTYPE) * pixel_noise
-        points_b = points_b + torch.randn(points_b.shape, generator=gen, dtype=DTYPE) * pixel_noise
+        points_a = (
+            points_a
+            + torch.randn(points_a.shape, generator=gen, dtype=DTYPE) * pixel_noise
+        )
+        points_b = (
+            points_b
+            + torch.randn(points_b.shape, generator=gen, dtype=DTYPE) * pixel_noise
+        )
     count = int(points * outlier_fraction)
     if count:
         index = torch.randperm(points, generator=gen)[:count]
-        points_b[index] = torch.rand(count, 2, generator=gen, dtype=DTYPE) * torch.tensor(
-            [640.0, 480.0], dtype=DTYPE
-        )
+        points_b[index] = torch.rand(
+            count, 2, generator=gen, dtype=DTYPE
+        ) * torch.tensor([640.0, 480.0], dtype=DTYPE)
     return points_a, points_b, intrinsics, true_relative
 
 
@@ -333,8 +395,12 @@ def run_two_view(args) -> list[tuple[str, bool, str]]:
     estimator.
     """
     seeds = range(6)
-    print(f"\nTwo-view relative pose  (300 correspondences, 1.5 px threshold, {len(list(seeds))} seeds)")
-    print(f"  {'noise':>7}{'outliers':>10}{'rot med':>10}{'rot max':>10}{'t-dir med':>12}{'t-dir max':>12}")
+    print(
+        f"\nTwo-view relative pose  (300 correspondences, 1.5 px threshold, {len(list(seeds))} seeds)"
+    )
+    print(
+        f"  {'noise':>7}{'outliers':>10}{'rot med':>10}{'rot max':>10}{'t-dir med':>12}{'t-dir max':>12}"
+    )
 
     checks = []
     for sigma, fraction in ((0.0, 0.0), (0.5, 0.0), (0.5, 0.1), (0.5, 0.2)):
@@ -390,7 +456,10 @@ def main() -> int:
     parser.add_argument("--pose-tol", type=float, default=1e-9)
     parser.add_argument("--runtime-budget", type=float, default=3.0)
     parser.add_argument(
-        "--skip", nargs="*", default=[], choices=["bundle", "triangulation", "lines", "twoview"]
+        "--skip",
+        nargs="*",
+        default=[],
+        choices=["bundle", "triangulation", "lines", "twoview"],
     )
     args = parser.parse_args()
 

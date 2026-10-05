@@ -124,7 +124,9 @@ class TestBaselineIsIndependent:
 class TestConvergence:
     def test_recovers_ground_truth_from_a_perturbed_start(self):
         ga_problem, _, (_, _, world) = bundle_problem(views=8, points=300)
-        start = float(ga_ba.reprojection_residuals(ga_problem).pow(2).sum(-1).mean().sqrt())
+        start = float(
+            ga_ba.reprojection_residuals(ga_problem).pow(2).sum(-1).mean().sqrt()
+        )
         assert start > 1.0  # the start really is perturbed
 
         refined, stats = ga_ba.bundle_adjust(ga_problem, iterations=50)
@@ -213,8 +215,12 @@ class TestAlignSimilarity:
     def test_recovers_a_known_similarity(self):
         torch.manual_seed(7)
         target = torch.randn(64, 3, dtype=DTYPE)
-        rotation = mot.motor_to_matrix(mot.motor_exp(torch.randn(6, dtype=DTYPE) * 0.5))[:3, :3]
-        source = 3.7 * (target @ rotation.T) + torch.tensor([1.0, -2.0, 0.5], dtype=DTYPE)
+        rotation = mot.motor_to_matrix(
+            mot.motor_exp(torch.randn(6, dtype=DTYPE) * 0.5)
+        )[:3, :3]
+        source = 3.7 * (target @ rotation.T) + torch.tensor(
+            [1.0, -2.0, 0.5], dtype=DTYPE
+        )
         aligned, error = ga_ba.align_similarity(source, target)
         assert error < 1e-10
         torch.testing.assert_close(aligned, target, atol=1e-9, rtol=0)

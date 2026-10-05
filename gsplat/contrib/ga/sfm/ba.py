@@ -153,7 +153,9 @@ def _residual_and_jacobians(
     eye = torch.eye(3, dtype=points.dtype, device=points.device).expand(
         problem.num_observations, 3, 3
     )
-    d_cam_d_delta = torch.cat([2.0 * _skew(cam_points), -2.0 * eye], dim=-1)  # (M, 3, 6)
+    d_cam_d_delta = torch.cat(
+        [2.0 * _skew(cam_points), -2.0 * eye], dim=-1
+    )  # (M, 3, 6)
 
     rotations = _mot.motor_to_matrix(problem.motors)[:, :3, :3][problem.camera_idx]
     return residual, d_pixel @ d_cam_d_delta, d_pixel @ rotations
@@ -286,9 +288,7 @@ class LineBundleProblem:
     def world_lines(self) -> torch.Tensor:
         """The reconstructed lines ``(L, 6)`` in world coordinates."""
         base = canonical_line(self.line_motors.dtype, self.line_motors.device)
-        return _mot.motor_apply_line(
-            self.line_motors, base.expand(self.num_lines, 6)
-        )
+        return _mot.motor_apply_line(self.line_motors, base.expand(self.num_lines, 6))
 
 
 def _line_observation_residual(
@@ -341,12 +341,12 @@ def _line_residual_and_jacobians(problem: LineBundleProblem):
     residual = vmap(_line_observation_residual, in_dims=(0, 0, 0, 0, 0, None))(
         zeros, zeros, camera_motors, line_motors, planes, base
     )
-    jac_cam = vmap(jacrev(_line_observation_residual, argnums=0), in_dims=(0, 0, 0, 0, 0, None))(
-        zeros, zeros, camera_motors, line_motors, planes, base
-    )
-    jac_line = vmap(jacrev(_line_observation_residual, argnums=1), in_dims=(0, 0, 0, 0, 0, None))(
-        zeros, zeros, camera_motors, line_motors, planes, base
-    )
+    jac_cam = vmap(
+        jacrev(_line_observation_residual, argnums=0), in_dims=(0, 0, 0, 0, 0, None)
+    )(zeros, zeros, camera_motors, line_motors, planes, base)
+    jac_line = vmap(
+        jacrev(_line_observation_residual, argnums=1), in_dims=(0, 0, 0, 0, 0, None)
+    )(zeros, zeros, camera_motors, line_motors, planes, base)
     return residual, jac_cam, jac_line
 
 
@@ -365,7 +365,9 @@ def bundle_adjust_lines(
     the claim that motivates doing this in geometric algebra.
     """
 
-    def apply_step(state: LineBundleProblem, delta_cam, delta_line) -> LineBundleProblem:
+    def apply_step(
+        state: LineBundleProblem, delta_cam, delta_line
+    ) -> LineBundleProblem:
         return replace(
             state,
             motors=_mot.motor_normalize(

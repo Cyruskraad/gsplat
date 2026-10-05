@@ -76,7 +76,9 @@ class MotorCameraOptModule(torch.nn.Module):
     def random_init(self, std: float) -> None:
         torch.nn.init.normal_(self.embeds.weight, std=std)
 
-    def forward(self, camtoworlds: torch.Tensor, embed_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, camtoworlds: torch.Tensor, embed_ids: torch.Tensor
+    ) -> torch.Tensor:
         """Adjust camera poses by the learned corrections.
 
         Args:

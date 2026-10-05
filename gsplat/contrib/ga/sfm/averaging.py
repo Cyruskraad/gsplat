@@ -117,6 +117,7 @@ def _solve_gauss_newton(
     history = [float(cost)]
 
     for _ in range(iterations):
+
         def at(step: torch.Tensor) -> torch.Tensor:
             return residual_fn(accumulated + step)
 
@@ -154,7 +155,11 @@ def _solve_gauss_newton(
         if not improved:
             break
 
-    return accumulated, {"cost": history, "final_cost": float(cost), "iterations": len(history) - 1}
+    return accumulated, {
+        "cost": history,
+        "final_cost": float(cost),
+        "iterations": len(history) - 1,
+    }
 
 
 def average_motors(

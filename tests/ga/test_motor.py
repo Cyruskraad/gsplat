@@ -59,9 +59,7 @@ class TestExponential:
         motor = mot.motor_exp(biv)
         transform = se3_matrix(biv)
 
-        pts = torch.tensor(
-            np.random.default_rng(0).normal(size=(64, 3)), dtype=DTYPE
-        )
+        pts = torch.tensor(np.random.default_rng(0).normal(size=(64, 3)), dtype=DTYPE)
         got = mot.motor_apply_point(motor.expand(64, 8), pts).numpy()
         want = pts.numpy() @ transform[:3, :3].T + transform[:3, 3]
         np.testing.assert_allclose(got, want, atol=1e-9, rtol=0)
@@ -102,7 +100,9 @@ class TestExponential:
             for pitch in (0.3, -0.8, 1.5):
                 biv = torch.cat([axis * theta, axis * pitch])
                 pseudo = mot.motor_exp(biv)[7]
-                assert float(pseudo) == pytest.approx(pitch * math.sin(theta), abs=1e-12)
+                assert float(pseudo) == pytest.approx(
+                    pitch * math.sin(theta), abs=1e-12
+                )
 
 
 class TestLogarithm:
@@ -147,7 +147,9 @@ class TestComposition:
         got = mot.motor_apply_point(composed, pts).numpy()
         want = np.stack(
             [
-                (se3_matrix(a[i]) @ se3_matrix(b[i]) @ np.append(pts[i].numpy(), 1.0))[:3]
+                (se3_matrix(a[i]) @ se3_matrix(b[i]) @ np.append(pts[i].numpy(), 1.0))[
+                    :3
+                ]
                 for i in range(16)
             ]
         )
@@ -163,9 +165,7 @@ class TestComposition:
     def test_normalize_repairs_drift(self):
         gen = torch.Generator().manual_seed(19)
         motor = mot.motor_exp(random_bivectors(64, gen))
-        drifted = motor + 1e-3 * torch.randn(
-            motor.shape, generator=gen, dtype=DTYPE
-        )
+        drifted = motor + 1e-3 * torch.randn(motor.shape, generator=gen, dtype=DTYPE)
         repaired = mot.motor_normalize(drifted)
         product = mot.motor_compose(repaired, mot.motor_inverse(repaired))
         torch.testing.assert_close(
@@ -231,8 +231,12 @@ class TestAutograd:
         assert torch.autograd.gradcheck(mot.motor_log, (motor,), eps=1e-6, atol=1e-6)
 
     def test_gradcheck_compose(self):
-        a = torch.tensor([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=DTYPE, requires_grad=True)
-        b = torch.tensor([-0.2, 0.1, 0.05, 0.3, -0.1, 0.2], dtype=DTYPE, requires_grad=True)
+        a = torch.tensor(
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6], dtype=DTYPE, requires_grad=True
+        )
+        b = torch.tensor(
+            [-0.2, 0.1, 0.05, 0.3, -0.1, 0.2], dtype=DTYPE, requires_grad=True
+        )
 
         def fn(x, y):
             return mot.motor_compose(mot.motor_exp(x), mot.motor_exp(y))
@@ -243,7 +247,9 @@ class TestAutograd:
         """``w = 0`` is where the unregularized screw split is 0/0."""
         biv = torch.zeros(6, dtype=DTYPE, requires_grad=True)
         pts = torch.randn(8, 3, dtype=DTYPE)
-        mot.motor_apply_point(mot.motor_exp(biv).expand(8, 8), pts).pow(2).sum().backward()
+        mot.motor_apply_point(mot.motor_exp(biv).expand(8, 8), pts).pow(
+            2
+        ).sum().backward()
         assert torch.isfinite(biv.grad).all()
 
 

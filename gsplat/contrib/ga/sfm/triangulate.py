@@ -111,7 +111,9 @@ def triangulate_linear(
     # validity, and stays finite on the degenerate systems it is diagnosing.
     u, s, vh = torch.linalg.svd(normal_matrix)
     valid = s[..., -1] > min_singular_value
-    inv_s = torch.where(s > min_singular_value, 1.0 / s.clamp_min(_EPS), torch.zeros_like(s))
+    inv_s = torch.where(
+        s > min_singular_value, 1.0 / s.clamp_min(_EPS), torch.zeros_like(s)
+    )
     pseudo_inverse = vh.transpose(-2, -1) @ (inv_s.unsqueeze(-1) * u.transpose(-2, -1))
     points = (pseudo_inverse @ rhs.unsqueeze(-1)).squeeze(-1)
     return points, valid

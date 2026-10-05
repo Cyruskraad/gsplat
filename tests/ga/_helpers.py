@@ -74,7 +74,9 @@ def random_bivectors(n: int, generator: torch.Generator, trans_scale: float = 2.
     """Random bivectors inside the principal branch of ``motor_log``."""
     w = torch.randn(n, 3, generator=generator, dtype=torch.float64)
     norms = w.norm(dim=-1, keepdim=True)
-    capped = torch.rand(n, 1, generator=generator, dtype=torch.float64) * (MAX_THETA * 0.999)
+    capped = torch.rand(n, 1, generator=generator, dtype=torch.float64) * (
+        MAX_THETA * 0.999
+    )
     w = w / norms * capped
     v = torch.randn(n, 3, generator=generator, dtype=torch.float64) * trans_scale
     return torch.cat([w, v], dim=-1)
@@ -101,15 +103,22 @@ def synthetic_scene(
     from gsplat.contrib.ga import motor as _motor
 
     gen = _torch.Generator().manual_seed(seed)
-    intrinsics = _torch.tensor(
-        [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]], dtype=_torch.float64
-    ).expand(views, 3, 3).contiguous()
+    intrinsics = (
+        _torch.tensor(
+            [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]],
+            dtype=_torch.float64,
+        )
+        .expand(views, 3, 3)
+        .contiguous()
+    )
 
     stand_off = _torch.zeros(views, 6, dtype=_torch.float64)
     stand_off[:, 5] = -distance / 2.0  # bivector v = -t/2
     motors = _motor.motor_compose(
         _motor.motor_exp(stand_off),
-        _motor.motor_exp(_torch.randn(views, 6, generator=gen, dtype=_torch.float64) * jitter),
+        _motor.motor_exp(
+            _torch.randn(views, 6, generator=gen, dtype=_torch.float64) * jitter
+        ),
     )
     world = _torch.randn(points, 3, generator=gen, dtype=_torch.float64) * 0.8
     pixels, _ = _camera.project(
@@ -149,19 +158,27 @@ def bundle_problem(
     point_idx = _torch.arange(points).repeat(views)
     observations = pixels.reshape(-1, 2)
     if pixel_noise:
-        observations = observations + _torch.randn(
-            observations.shape, generator=gen, dtype=_torch.float64
-        ) * pixel_noise
+        observations = (
+            observations
+            + _torch.randn(observations.shape, generator=gen, dtype=_torch.float64)
+            * pixel_noise
+        )
 
     delta = _torch.randn(views, 6, generator=gen, dtype=_torch.float64) * pose_noise
     delta[0] = 0.0  # camera 0 is the gauge anchor; start it at the truth
     start_motors = _motor.motor_compose(_motor.motor_exp(delta), motors)
-    start_points = world + _torch.randn(
-        points, 3, generator=gen, dtype=_torch.float64
-    ) * point_noise
+    start_points = (
+        world
+        + _torch.randn(points, 3, generator=gen, dtype=_torch.float64) * point_noise
+    )
 
     ga_problem = _ga_ba.BundleProblem(
-        start_motors, intrinsics, start_points.clone(), observations, camera_idx, point_idx
+        start_motors,
+        intrinsics,
+        start_points.clone(),
+        observations,
+        camera_idx,
+        point_idx,
     )
     qt_problem = _qt_ba.QuaternionBundleProblem(
         _qt_ba.poses_from_matrices(_motor.motor_to_matrix(start_motors)),
@@ -187,14 +204,21 @@ def line_scene(views: int = 6, lines: int = 40, seed: int = 0, spread: float = 0
     from gsplat.contrib.ga.sfm import ba as _ba
 
     gen = _torch.Generator().manual_seed(seed)
-    intrinsics = _torch.tensor(
-        [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]], dtype=_torch.float64
-    ).expand(views, 3, 3).contiguous()
+    intrinsics = (
+        _torch.tensor(
+            [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]],
+            dtype=_torch.float64,
+        )
+        .expand(views, 3, 3)
+        .contiguous()
+    )
     stand_off = _torch.zeros(views, 6, dtype=_torch.float64)
     stand_off[:, 5] = -4.0
     motors = _motor.motor_compose(
         _motor.motor_exp(stand_off),
-        _motor.motor_exp(_torch.randn(views, 6, generator=gen, dtype=_torch.float64) * 0.2),
+        _motor.motor_exp(
+            _torch.randn(views, 6, generator=gen, dtype=_torch.float64) * 0.2
+        ),
     )
     line_motors = _motor.motor_exp(
         _torch.randn(lines, 6, generator=gen, dtype=_torch.float64) * spread
@@ -250,7 +274,8 @@ def two_view_scene(
 
     gen = _torch.Generator().manual_seed(seed)
     intrinsics = _torch.tensor(
-        [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]], dtype=_torch.float64
+        [[600.0, 0.0, 320.0], [0.0, 600.0, 240.0], [0.0, 0.0, 1.0]],
+        dtype=_torch.float64,
     )
     true_relative = _motor.motor_exp(
         _torch.tensor([0.06, -0.09, 0.03, 0.35, -0.15, 0.05], dtype=_torch.float64)
@@ -268,12 +293,16 @@ def two_view_scene(
     )
 
     if pixel_noise:
-        points_a = points_a + _torch.randn(
-            points_a.shape, generator=gen, dtype=_torch.float64
-        ) * pixel_noise
-        points_b = points_b + _torch.randn(
-            points_b.shape, generator=gen, dtype=_torch.float64
-        ) * pixel_noise
+        points_a = (
+            points_a
+            + _torch.randn(points_a.shape, generator=gen, dtype=_torch.float64)
+            * pixel_noise
+        )
+        points_b = (
+            points_b
+            + _torch.randn(points_b.shape, generator=gen, dtype=_torch.float64)
+            * pixel_noise
+        )
 
     inliers = _torch.ones(points, dtype=_torch.bool)
     count = int(points * outlier_fraction)
@@ -299,17 +328,25 @@ def pose_errors(estimate, reference):
 
     est = _motor.motor_to_matrix(estimate)
     ref = _motor.motor_to_matrix(reference)
-    cos_angle = ((_torch.trace(est[:3, :3].T @ ref[:3, :3]) - 1.0) / 2.0).clamp(-1.0, 1.0)
+    cos_angle = ((_torch.trace(est[:3, :3].T @ ref[:3, :3]) - 1.0) / 2.0).clamp(
+        -1.0, 1.0
+    )
     rotation = float(_torch.arccos(cos_angle) * 180.0 / _torch.pi)
 
-    cosine = _torch.nn.functional.cosine_similarity(
-        est[:3, 3].unsqueeze(0), ref[:3, 3].unsqueeze(0)
-    ).abs().clamp(max=1.0)
+    cosine = (
+        _torch.nn.functional.cosine_similarity(
+            est[:3, 3].unsqueeze(0), ref[:3, 3].unsqueeze(0)
+        )
+        .abs()
+        .clamp(max=1.0)
+    )
     direction = float(_torch.arccos(cosine) * 180.0 / _torch.pi)
     return rotation, direction
 
 
-def view_graph(views: int = 10, seed: int = 0, spread: float = 0.4, connected: bool = True):
+def view_graph(
+    views: int = 10, seed: int = 0, spread: float = 0.4, connected: bool = True
+):
     """A view graph with known global motors and exact relative motors on edges.
 
     ``connected=True`` gives a chain plus chords, which is what averaging needs.
@@ -329,9 +366,7 @@ def view_graph(views: int = 10, seed: int = 0, spread: float = 0.4, connected: b
     truth = _motor.motor_exp(
         _torch.randn(views, 6, generator=gen, dtype=_torch.float64) * spread
     )
-    truth = _motor.motor_compose(
-        _motor.motor_inverse(truth[0]).expand(views, 8), truth
-    )
+    truth = _motor.motor_compose(_motor.motor_inverse(truth[0]).expand(views, 8), truth)
 
     if connected:
         pairs = (
@@ -341,7 +376,10 @@ def view_graph(views: int = 10, seed: int = 0, spread: float = 0.4, connected: b
         )
     else:
         pairs = [
-            (i, j) for i in range(views) for j in range(views) if i != j and (i + j) % 2 == 0
+            (i, j)
+            for i in range(views)
+            for j in range(views)
+            if i != j and (i + j) % 2 == 0
         ]
 
     edge_i = _torch.tensor([p[0] for p in pairs])

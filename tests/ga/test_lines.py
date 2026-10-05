@@ -93,13 +93,19 @@ class TestLineProjection:
         problem, motors, world_lines = line_scene(views=3, lines=8)
         line = world_lines[0]
         direction = prim.line_direction(prim.normalize_line(line))
-        foot = torch.linalg.cross(direction, prim.line_moment(prim.normalize_line(line)))
+        foot = torch.linalg.cross(
+            direction, prim.line_moment(prim.normalize_line(line))
+        )
         samples = torch.stack([foot + t * direction for t in (-1.5, 0.0, 2.0)])
 
         for v in range(3):
-            image_line = cam.project_line(problem.motors[v], problem.intrinsics[v], line)
+            image_line = cam.project_line(
+                problem.motors[v], problem.intrinsics[v], line
+            )
             pixels, valid = cam.project(
-                problem.motors[v].expand(3, 8), problem.intrinsics[v].expand(3, 3, 3), samples
+                problem.motors[v].expand(3, 8),
+                problem.intrinsics[v].expand(3, 3, 3),
+                samples,
             )
             residual = pixels @ image_line[:2] + image_line[2]
             assert float(residual[valid].abs().max()) < 1e-8
@@ -118,7 +124,9 @@ class TestLineBundleAdjustment:
         start = replace(
             problem,
             motors=mot.motor_compose(mot.motor_exp(delta_cam), problem.motors),
-            line_motors=mot.motor_compose(mot.motor_exp(delta_line), problem.line_motors),
+            line_motors=mot.motor_compose(
+                mot.motor_exp(delta_line), problem.line_motors
+            ),
         )
         return start, motors, world_lines
 
@@ -213,7 +221,9 @@ class TestConditioning:
                 c = int(problem.camera_idx[m])
                 l = int(problem.line_idx[m])
                 full[m * 4 : (m + 1) * 4, 6 * c : 6 * c + 6] = jac_cam[m]
-                full[m * 4 : (m + 1) * 4, 6 * views + 6 * l : 6 * views + 6 * l + 6] = jac_line[m]
+                full[
+                    m * 4 : (m + 1) * 4, 6 * views + 6 * l : 6 * views + 6 * l + 6
+                ] = jac_line[m]
 
             keep = torch.ones(full.shape[1], dtype=torch.bool)
             keep[:6] = False  # camera 0 is pinned, as in the solver

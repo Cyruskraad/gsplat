@@ -121,7 +121,9 @@ def bivector_mv(biv: torch.Tensor):
     """``(..., 6)`` ``[wx, wy, wz, vx, vy, vz]`` -> bivector multivector."""
     parts = {
         name: (sign * biv[..., i] if sign != 1.0 else biv[..., i])
-        for i, (name, sign) in enumerate(zip(BIVECTOR_BLADES, _ROT_SIGNS + (1.0, 1.0, 1.0)))
+        for i, (name, sign) in enumerate(
+            zip(BIVECTOR_BLADES, _ROT_SIGNS + (1.0, 1.0, 1.0))
+        )
     }
     return ALGEBRA.multivector(parts)
 
@@ -129,7 +131,9 @@ def bivector_mv(biv: torch.Tensor):
 def mv_to_bivector(mv, like: torch.Tensor) -> torch.Tensor:
     """Bivector multivector -> ``(..., 6)`` ``[wx, wy, wz, vx, vy, vz]``."""
     raw = _coeffs(mv, BIVECTOR_BLADES, like)
-    signs = torch.tensor(_ROT_SIGNS + (1.0, 1.0, 1.0), dtype=raw.dtype, device=raw.device)
+    signs = torch.tensor(
+        _ROT_SIGNS + (1.0, 1.0, 1.0), dtype=raw.dtype, device=raw.device
+    )
     return raw * signs
 
 

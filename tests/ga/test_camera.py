@@ -41,7 +41,9 @@ class TestProjection:
         for v in range(views):
             cam_pts = world.numpy() @ matrices[v][:3, :3].T + matrices[v][:3, 3]
             want = (cam_pts / cam_pts[:, 2:3]) @ k[v].T
-            np.testing.assert_allclose(pixels[v].numpy(), want[:, :2], atol=1e-9, rtol=0)
+            np.testing.assert_allclose(
+                pixels[v].numpy(), want[:, :2], atol=1e-9, rtol=0
+            )
 
     def test_points_behind_the_camera_are_marked_invalid(self):
         motors, intrinsics, _, _ = synthetic_scene(views=1)
@@ -56,7 +58,9 @@ class TestProjection:
         motors, intrinsics, _, _ = synthetic_scene(views=1)
         pts = cam.camera_to_world(
             motors[0],
-            torch.tensor([[0.1, 0.1, -2.0], [0.0, 0.0, 0.0], [0.1, 0.1, 5.0]], dtype=DTYPE),
+            torch.tensor(
+                [[0.1, 0.1, -2.0], [0.0, 0.0, 0.0], [0.1, 0.1, 5.0]], dtype=DTYPE
+            ),
         )
         pixels, valid = cam.project(motors[0], intrinsics[0], pts)
         assert torch.isfinite(pixels).all()

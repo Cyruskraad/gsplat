@@ -48,7 +48,9 @@ _EPS = 1e-12
 
 def schur_lm(
     state: Any,
-    residual_and_jacobians: Callable[[Any], tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
+    residual_and_jacobians: Callable[
+        [Any], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ],
     apply_step: Callable[[Any, torch.Tensor, torch.Tensor], Any],
     cost: Callable[[Any], torch.Tensor],
     num_cameras: int,
@@ -92,10 +94,14 @@ def schur_lm(
         u_blocks.index_add_(0, camera_idx, jac_cam.transpose(-2, -1) @ jac_cam)
         v_blocks.index_add_(0, point_idx, jac_pt.transpose(-2, -1) @ jac_pt)
         g_cam.index_add_(
-            0, camera_idx, (jac_cam.transpose(-2, -1) @ residual.unsqueeze(-1)).squeeze(-1)
+            0,
+            camera_idx,
+            (jac_cam.transpose(-2, -1) @ residual.unsqueeze(-1)).squeeze(-1),
         )
         g_pt.index_add_(
-            0, point_idx, (jac_pt.transpose(-2, -1) @ residual.unsqueeze(-1)).squeeze(-1)
+            0,
+            point_idx,
+            (jac_pt.transpose(-2, -1) @ residual.unsqueeze(-1)).squeeze(-1),
         )
 
         # The camera-point coupling block, scattered into (V, 6, P, 3).
@@ -124,7 +130,9 @@ def schur_lm(
             reduced = torch.block_diag(*u_damped) - torch.einsum(
                 "vipj,wkpj->viwk", y, w_blocks
             ).reshape(num_cameras * 6, num_cameras * 6)
-            rhs = -(g_cam - torch.einsum("vipj,pj->vi", y, g_pt)).reshape(num_cameras * 6)
+            rhs = -(g_cam - torch.einsum("vipj,pj->vi", y, g_pt)).reshape(
+                num_cameras * 6
+            )
 
             # Gauge fixing: bundle adjustment is invariant to a global
             # similarity, so without pinning a camera the system is singular.
