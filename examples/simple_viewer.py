@@ -311,7 +311,7 @@ def main(local_rank: int, world_rank, world_size: int, args):
             )
         return renders
 
-    server = viser.ViserServer(port=args.port, verbose=False)
+    server = viser.ViserServer(host=args.host, port=args.port, verbose=False)
     viewer_kwargs = dict(
         server=server,
         render_fn=viewer_render_fn,
@@ -350,6 +350,9 @@ if __name__ == "__main__":
     parser.add_argument("--ply", type=str, default=None, help="path to a 3DGS PLY file")
     parser.add_argument(
         "--port", type=int, default=8080, help="port for the viewer server"
+    )
+    parser.add_argument(
+        "--host", type=str, default="127.0.0.1", help="host for the viewer server"
     )
     parser.add_argument(
         "--with_ut", action="store_true", help="use uncentered transform"
